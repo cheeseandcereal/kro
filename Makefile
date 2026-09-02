@@ -432,4 +432,32 @@ upgrade-kro: ko ## Build current kro and upgrade the running deployment (no clus
 		--set config.allowCRDDeletion=false \
 		--set config.resourceGraphDefinitionConcurrentReconciles=10 \
 		--set config.dynamicControllerConcurrentReconciles=10 | $(WITH_GOFLAGS) $(KO) apply -f -
-	kubectl wait --for=condition=available --timeout=3m deployment/kro -n kro-system
+	$(KUBECTL) rollout status --timeout=3m deployment/kro -n kro-system
+	# Readiness is not leader-aware, so wait for the updated pod to own the lease.
+	@pod="$$($(KUBECTL) get pods -n kro-system \
+		-l app.kubernetes.io/name=kro,app.kubernetes.io/instance=kro,app.kubernetes.io/component=controller \
+		-o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}')"; \
+	if [[ -z "$$pod" || "$$pod" == *$$'\n'* ]]; then \
+		echo "expected one current kro controller pod, found: $${pod:-none}" >&2; \
+		exit 1; \
+	fi; \
+	echo "Waiting for kro controller pod $$pod to acquire leadership..."; \
+	deadline=$$((SECONDS + 180)); \
+	last_holder=""; \
+	last_renew_time=""; \
+	while (( SECONDS < deadline )); do \
+		lease="$$($(KUBECTL) get lease controller.kro.run -n kro-system \
+			--ignore-not-found --request-timeout=5s \
+			-o jsonpath='{.spec.holderIdentity}{"\t"}{.spec.renewTime}')"; \
+		IFS=$$'\t' read -r holder renew_time <<< "$$lease"; \
+		if [[ "$$holder" == "$${pod}_"* && "$$holder" == "$$last_holder" && \
+			-n "$$renew_time" && "$$renew_time" != "$$last_renew_time" ]]; then \
+			echo "Controller pod $$pod acquired leadership"; \
+			exit 0; \
+		fi; \
+		last_holder="$$holder"; \
+		last_renew_time="$$renew_time"; \
+		sleep 2; \
+	done; \
+	echo "timed out waiting for controller pod $$pod to acquire leadership (current holder: $${holder:-none})" >&2; \
+	exit 1
