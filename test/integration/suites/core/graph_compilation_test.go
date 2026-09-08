@@ -151,6 +151,31 @@ var _ = Describe("Graph Compilation", func() {
 				wantStatus: metav1.ConditionFalse,
 				wantSubstr: "self references are not allowed",
 			},
+			{
+				name: "invalid-ref-selector-misspelled-matchlabels",
+				// metadata.selector is schemaless, so a misspelled key is only
+				// catchable at compile time.
+				nodes: []expv1alpha1.Node{
+					{
+						ID:  "seed",
+						Def: environment.RawExt(t, map[string]any{"v": "x"}),
+					},
+					{
+						ID: "configs",
+						Ref: &expv1alpha1.ExternalRef{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Metadata: expv1alpha1.ExternalRefMetadata{
+								Selector: *environment.RawExt(t, map[string]any{
+									"matchLabel": map[string]any{"tier": "db"},
+								}),
+							},
+						},
+					},
+				},
+				wantStatus: metav1.ConditionFalse,
+				wantSubstr: "matchLabel",
+			},
 		}
 
 		for _, tc := range tests {
