@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	memory "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/restmapper"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -166,5 +167,71 @@ func TestSimple_Apply_DynamicRef(t *testing.T) {
 		assert.ErrorIs(t, err, errSchemaNotReady)
 		assert.Contains(t, res.Unresolved, "coll")
 		assert.Empty(t, res.Applied)
+	})
+
+	t.Run("dynamic selector ref feeds a forEach template and comprehensions", func(t *testing.T) {
+		t.Parallel()
+		// The collection is declared list(dyn) at compile time and published as
+		// a []any at runtime, so forEach fans out per matched object and
+		// coll.map(...) / size(coll) evaluate against the same list.
+		g := generator.NewGraph("g",
+			generator.WithNamespace("default"),
+			generator.WithDef("crd", map[string]any{"kind": "ConfigMap"}),
+			generator.WithRef("coll", &expv1alpha1.ExternalRef{
+				APIVersion: "v1",
+				Kind:       "${crd.kind}",
+				Metadata: expv1alpha1.ExternalRefMetadata{
+					Namespace: "default",
+					Selector:  runtime.RawExtension{Raw: []byte(`{"matchLabels":{"tier":"db"}}`)},
+				},
+			}),
+			generator.WithTemplate("fanout", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${w.metadata.name}-copy"},
+				"data":     map[string]any{"from": "${w.data.k}"},
+			}, generator.ForEachDim("w", "${coll}")),
+			generator.WithTemplate("summary", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "summary"},
+				"data": map[string]any{
+					"names": "${coll.map(c, c.metadata.name).join(',')}",
+					"count": "${string(size(coll))}",
+				},
+			}),
+		)
+		rt := compileAndBuild(t, g)
+		cl := fake.NewClientBuilder().WithScheme(newScheme(t)).WithRESTMapper(rm).
+			WithObjects(seedCM("db-a", "db"), seedCM("db-b", "db"), seedCM("web", "web")).Build()
+
+		res, err := NewSimple(cl).Apply(context.Background(), rt, watchrouter.NoopWatcher{})
+		require.NoError(t, err)
+		assert.Empty(t, res.Unresolved)
+
+		// One copy per matched object (the web ConfigMap is not selected) plus
+		// the summary — and nothing for the read-only collection itself.
+		applied := map[string]bool{}
+		for _, mr := range res.Applied {
+			applied[mr.NodeID+"/"+mr.Name] = true
+		}
+		assert.Equal(t, map[string]bool{
+			"fanout/db-a-copy": true,
+			"fanout/db-b-copy": true,
+			"summary/summary":  true,
+		}, applied)
+
+		get := func(name string) *unstructured.Unstructured {
+			t.Helper()
+			obj := &unstructured.Unstructured{}
+			obj.SetAPIVersion("v1")
+			obj.SetKind("ConfigMap")
+			require.NoError(t, cl.Get(context.Background(),
+				types.NamespacedName{Namespace: "default", Name: name}, obj), "missing %q", name)
+			return obj
+		}
+		assert.Equal(t, "db-a", get("db-a-copy").Object["data"].(map[string]any)["from"])
+		assert.Equal(t, "db-b", get("db-b-copy").Object["data"].(map[string]any)["from"])
+		summary := get("summary").Object["data"].(map[string]any)
+		assert.Equal(t, "db-a,db-b", summary["names"])
+		assert.Equal(t, "2", summary["count"])
 	})
 }

@@ -341,6 +341,57 @@ func TestTypedEnvironmentWithIDsAndProvider(t *testing.T) {
 	assert.Error(t, issues.Err())
 }
 
+// TestWithResourceIDs_DeclaresDyn pins that WithResourceIDs declares dyn, not
+// any: the checker rejects any as a comprehension range, so x.map(...) over an
+// any-declared identifier would not compile even when the runtime value is a list.
+func TestWithResourceIDs_DeclaresDyn(t *testing.T) {
+	env, err := DefaultEnvironment(WithResourceIDs([]string{"x"}), WithRuntimeLibrary(false))
+	require.NoError(t, err)
+
+	checked, issues := env.Compile("x")
+	require.NoError(t, issues.Err())
+	assert.True(t, checked.OutputType().IsExactType(cel.DynType), "got %s", checked.OutputType())
+
+	for _, expr := range []string{
+		"x.map(i, i.name)",
+		"x.filter(i, i.enabled).size()",
+		"x.all(i, has(i.name))",
+		"x.exists(i, i == 'a')",
+		"x.metadata.name",
+		"x[0].name",
+		"size(x)",
+	} {
+		t.Run(expr, func(t *testing.T) {
+			_, issues := env.Compile(expr)
+			assert.NoError(t, issues.Err())
+		})
+	}
+
+	ast, issues := env.Compile("x.map(i, i.name).join(',')")
+	require.NoError(t, issues.Err())
+	prg, err := env.Program(ast)
+	require.NoError(t, err)
+	out, _, err := prg.Eval(map[string]any{"x": []any{
+		map[string]any{"name": "a"},
+		map[string]any{"name": "b"},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "a,b", out.Value())
+
+	t.Run("any is rejected as a comprehension range", func(t *testing.T) {
+		anyEnv, err := DefaultEnvironment(
+			WithCustomDeclarations([]cel.EnvOption{cel.Variable("y", cel.AnyType)}),
+			WithRuntimeLibrary(false),
+		)
+		require.NoError(t, err)
+		_, issues := anyEnv.Compile("y.metadata.name")
+		require.NoError(t, issues.Err())
+		_, issues = anyEnv.Compile("y.map(i, i.name)")
+		require.Error(t, issues.Err())
+		assert.Contains(t, issues.Err().Error(), "cannot be range of a comprehension")
+	})
+}
+
 func TestBaseEnv_Extend_PreservesLibraries(t *testing.T) {
 	// Verify that extending the cached base env still has all libraries available
 	env, err := DefaultEnvironment(

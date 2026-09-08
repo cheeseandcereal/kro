@@ -1178,6 +1178,196 @@ func TestCompile_DynamicRef(t *testing.T) {
 	})
 }
 
+// TestCompile_DynamicRefCollectionTyping pins the CEL types of schemaless
+// identifiers: a dynamic-GVK collection is list(dyn) and a dynamic single ref
+// is dyn, so forEach, comprehensions and bare references compile as documented.
+func TestCompile_DynamicRefCollectionTyping(t *testing.T) {
+	t.Parallel()
+
+	// A static ref to a CRD object plus a dynamic selector ref over that CRD's
+	// instances (the fake CRD schema exposes spec.version, not spec.versions[]).
+	withCRDAndInstances := func(extra ...generator.GraphOption) *expv1alpha1.Graph {
+		return generator.NewGraph("g", append([]generator.GraphOption{
+			generator.WithNamespace("default"),
+			generator.WithRef("crd", &expv1alpha1.ExternalRef{
+				APIVersion: "apiextensions.k8s.io/v1",
+				Kind:       "CustomResourceDefinition",
+				Metadata:   expv1alpha1.ExternalRefMetadata{Name: "widgets.example.com"},
+			}),
+			generator.WithRef("insts", &expv1alpha1.ExternalRef{
+				APIVersion: "${crd.spec.group + '/' + crd.spec.version}",
+				Kind:       "${crd.spec.names.kind}",
+				Metadata: expv1alpha1.ExternalRefMetadata{
+					Selector: runtime.RawExtension{Raw: []byte(`{}`)},
+				},
+			}),
+		}, extra...)...)
+	}
+
+	t.Run("forEach over a dynamic collection ref compiles", func(t *testing.T) {
+		t.Parallel()
+		g := withCRDAndInstances(
+			generator.WithTemplate("cms", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${w.metadata.name}-x"},
+				"data":     map[string]any{"kind": "${w.kind}"},
+			}, generator.ForEachDim("w", "${insts}")),
+		)
+		prog, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err)
+		cms := prog.Nodes["cms"]
+		require.NotNil(t, cms)
+		assert.Contains(t, cms.HardDepIDs(), "insts")
+		require.Len(t, cms.ForEach, 1)
+		assert.NotNil(t, cms.ForEach[0].Expression.Program)
+	})
+
+	t.Run("comprehensions over a dynamic collection ref compile", func(t *testing.T) {
+		t.Parallel()
+		g := withCRDAndInstances(
+			generator.WithTemplate("summary", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "summary"},
+				"data": map[string]any{
+					"names":    "${insts.map(x, x.metadata.name).join(',')}",
+					"labelled": "${string(insts.filter(x, has(x.metadata.labels)).size())}",
+					"allNamed": "${string(insts.all(x, has(x.metadata.name)))}",
+					"anyReady": "${string(insts.exists(x, x.status.ready == true))}",
+				},
+			}),
+			generator.WithDef("derived", map[string]any{
+				"names": "${insts.map(x, x.metadata.name)}",
+				"count": "${insts.filter(x, has(x.metadata.labels)).size()}",
+			}),
+		)
+		prog, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err)
+		assert.Contains(t, prog.Nodes["summary"].HardDepIDs(), "insts")
+		assert.Contains(t, prog.Nodes["derived"].HardDepIDs(), "insts")
+	})
+
+	t.Run("size, indexing and dyn() wrapping keep working", func(t *testing.T) {
+		t.Parallel()
+		g := withCRDAndInstances(
+			generator.WithTemplate("cms", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${w.metadata.name}-x"},
+			}, generator.ForEachDim("w", "${dyn(insts)}")),
+			generator.WithTemplate("cm", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "cm"},
+				"data": map[string]any{
+					"count": "${string(size(insts))}",
+					"first": "${insts[0].metadata.name}",
+					"names": "${dyn(insts).map(x, x.metadata.name).join(',')}",
+				},
+			}),
+		)
+		_, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err)
+	})
+
+	t.Run("a dynamic collection is a list, not a bool or a string", func(t *testing.T) {
+		t.Parallel()
+		_, err := newTestCompiler(t).Compile(withCRDAndInstances(
+			generator.WithTemplate("cm", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "cm"},
+			}),
+			generator.WithIncludeWhen("${insts}"),
+		))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must return bool, got list(dyn)")
+
+		_, err = newTestCompiler(t).Compile(withCRDAndInstances(
+			generator.WithTemplate("cm", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "cm"},
+				"data":     map[string]any{"bad": "${insts}"},
+			}),
+		))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `returns "list(dyn)" but expected "string"`)
+	})
+
+	t.Run("a dynamic non-collection ref is dyn: bare reference and field access compile", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithNamespace("default"),
+			generator.WithDef("crd", map[string]any{"group": "example.com"}),
+			generator.WithRef("target", &expv1alpha1.ExternalRef{
+				APIVersion: "${crd.group}/v1",
+				Kind:       "Widget",
+				Metadata:   expv1alpha1.ExternalRefMetadata{Name: "w"},
+			}),
+			generator.WithTemplate("cm", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${target.metadata.name}-cm"},
+				"data": map[string]any{
+					"whole": "${target}",
+					"items": "${target.spec.items.map(i, i.name).join(',')}",
+					"ns":    "${has(target.metadata.namespace) ? target.metadata.namespace : 'none'}",
+				},
+			}),
+			// A bare dyn is accepted where a bool is expected (checked at runtime).
+			generator.WithIncludeWhen("${target}"),
+			generator.WithTemplate("per", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${target.metadata.name}-${i.name}"},
+			}, generator.ForEachDim("i", "${target.spec.items}")),
+		)
+		prog, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err)
+		assert.False(t, prog.Nodes["target"].IsCollection())
+		assert.Contains(t, prog.Nodes["cm"].HardDepIDs(), "target")
+		assert.Contains(t, prog.Nodes["per"].HardDepIDs(), "target")
+	})
+
+	t.Run("a dynamic forEach template is list(dyn) for downstream nodes", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithNamespace("default"),
+			generator.WithDef("cfg", map[string]any{"group": "example.com/v1", "names": []any{"a", "b"}}),
+			generator.WithTemplate("widgets", map[string]any{
+				"apiVersion": "${cfg.group}",
+				"kind":       "Widget",
+				"metadata":   map[string]any{"name": "${n}"},
+			}, generator.ForEachDim("n", "${cfg.names}")),
+			generator.WithTemplate("cm", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "cm"},
+				"data":     map[string]any{"names": "${widgets.map(w, w.metadata.name).join(',')}"},
+			}),
+		)
+		prog, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err)
+		assert.True(t, prog.Nodes["widgets"].DynamicGVK)
+		assert.Contains(t, prog.Nodes["cm"].HardDepIDs(), "widgets")
+	})
+
+	t.Run("a subgraph forEach over a captured parent collection compiles", func(t *testing.T) {
+		t.Parallel()
+		child := generator.NewGraph("child",
+			generator.WithTemplate("cm", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${w.metadata.name}-child"},
+			}, generator.ForEachDim("w", "${insts}")),
+			generator.WithDef("names", map[string]any{
+				"all": "${insts.map(x, x.metadata.name)}",
+			}),
+		)
+		g := withCRDAndInstances(generator.WithSubgraph("sub", child))
+		prog, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err)
+		sub := prog.Nodes["sub"]
+		require.NotNil(t, sub)
+		require.NotNil(t, sub.SubProgram)
+		assert.Contains(t, sub.HardDepIDs(), "insts")
+		require.NotNil(t, sub.SubProgram.Nodes["cm"])
+		require.Len(t, sub.SubProgram.Nodes["cm"].ForEach, 1)
+	})
+}
+
 func TestCompile_WithSoftDependencies(t *testing.T) {
 	t.Parallel()
 	g := generator.NewGraph("g",
