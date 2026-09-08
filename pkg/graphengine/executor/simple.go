@@ -65,7 +65,8 @@ type Simple struct {
 	// stamped by the graph-engine path. Safe to leave nil — no-op.
 	LabelInjector func(*unstructured.Unstructured)
 	// GateReadiness makes the executor withhold a node until every one of
-	// its dependencies has reached a terminal ready state this cycle. When
+	// its dependencies has reached a terminal ready state this cycle; the
+	// gate is checked before the node's includeWhen (see Apply). When
 	// false (the default), every reachable node is applied regardless of
 	// upstream readiness so drift watches register across a not-ready node.
 	GateReadiness bool
@@ -205,12 +206,13 @@ func (s *Simple) ApplyWithLabeler(
 
 var _ Interface = (*Simple)(nil)
 
-// Apply walks rt in topological order. For each node it checks ignore
-// status (contagious), resolves the desired state, registers a watch on
-// the resulting GVR/Name/Namespace via w, applies to cluster (or just
-// renders for Def), records observed state on the node, and finally
-// checks readyWhen — surfacing an unsatisfied result as ErrNotReady so
-// the reconciler requeues without backoff.
+// Apply walks rt in topological order. For each node it gates on
+// dependency readiness (GateReadiness), then checks ignore status
+// (contagious), resolves the desired state, registers a watch on the
+// resulting GVR/Name/Namespace via w, applies to cluster (or just renders
+// for Def), records observed state on the node, and finally checks
+// readyWhen — surfacing an unsatisfied result as ErrNotReady so the
+// reconciler requeues without backoff.
 //
 // Per-template watches are registered BEFORE SSA apply. Doing it before
 // closes the window where an external actor could mutate the object
@@ -227,14 +229,14 @@ var _ Interface = (*Simple)(nil)
 // first one is returned at the end wrapped in ErrNotReady. Hard errors
 // (apply failure, type errors, etc.) still abort immediately.
 //
-// Dependency-readiness gating: a node is applied only once every node it
-// depends on is ready this cycle (readyWhen satisfied). A dependency that
-// was applied-but-not-ready, blocked, or unresolved leaves the dependent
-// blocked too — it is recorded Unresolved and skipped (never applied) so a
-// dependent resource is not created before its dependencies converge, and
-// its own dependents cascade-block via the readiness map. Gating is opt-in
-// via GateReadiness; when it is off every reachable node is applied
-// regardless of upstream readiness.
+// Dependency-readiness gating: a node is decided (includeWhen) and applied
+// only once every node it depends on is ready this cycle (readyWhen
+// satisfied). A dependency that was applied-but-not-ready, blocked, or
+// unresolved leaves the dependent blocked too — it is recorded Unresolved
+// and skipped (never applied) so a dependent resource is not created before
+// its dependencies converge, and its own dependents cascade-block via the
+// readiness map. Gating is opt-in via GateReadiness; when it is off every
+// reachable node is decided and applied regardless of upstream readiness.
 func (s *Simple) Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.Watcher) (ApplyResult, error) {
 	// Establish the per-Apply identity-claim set at the top-level walk. A
 	// subgraph child walk (applySubgraph copies the executor by value) inherits
@@ -267,6 +269,19 @@ func (s *Simple) Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.W
 	ready := make(map[string]bool, len(rt.Nodes()))
 
 	for _, n := range rt.Nodes() {
+		// Gate on dependency readiness BEFORE deciding includeWhen: an
+		// applied-but-not-ready dependency has already published its interim
+		// value, and a false verdict against it would mark the node ignored (not
+		// Unresolved) and let the caller prune its existing child. Opt-in — when
+		// off, dependents are decided and applied across a not-ready upstream.
+		if s.GateReadiness {
+			if dep, blocked := firstUnreadyDep(n, ready); blocked {
+				result.Unresolved = append(result.Unresolved, n.ID())
+				recordSoft(fmt.Errorf("apply %q: waiting for dependency %q: %w", n.ID(), dep, ErrNotReady))
+				continue
+			}
+		}
+
 		ignored, err := n.IsIgnored()
 		if err != nil {
 			if isSoftRuntimeErr(err) {
@@ -288,17 +303,6 @@ func (s *Simple) Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.W
 			// dependents (their dependents are contagiously ignored too).
 			ready[n.ID()] = true
 			continue
-		}
-
-		// Gate on dependency readiness: do not apply until every dependency is
-		// ready this cycle. Opt-in — when off, dependents apply across a
-		// not-ready upstream (drift watches still register).
-		if s.GateReadiness {
-			if dep, blocked := firstUnreadyDep(n, ready); blocked {
-				result.Unresolved = append(result.Unresolved, n.ID())
-				recordSoft(fmt.Errorf("apply %q: waiting for dependency %q: %w", n.ID(), dep, ErrNotReady))
-				continue
-			}
 		}
 
 		// A subgraph node has no payload of its own — it runs a child

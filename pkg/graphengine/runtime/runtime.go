@@ -275,6 +275,15 @@ func (r *Runtime) Nodes() []*Node { return r.nodes }
 // Node returns the node with the given ID, or nil if no such node exists.
 func (r *Runtime) Node(id string) *Node { return r.byID[id] }
 
+// ResetIgnoredCache discards every node's memoized IsIgnored verdict. Call it
+// after evaluating IsIgnored against a scope that still holds soft-dependency
+// placeholders (see New): has(db.data) on `{}` yields a definite, wrong verdict.
+func (r *Runtime) ResetIgnoredCache() {
+	for _, n := range r.nodes {
+		n.ignored = nil
+	}
+}
+
 // Scope returns the current scope map. The map is live — mutating it
 // affects subsequent Resolve calls. Most callers should use Set instead.
 func (r *Runtime) Scope() map[string]any { return r.scope }

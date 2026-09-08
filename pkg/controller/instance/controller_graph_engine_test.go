@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/restmapper"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1915,4 +1916,115 @@ func TestReconcileViaGraphEngine_PatchContributions(t *testing.T) {
 		cond := conditionByType(t, stored, ResourcesReady)
 		assert.Equal(t, metav1.ConditionTrue, cond.Status)
 	})
+}
+
+// newTestCompilerKnowingParentKind builds a real compiler whose schema resolver
+// and REST mapper also know the test parent kind (kro.run/v1alpha1 WebApp), so
+// an RGD with author status fields compiles: the synthesized status writeback
+// node targets the instance kind itself.
+func newTestCompilerKnowingParentKind(t *testing.T) *compiler.Compiler {
+	t.Helper()
+	r, disco := testk8s.NewFakeResolver()
+	str := func() spec.Schema { return spec.Schema{SchemaProps: spec.SchemaProps{Type: []string{"string"}}} }
+	r.AddSchema(controllerTestParentGVK, &spec.Schema{SchemaProps: spec.SchemaProps{
+		Type: []string{"object"},
+		Properties: map[string]spec.Schema{
+			"apiVersion": str(),
+			"kind":       str(),
+			"metadata": {SchemaProps: spec.SchemaProps{Type: []string{"object"}, Properties: map[string]spec.Schema{
+				"name":      str(),
+				"namespace": str(),
+			}}},
+			"status": {SchemaProps: spec.SchemaProps{Type: []string{"object"}, Properties: map[string]spec.Schema{
+				"dbOwner": str(),
+			}}},
+		},
+	}})
+	disco.Resources = append(disco.Resources, &metav1.APIResourceList{
+		GroupVersion: controllerTestParentGVK.GroupVersion().String(),
+		APIResources: []metav1.APIResource{{
+			Name:       controllerTestParentGVR.Resource,
+			Namespaced: true,
+			Kind:       controllerTestParentGVK.Kind,
+			Verbs:      []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+		}},
+	})
+	rm := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(disco))
+	return compiler.NewCompilerWithDependencies(r, rm)
+}
+
+// A status field referencing db makes db a soft-dependency `{}` placeholder, so
+// the pre-apply inventory projection (candidateMetadata) decides app's
+// presence-tolerant includeWhen as a definite false. The executor must not
+// reuse that memoized verdict after db publishes: app is created and the
+// instance converges.
+func TestReconcileViaGraphEngine_PreApplyProjectionDoesNotPoisonIncludeWhen(t *testing.T) {
+	comp := newTestCompilerKnowingParentKind(t)
+
+	statusBytes, err := json.Marshal(map[string]any{"dbOwner": "${db.data.owner}"})
+	require.NoError(t, err)
+	rgdSpec := &v1alpha1.ResourceGraphDefinitionSpec{
+		Schema: &v1alpha1.Schema{
+			APIVersion: "v1alpha1",
+			Kind:       controllerTestParentGVK.Kind,
+			Group:      controllerTestParentGVK.Group,
+			Spec:       apimachineryruntime.RawExtension{Raw: []byte(`{}`)},
+			// The status reference makes db a soft-dependency `{}` placeholder.
+			Status: apimachineryruntime.RawExtension{Raw: statusBytes},
+		},
+		Resources: []*v1alpha1.Resource{
+			{
+				ID: "db",
+				Template: apimachineryruntime.RawExtension{
+					Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"db","namespace":"default"},"data":{"owner":"team","phase":"Running"}}`),
+				},
+			},
+			{
+				ID: "app",
+				// False (nil error) against the `{}` placeholder; true against the applied db.
+				IncludeWhen: []string{`${db.?data.phase.orValue("missing") == "Running"}`},
+				Template: apimachineryruntime.RawExtension{
+					Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"app","namespace":"default"},"data":{"k":"v"}}`),
+				},
+			},
+		},
+	}
+
+	inst := newInstanceObject("demo", "default")
+	raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+	// The status writeback node patches the instance's status subresource
+	// through the executor's client, so the instance must exist there too.
+	s := apimachineryruntime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(s))
+	fakeRuntimeCl := fakeclient.NewClientBuilder().WithScheme(s).
+		WithObjects(inst.DeepCopy()).WithStatusSubresource(inst.DeepCopy()).Build()
+	c, _ := newGraphEngineControllerUnderTest(t, raw, rgdSpec, revisions.RevisionStateActive, comp, fakeRuntimeCl)
+
+	watcher := &fakeInstanceWatcher{}
+	err = c.reconcileViaGraphEngine(context.Background(), inst, watcher)
+	require.NoError(t, err)
+
+	getCM := func(name string) (*unstructured.Unstructured, error) {
+		cm := &unstructured.Unstructured{}
+		cm.SetGroupVersionKind(controllerTestCMGVK)
+		return cm, fakeRuntimeCl.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: name}, cm)
+	}
+	_, err = getCM("db")
+	require.NoError(t, err, "db must be applied")
+	app, err := getCM("app")
+	require.NoError(t, err, "app must be created: the verdict memoized against the pre-apply placeholder must not be reused")
+	assert.Equal(t, "v", app.Object["data"].(map[string]any)["k"])
+
+	stored := getStoredParentObject(t, raw)
+	assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, ResourcesReady).Status)
+	status, _, _ := unstructured.NestedMap(stored.Object, "status")
+	require.NotNil(t, status)
+	assert.Equal(t, string(v1alpha1.InstanceStateActive), status["state"])
+
+	// The author status field was projected from the published db value.
+	written := &unstructured.Unstructured{}
+	written.SetGroupVersionKind(controllerTestParentGVK)
+	require.NoError(t, fakeRuntimeCl.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "demo"}, written))
+	dbOwner, _, _ := unstructured.NestedString(written.Object, "status", "dbOwner")
+	assert.Equal(t, "team", dbOwner)
 }

@@ -132,7 +132,8 @@ func (n *Node) SetObserved(observed []*unstructured.Unstructured, desired []*uns
 //   - any of its own includeWhen expressions evaluates to false
 //
 // The result is memoized within a single Runtime so repeated checks
-// during apply don't re-walk the dependency tree or re-evaluate CEL.
+// during apply don't re-walk the dependency tree or re-evaluate CEL
+// (Runtime.ResetIgnoredCache discards the memo).
 func (n *Node) IsIgnored() (bool, error) {
 	if n.ignored != nil {
 		return *n.ignored, nil

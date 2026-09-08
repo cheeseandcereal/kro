@@ -162,6 +162,104 @@ func TestSimple_GateReadinessDoesNotReportWithheldAsApplied(t *testing.T) {
 	}
 }
 
+// interimIncludeWhenGraph builds db → app where db is applied with an interim
+// value that never satisfies its readyWhen, and app's includeWhen reads that
+// same field (false against the interim value).
+func interimIncludeWhenGraph() *expv1alpha1.Graph {
+	return generator.NewGraph("g",
+		generator.WithNamespace("default"),
+		generator.WithTemplate("db", map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": "db"},
+			"data":     map[string]any{"phase": "Starting"},
+		}),
+		generator.WithReadyWhen(`${db.data.phase == "Running"}`),
+		generator.WithTemplate("app", map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": "app"},
+			"data":     map[string]any{"from": "${db.data.phase}"},
+		}),
+		generator.WithIncludeWhen(`${db.data.phase == "Running"}`),
+	)
+}
+
+// With GateReadiness on, a dependent of an applied-but-not-ready dependency is
+// withheld as Unresolved before its includeWhen is decided, so the caller keeps
+// its existing child. With the gate off (the Graph default) the includeWhen is
+// decided immediately against the interim value.
+func TestSimple_GateReadinessDecidesIncludeWhenAfterDependencyReady(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		gate bool
+		// wantUnresolved: app is withheld (gate on); false: app is decided
+		// ignored against the interim value (gate off).
+		wantUnresolved bool
+	}{
+		{name: "gate on withholds the dependent as Unresolved instead of deciding includeWhen", gate: true, wantUnresolved: true},
+		{name: "gate off decides includeWhen against the interim value (Graph path unchanged)", gate: false, wantUnresolved: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cl := fake.NewClientBuilder().WithScheme(newScheme(t)).Build()
+			ex := NewSimple(cl)
+			ex.GateReadiness = tc.gate
+
+			res, err := ex.Apply(context.Background(),
+				compileAndBuild(t, interimIncludeWhenGraph()), watchrouter.NoopWatcher{})
+
+			// Either way db itself is applied but not ready.
+			require.Error(t, err)
+			assert.True(t, errors.Is(err, ErrNotReady), "db's unsatisfied readyWhen must surface as ErrNotReady, got %v", err)
+			assert.True(t, cmExists(t, cl, "db"), "db must be applied")
+			assert.False(t, cmExists(t, cl, "app"), "app must not be created either way (gated, or includeWhen false)")
+			for _, applied := range res.Applied {
+				assert.NotEqual(t, "app", applied.NodeID, "app must never be reported Applied")
+			}
+
+			if tc.wantUnresolved {
+				assert.Contains(t, res.Unresolved, "app",
+					"with the gate on, app must be withheld (Unresolved) so its existing child is not pruned, not decided ignored against db's interim value")
+			} else {
+				assert.NotContains(t, res.Unresolved, "app",
+					"with the gate off, app's includeWhen is decided (false) against the applied value and app is ignored, not Unresolved")
+			}
+		})
+	}
+}
+
+// An ignored dependency is recorded ready, so gating before includeWhen must
+// not withhold its dependents: they are contagiously ignored, not Unresolved.
+func TestSimple_GateReadinessPassesDependentsOfIgnoredDependency(t *testing.T) {
+	t.Parallel()
+	g := generator.NewGraph("g",
+		generator.WithNamespace("default"),
+		generator.WithDef("flag", map[string]any{"enabled": false}),
+		generator.WithTemplate("db", map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": "db"},
+			"data":     map[string]any{"k": "v"},
+		}),
+		generator.WithIncludeWhen("${flag.enabled}"),
+		generator.WithTemplate("app", map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": "app"},
+			"data":     map[string]any{"from": "${db.data.k}"},
+		}),
+	)
+	cl := fake.NewClientBuilder().WithScheme(newScheme(t)).Build()
+	ex := NewSimple(cl)
+	ex.GateReadiness = true
+
+	res, err := ex.Apply(context.Background(), compileAndBuild(t, g), watchrouter.NoopWatcher{})
+	require.NoError(t, err, "an ignored dependency is not a not-ready dependency; nothing should be soft-blocked")
+	assert.Empty(t, res.Unresolved, "dependents of an ignored node must be contagiously ignored, not withheld")
+	assert.Empty(t, res.Applied)
+	assert.False(t, cmExists(t, cl, "db"))
+	assert.False(t, cmExists(t, cl, "app"))
+}
+
 // ApplyWithLabeler is the only path the instance controller calls
 // (controller_graph_engine.go). It composes a per-call labeler over the
 // struct-level one and runs the walk on a copy of the executor so concurrent

@@ -179,6 +179,11 @@ func (c *Controller) reconcileViaGraphEngine(
 		return preErr
 	}
 
+	// candidateMetadata evaluated includeWhen against a scope holding only the
+	// `schema` Def and the `{}` soft-dependency placeholders; drop those memoized
+	// verdicts so the walk decides each node against live values.
+	rt.ResetIgnoredCache()
+
 	// Apply through the executor (SSA + watches).
 	// Build a per-reconcile child labeler: instance labels + applyset part-of
 	// + struct-level KRO-meta labels are composed inside ApplyWithLabeler.
@@ -580,6 +585,12 @@ func (c *Controller) candidateMetadata(rt *geruntime.Runtime, inst *unstructured
 		// that re-enqueues the instance and fights the pre-apply writer forever.
 		// On an IsIgnored error we can't decide, so keep the node (holding the
 		// inventory steady is the safe direction).
+		//
+		// Evaluated against the pre-apply scope (schema + soft-dep placeholders),
+		// this verdict can be wrong for a placeholder-backed includeWhen: the node
+		// is then missing from the write-ahead superset until the post-apply
+		// align. The caller resets the memo (Runtime.ResetIgnoredCache) before the
+		// executor walk so it is not reused against live values.
 		if ignored, err := n.IsIgnored(); err == nil && ignored {
 			continue
 		}
