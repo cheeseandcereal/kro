@@ -97,7 +97,8 @@ func validateFrameNodes(nodes []expv1alpha1.Node) error {
 // don't render or read; the per-node modifiers have no defined semantics on
 // them yet, so they're rejected explicitly rather than silently ignored.
 // patch nodes MAY carry forEach — the contribution fans out across every
-// rendered target (each must be nameable and resolve to a distinct name).
+// rendered target (each must be nameable and resolve to a distinct name) —
+// and includeWhen, but not readyWhen (a patch publishes nothing into scope).
 func validateKindCompatibility(n *expv1alpha1.Node) error {
 	if n.Graph != nil {
 		switch {
@@ -111,13 +112,17 @@ func validateKindCompatibility(n *expv1alpha1.Node) error {
 		return nil
 	}
 	if n.Patch != nil {
+		// Rejected here, with an actionable message, rather than deep in CEL
+		// analysis where every readyWhen on a patch fails for a confusing reason.
+		if len(n.ReadyWhen) > 0 {
+			return fmt.Errorf("readyWhen is not supported on patch nodes: a patch contributes fields to its target and publishes no value into scope, so there is nothing for readyWhen to evaluate; to wait for the target's state, add a ref node for the target and put readyWhen on it")
+		}
 		// A patch contributes fields to EXISTING targets. forEach is allowed: it
 		// fans the same contribution out across every rendered target (e.g. a
 		// status writeback to each claimant CR). Name-required and endpoint
 		// derivation are enforced later against the unmarshalled payload
 		// (derivePatchEndpoint); iterator→identity coverage (each rendered patch
-		// must resolve to a distinct name) is enforced in analyzeVariables so a
-		// forEach patch can't silently patch one target N times.
+		// must resolve to a distinct name) is enforced in analyzeVariables.
 		return nil
 	}
 	if len(n.ForEach) == 0 {

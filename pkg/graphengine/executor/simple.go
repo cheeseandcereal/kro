@@ -223,8 +223,10 @@ var _ Interface = (*Simple)(nil)
 // authoritative — bailing early on a not-ready upstream node would
 // leave downstream nodes' watches missing, and the next reconcile
 // would lose drift events on them. Soft errors are remembered and the
-// first one is returned at the end wrapped in ErrNotReady. Hard errors
-// (apply failure, type errors, etc.) still abort immediately.
+// first one is returned at the end wrapped in ErrNotReady, except that a
+// field-manager conflict takes precedence so it is never hidden behind a
+// node that is merely still converging. Hard errors (apply failure, type
+// errors, etc.) still abort immediately.
 //
 // Dependency-readiness gating: a node is applied only once every node it
 // depends on is ready this cycle (readyWhen satisfied). A dependency that
@@ -249,7 +251,7 @@ func (s *Simple) Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.W
 	var result ApplyResult
 	var firstSoft error
 	recordSoft := func(err error) {
-		if firstSoft == nil {
+		if firstSoft == nil || (errors.Is(err, ErrFieldManagerConflict) && !errors.Is(firstSoft, ErrFieldManagerConflict)) {
 			firstSoft = err
 		}
 	}
@@ -466,9 +468,8 @@ func (s *Simple) applyNodeByKind(
 			}
 			return nil, fmt.Errorf("apply %q (patch): %w", n.ID(), err)
 		}
-		// A patch publishes no value into scope; record observed so an
-		// optional readyWhen can still evaluate against the node.
-		n.SetObserved(desired, desired)
+		// A patch publishes no value into scope and the compiler rejects
+		// readyWhen on it, so there is no observed state to record.
 	default:
 		return nil, fmt.Errorf("apply %q: unknown kind %v", n.ID(), n.Kind())
 	}
@@ -1744,7 +1745,13 @@ func (s *Simple) applyPatchOne(ctx context.Context, rt *runtime.Runtime, w watch
 	subresource := n.Subresource()
 	if err := s.contributeApply(ctx, obj, fieldManager, subresource); err != nil {
 		if apierrors.IsConflict(err) {
-			return Contribution{}, fmt.Errorf("patch field conflict on %s %q: %w (%w)",
+			// Soft either way; an ownership conflict additionally carries
+			// ErrFieldManagerConflict so the controllers can report it distinctly.
+			if hasFieldManagerConflictCause(err) {
+				return Contribution{}, fmt.Errorf("patch field conflict on %s %q: %w (%w) (%w)",
+					obj.GetKind(), client.ObjectKeyFromObject(obj), err, ErrFieldManagerConflict, ErrNotReady)
+			}
+			return Contribution{}, fmt.Errorf("patch conflict on %s %q: %w (%w)",
 				obj.GetKind(), client.ObjectKeyFromObject(obj), err, ErrNotReady)
 		}
 		return Contribution{}, err
@@ -1968,6 +1975,22 @@ func isReclaimableStalePatchManager(manager, self, selfGraph string) bool {
 	return seg == "" || (selfGraph != "" && seg == selfGraph)
 }
 
+// hasFieldManagerConflictCause reports whether a 409 carries a FieldManagerConflict
+// cause (a server-side-apply ownership conflict) rather than, e.g., an
+// optimistic-concurrency precondition failure.
+func hasFieldManagerConflictCause(err error) bool {
+	status := apierrors.APIStatus(nil)
+	if !errors.As(err, &status) || status.Status().Details == nil {
+		return false
+	}
+	for _, cause := range status.Status().Details.Causes {
+		if cause.Type == metav1.CauseTypeFieldManagerConflict {
+			return true
+		}
+	}
+	return false
+}
+
 // conflictCauseManager extracts the field-manager name from an SSA conflict
 // cause message. The apiserver formats these as `conflict with "<manager>"`
 // optionally followed by ` using <version>[ at <time>]` or ` with subresource
@@ -2002,12 +2025,13 @@ func graphManagerSegment(parentUID types.UID) string {
 	return hex.EncodeToString(sum[:6])
 }
 
-// ErrFieldManagerConflict is the sentinel returned when a Template object's
-// field is already owned by a DIFFERENT kro Graph's template field manager.
-// kro refuses to force-steal a peer Graph's field, so the node is held soft
-// not-ready and the reconcile backs off instead of flip-flopping the field
-// between the two Graphs forever. It always also satisfies
-// errors.Is(err, ErrNotReady) at the call site (wrapped alongside it).
+// ErrFieldManagerConflict is the sentinel returned when a field this Graph
+// wants to write is owned by another field manager that kro refuses to steal:
+// a Template object owned by a DIFFERENT kro Graph's template manager, or a
+// main-resource patch contribution whose field is owned by anyone else. The
+// node is held soft not-ready (the call site also wraps ErrNotReady); the
+// controllers report it under its own reason because nothing was applied and
+// nothing will be until the other owner releases the field.
 var ErrFieldManagerConflict = errors.New("executor: field owned by a foreign field manager")
 
 // templateFieldManager derives a stable, PER-GRAPH field-manager identity for a

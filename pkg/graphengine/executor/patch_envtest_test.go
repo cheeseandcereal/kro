@@ -667,6 +667,9 @@ func TestPatch_StatusSubresourceLegacyUpdateConflictResolution(t *testing.T) {
 // an SSA field-manager conflict with a pre-existing manager, it is treated as a soft error
 // (ErrNotReady): the patch node is marked Unresolved, the error message mentions the
 // contending manager, and the topological walk continues to apply downstream nodes.
+// The error also carries ErrFieldManagerConflict so the controllers can report it under
+// its own reason, and it is returned even though an upstream node is soft not-ready
+// earlier in the walk.
 func TestPatch_FieldManagerConflictSoftRequeue(t *testing.T) {
 	cl := patchEnvClient(t)
 	ns := "default"
@@ -679,12 +682,19 @@ func TestPatch_FieldManagerConflictSoftRequeue(t *testing.T) {
 	require.NoError(t, cl.Patch(context.Background(), cm, client.Apply, client.FieldOwner("foreign-manager")))
 
 	// 2. Build graph with:
+	// - template node 'upstream' whose readyWhen is never satisfied (a plain soft not-ready that precedes 'p')
 	// - patch node 'p' patching contendedKey without ForceOwnership (which will conflict with foreign-manager)
 	// - downstream template node 'downstream' creating 'downstream-cm'
 	g := generator.NewGraph("g",
 		generator.WithNamespace(ns),
+		generator.WithTemplate("upstream", map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": "upstream-cm"},
+			"data":     map[string]any{"k": "patch-value"},
+		}),
+		generator.WithReadyWhen("${upstream.data.k == 'never'}"),
 		generator.WithPatch("p", "v1", "ConfigMap", targetName, map[string]any{
-			"data": map[string]any{"contendedKey": "patch-value"},
+			"data": map[string]any{"contendedKey": "${upstream.data.k}"},
 		}),
 		generator.WithTemplate("downstream", map[string]any{
 			"apiVersion": "v1", "kind": "ConfigMap",
@@ -697,15 +707,24 @@ func TestPatch_FieldManagerConflictSoftRequeue(t *testing.T) {
 	rt := compileAndBuildEnv(t, patchEnvCfg, g)
 	res, err := NewSimple(cl).Apply(context.Background(), rt, watchrouter.NoopWatcher{})
 
-	// 3. Error must be soft (ErrNotReady), node 'p' is Unresolved, and contending manager is in message.
+	// 3. Error must be soft (ErrNotReady) AND distinguishable (ErrFieldManagerConflict) even
+	// though 'upstream' was not ready first; node 'p' is Unresolved, and the contending
+	// manager + target are in the message.
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrNotReady), "field-manager conflict on patch must be soft ErrNotReady, got %v", err)
+	assert.True(t, errors.Is(err, ErrFieldManagerConflict), "field-manager conflict must win over the earlier plain not-ready, got %v", err)
 	assert.Contains(t, res.Unresolved, "p", "conflicting patch node must be recorded as Unresolved")
 	assert.Contains(t, err.Error(), "foreign-manager", "error message must include the contending field manager name")
+	assert.Contains(t, err.Error(), targetName, "error message must name the patch target")
+	assert.Empty(t, res.Contributions, "a refused contribution must not be recorded as landed")
 
-	// 4. Topological walk must NOT have aborted: downstream node was applied!
-	require.Len(t, res.Applied, 1, "downstream node must be applied despite patch conflict")
-	assert.Equal(t, "downstream-cm", res.Applied[0].Name)
+	// The foreign manager keeps its value: the patch is cooperative and did not steal the field.
+	assert.Equal(t, "initial-value", getConfigMap(t, cl, ns, targetName).Object["data"].(map[string]any)["contendedKey"])
+
+	// 4. Topological walk must NOT have aborted: upstream and downstream were applied.
+	require.Len(t, res.Applied, 2, "upstream and downstream nodes must be applied despite patch conflict")
+	assert.Equal(t, "upstream-cm", res.Applied[0].Name)
+	assert.Equal(t, "downstream-cm", res.Applied[1].Name)
 	downstreamCM := getConfigMap(t, cl, ns, "downstream-cm")
 	data, _, _ := unstructured.NestedStringMap(downstreamCM.Object, "data")
 	assert.Equal(t, "v", data["k"])

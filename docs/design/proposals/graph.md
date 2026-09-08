@@ -1,6 +1,6 @@
 # KREP-024: Graph
 
-> **Implementation status (as of v1alpha1):** This proposal document has been partially reconciled with the shipped implementation in `pkg/graphengine/` and `pkg/controller/graph/`. Key architectural differences from earlier drafts — including unified `ref:` for collections (superseding `watch:`), explicit `graph:` subgraph nodes, the raw-manifest `patch:` API (a `Patch *runtime.RawExtension` field authored exactly like `template:` — no `PatchSpec` wrapper, no `subresource`/`body` fields, no `forEach`; the target endpoint is derived from field presence, see `api/v1alpha1/graph_types.go:208`), collection expansion caps (`MaxCollectionSize`), and the `Accepted`/`ResourcesConverged`/`Ready` condition model — are reflected below. Note also that RGD is no longer a sibling engine: the RGD controller now unconditionally routes through the graph engine (it issues `GraphRevision` objects and serves compiled graphs through the shared runtime; see `pkg/controller/resourcegraphdefinition/controller_reconcile.go`). Features marked as "Planned" or "Not yet implemented" (such as KREP-006 `propagateWhen` and lifecycle signals) remain future work. Remaining design claims may still drift.
+> **Implementation status (as of v1alpha1):** This proposal document has been partially reconciled with the shipped implementation in `pkg/graphengine/` and `pkg/controller/graph/`. Key architectural differences from earlier drafts — including unified `ref:` for collections (superseding `watch:`), explicit `graph:` subgraph nodes, the raw-manifest `patch:` API (a `Patch *runtime.RawExtension` field authored exactly like `template:` — no `PatchSpec` wrapper, no `subresource`/`body` fields; `forEach` and `includeWhen` are supported, `readyWhen` is not; the target endpoint is derived from field presence, see `api/v1alpha1/graph_types.go:208`), collection expansion caps (`MaxCollectionSize`), and the `Accepted`/`ResourcesConverged`/`Ready` condition model — are reflected below. Note also that RGD is no longer a sibling engine: the RGD controller now unconditionally routes through the graph engine (it issues `GraphRevision` objects and serves compiled graphs through the shared runtime; see `pkg/controller/resourcegraphdefinition/controller_reconcile.go`). Features marked as "Planned" or "Not yet implemented" (such as KREP-006 `propagateWhen` and lifecycle signals) remain future work. Remaining design claims may still drift.
 
 ## Summary
 
@@ -159,7 +159,17 @@ presence**:
   endpoints. If a resource needs both, split into two patch nodes.
 - The scale subresource is not supported.
 
-Note that `forEach` is not supported on patch nodes.
+`forEach` is supported on patch nodes: the same contribution is fanned out across every rendered
+target, and every iterator must appear in the rendered `metadata.name`. `includeWhen` is supported.
+`readyWhen` is **not** supported on patch nodes and is rejected at compile time (`Accepted=False`): a
+patch publishes no value into scope, so there is nothing for a readyWhen to evaluate against. To wait
+for the target's state, add a `ref:` node for the target and put the `readyWhen` on that node.
+
+A main-resource patch is cooperative (see [Application & Field Management](#evaluation-model-and-compilation-cache)):
+when a contributed field is owned by another field manager — a human using `kubectl`, another
+controller, or a peer Graph — the contribution is refused rather than force-stolen, and the Graph
+reports `ResourcesConverged=False` with reason `FieldManagerConflict` naming the target and the
+contending manager. The contested field keeps the other owner's value until that owner releases it.
 
 ```yaml
 - id: instanceStatus
@@ -242,13 +252,13 @@ Node modifiers provide conditional logic, health checking, and repetition. In th
 
 - `forEach`: Supported on `template`, `def`, and `patch` nodes. On `template`/`def` it stamps one instance per element (or cartesian product across multiple dimensions); on `patch` it fans the same contribution out across every rendered target (each must resolve to a distinct name). Explicitly rejected on `graph` and `ref` nodes.
 - `includeWhen`: Supported on `template`, `ref`, `def`, and `patch` nodes. When false, the node is skipped (and template resources are pruned). The skip is contagious — nodes depending on a skipped node are skipped too, rather than erroring on the missing reference. Rejected on `graph` nodes.
-- `readyWhen`: Supported on `template`, `ref`, `def`, and `patch` nodes. Evaluated against scope to determine whether the node is ready. Rejected on `graph` nodes.
+- `readyWhen`: Supported on `template`, `ref`, and `def` nodes. Evaluated against scope to determine whether the node is ready. Rejected on `graph` nodes and on `patch` nodes (a patch publishes no value into scope, so there is nothing for readyWhen to evaluate; wait on the target's state through a `ref` node carrying the readyWhen instead).
 - `propagateWhen`: Planned / Not yet implemented (deferred to KREP-006).
 
 | Modifier        | Supported Node Types             | Question it answers       | When false                           | Status / Defined in  |
 | --------------- | -------------------------------- | ------------------------- | ------------------------------------ | -------------------- |
 | `includeWhen`   | `template`, `ref`, `def`, `patch`| Should this node exist?   | Prune — resource deleted / skipped   | Shipped (KREP-008)   |
-| `readyWhen`     | `template`, `ref`, `def`, `patch`| Is this node healthy?     | Signal only — Graph not Ready        | Shipped (from RGD)   |
+| `readyWhen`     | `template`, `ref`, `def`         | Is this node healthy?     | Signal only — Graph not Ready        | Shipped (from RGD)   |
 | `forEach`       | `template`, `def`, `patch`       | How many instances?       | N/A (expands node)                   | Shipped (KREP-002)   |
 | `propagateWhen` | (Planned)                        | May this node mutate now? | Freeze — last-applied state persists | Planned (KREP-006)   |
 
@@ -312,9 +322,9 @@ Reconciliation proceeds in topological order derived from hard dependency edges:
 2. **Evaluation & Scope:** A node evaluates as soon as its hard dependencies are in scope — meaning they have been applied and their observed state is available from the cluster. Nodes do not wait for upstream dependencies to pass `readyWhen`.
 3. **Application & Field Management:**
    - `template:` nodes apply their desired manifest via Server-Side Apply (SSA). On the RGD/instance path the shared field manager `kro.run/applyset` is used with force ownership. On the standalone Graph path a **per-Graph** field manager `kro-graphengine.tmpl.<graphSegment>` (e.g. `kro-graphengine.tmpl.d2ba416cfd76`, where `<graphSegment>` is derived from the Graph UID) is used **without** force so the API server reports a field-level conflict. Note the manager is keyed on the Graph UID **only**, not the node: every node of one Graph shares a single template manager, so ownership stays stable across a node rename (SSA narrows the manager's field set instead of orphaning the retired node's fields). The peer-vs-drift decision reads the 409's own conflict causes: a field owned by a _peer Graph's_ template manager is never stolen (the node is held soft not-ready), while external drift (a human or another controller) is reclaimed with force. Two nodes of the same Graph can never legitimately co-own one object — the identity-claim guard rejects that before any write — so there is no same-Graph self-conflict case.
-   - `patch:` nodes apply contributed fields under a dedicated per-node field manager (`kro-graphengine.patch.<graph>.<node>`). Force behavior **differs by target endpoint** (`pkg/graphengine/executor/simple.go:1495` `contributeApply`):
-     - A **status-subresource** patch (a top-level `status:` field) always applies **with** force ownership (`client.ForceOwnership`, `simple.go:1497`). Status writeback must reclaim status fields from a legacy `Update`-manager takeover (the pre-SSA controller wrote status via `Update`, which leaves fields owned by the `before-first-apply`/manager-update identity); without force the first status apply would 409 forever. SSA scopes the force to only the fields this manager sets.
-     - A **main-resource** patch (`spec:`, `data:`, `metadata.labels`/`annotations`, etc.) applies **without** force (`simple.go:1499`), so the API server reports a field-level 409 rather than silently stealing a field owned by a human, another controller, or a peer Graph — the caller surfaces that as soft not-ready. The one exception is a conflict with this Graph's own stale patch identity (a re-keyed node, or a legacy pre-segment manager), which is force-reclaimed since unforced it would deadlock forever.
+   - `patch:` nodes apply contributed fields under a dedicated per-node field manager (`kro-graphengine.patch.<graph>.<node>`). Force behavior **differs by target endpoint** (`contributeApply` in `pkg/graphengine/executor/simple.go`):
+     - A **status-subresource** patch (a top-level `status:` field) always applies **with** force ownership (`client.ForceOwnership`). Status writeback must reclaim status fields from a legacy `Update`-manager takeover (the pre-SSA controller wrote status via `Update`, which leaves fields owned by the `before-first-apply`/manager-update identity); without force the first status apply would 409 forever. SSA scopes the force to only the fields this manager sets.
+     - A **main-resource** patch (`spec:`, `data:`, `metadata.labels`/`annotations`, etc.) applies **without** force, so the API server reports a field-level 409 rather than silently stealing a field owned by a human, another controller, or a peer Graph — the caller surfaces that as soft not-ready under the distinct `FieldManagerConflict` reason (not `WaitingForReadiness`: nothing was applied, and nothing will be until the other owner releases the field). The one exception is a conflict with this Graph's own stale patch identity (a re-keyed node, or a legacy pre-segment manager), which is force-reclaimed since unforced it would deadlock forever.
    - The ownership implication: a status patch will _take over_ status fields another manager currently owns, while a main-resource patch is cooperative and will not. On delete or prune, releasing a contribution applies an empty object under that manager to relinquish field ownership without deleting the target object.
 4. **Reconciliation Parallelism:** Within a single Graph, nodes evaluate serially in topological order; collection instances evaluate in bounded parallel (default ApplyConcurrency=20). Across Graphs, reconciliation is fully parallel via controller-runtime's work queue.
 
@@ -401,6 +411,7 @@ A Graph object exposes three standard conditions managed by the controller:
   - Status `True` with reason `Applied` ("all nodes applied and ready").
   - Status `False` with reason `WaitingForReadiness` when apply succeeded but `readyWhen` expressions evaluate false.
   - Status `False` with reason `DataPending` when a node's CEL expression references data the cluster has not surfaced yet (e.g. pending status fields).
+  - Status `False` with reason `FieldManagerConflict` when a field a node wants to write is owned by another field manager that kro refuses to steal: a main-resource `patch:` contribution whose target field is owned by a human (`kubectl`), another controller, or a peer Graph, or a `template:` object owned by a peer Graph's template manager. Nothing was applied to the contested field; the message names the target and the contending manager. This reason takes precedence over `WaitingForReadiness`/`DataPending` from other nodes. The Graph is requeued with backoff and converges once the other owner releases the field.
   - Status `False` with reason `ApplyFailed` when the executor encounters a hard error applying resources.
 - **`Ready`** (`kro.run/v1alpha1` `GraphConditionTypeReady`): Root aggregate condition rolled up from `Accepted` and `ResourcesConverged`.
   - Status `True` when both `Accepted` and `ResourcesConverged` are `True`.
@@ -414,6 +425,7 @@ A Graph object exposes three standard conditions managed by the controller:
 | `ResourcesConverged` | True    | `Applied`            | All nodes applied and ready                  |
 | `ResourcesConverged` | False   | `WaitingForReadiness`| Applied, but readyWhen conditions not yet met|
 | `ResourcesConverged` | False   | `DataPending`        | Waiting for upstream cluster data in scope   |
+| `ResourcesConverged` | False   | `FieldManagerConflict`| A patch/template field is owned by another manager; not applied |
 | `ResourcesConverged` | False   | `ApplyFailed`        | Hard failure during resource apply           |
 | `Ready`              | True    | `Ready`              | All dependent conditions True (graph ready)  |
 | `Ready`              | False   | _(from dependent)_   | Spec invalid or apply failed                 |
@@ -487,7 +499,7 @@ scoping — e.g. short-lived/bound tokens and caller-credential propagation — 
 | KREP                            | Relationship                                                                                                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | KREP-001 (Status Conditions)    | System conditions (`Accepted`, `ResourcesConverged`, `Ready`) exist on Graph objects — never on user resources. Users define their own status via `patch:` nodes.       |
-| KREP-002 (Collections)          | Adopted with safety limits (`MaxCollectionSize = 1000`, `MaxCollectionDimensions = 10`). Supported on `template` and `def` nodes.                                      |
+| KREP-002 (Collections)          | Adopted with safety limits (`MaxCollectionSize = 1000`, `MaxCollectionDimensions = 10`). Supported on `template`, `def`, and `patch` nodes.                              |
 | KREP-003 (Decorators)           | A Decorator is naturally a Graph with `ref:` (selector) + `forEach`. No special runtime support needed.                                                                  |
 | KREP-006 (Propagation Control)  | Planned / Not yet implemented: `propagateWhen` gating and lifecycle signals (`.ready()`, `.updated()`) are deferred to KREP-006 and not yet implemented in the engine. |
 | KREP-008 (includeWhen)          | Graph implements `includeWhen` as a first-class modifier across `template`, `ref`, `def`, and `patch` nodes. Dependency inference works naturally.                      |
