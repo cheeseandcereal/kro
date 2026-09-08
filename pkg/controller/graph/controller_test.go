@@ -692,6 +692,17 @@ func TestConditionsMarker(t *testing.T) {
 			wantReason:  "Compiled",
 			msgContains: "1",
 		},
+		{
+			name: "ResourcesFieldManagerConflict drives Ready false even with Accepted true",
+			apply: func(m *ConditionsMarker) {
+				m.GraphCompiled(1)
+				m.ResourcesFieldManagerConflict("field owned by kubectl")
+			},
+			wantAcc:     metav1.ConditionTrue,
+			wantReady:   metav1.ConditionFalse,
+			wantReason:  "Compiled",
+			msgContains: "1",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

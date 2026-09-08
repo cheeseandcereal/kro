@@ -17,6 +17,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -182,6 +184,40 @@ func TestAnyConflictOwnedByForeignGraphTemplate(t *testing.T) {
 		"an unparseable error is treated as foreign (never force-steal on ambiguity)")
 	assert.True(t, anyConflictOwnedByForeignGraphTemplate(conflictErr(""), self),
 		"a conflict cause with no readable manager is treated as foreign")
+}
+
+// TestHasFieldManagerConflictCause pins the classifier that tells an SSA
+// ownership conflict apart from any other 409.
+func TestHasFieldManagerConflictCause(t *testing.T) {
+	t.Parallel()
+
+	fieldConflict := &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status: metav1.StatusFailure,
+		Reason: metav1.StatusReasonConflict,
+		Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldManagerConflict,
+			Message: `conflict with "kubectl-client-side-apply"`,
+			Field:   ".data.logLevel",
+		}}},
+	}}
+	assert.True(t, hasFieldManagerConflictCause(fieldConflict), "an SSA 409 with a FieldManagerConflict cause")
+	assert.True(t, hasFieldManagerConflictCause(fmt.Errorf("wrapped: %w", fieldConflict)),
+		"the classifier must see through fmt.Errorf wrapping")
+
+	// A 409 whose causes carry no field-manager conflict (e.g. an optimistic
+	// concurrency failure) is NOT a field-manager conflict.
+	assert.False(t, hasFieldManagerConflictCause(apierrors.NewConflict(
+		schema.GroupResource{Resource: "configmaps"}, "cm", errors.New("the object has been modified"))),
+		"a plain optimistic-concurrency 409 has no field-manager cause")
+	assert.False(t, hasFieldManagerConflictCause(&apierrors.StatusError{ErrStatus: metav1.Status{
+		Status: metav1.StatusFailure,
+		Reason: metav1.StatusReasonConflict,
+		Details: &metav1.StatusDetails{Causes: []metav1.StatusCause{{
+			Type: metav1.CauseTypeFieldValueInvalid, Field: ".data.x",
+		}}},
+	}}), "a 409 with only non-field-manager causes is not a field-manager conflict")
+	assert.False(t, hasFieldManagerConflictCause(errors.New("opaque")), "a non-API error is never a field-manager conflict")
+	assert.False(t, hasFieldManagerConflictCause(nil), "nil is never a field-manager conflict")
 }
 
 // contestedGraph builds and compiles a Graph that templates a single ConfigMap

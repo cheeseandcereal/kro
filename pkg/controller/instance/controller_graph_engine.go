@@ -221,6 +221,10 @@ func (c *Controller) reconcileViaGraphEngine(
 		} else {
 			mark.ResourcesDeleting("%v", applyErr)
 		}
+	case errors.Is(applyErr, executor.ErrNotReady) && errors.Is(applyErr, executor.ErrFieldManagerConflict):
+		// Soft like any not-ready node, but the message must say the field is
+		// owned by another manager (the instance markers have no dedicated reason).
+		mark.ResourcesNotReady("field manager conflict: %v", applyErr)
 	case errors.Is(applyErr, executor.ErrNotReady):
 		// Soft: a node is waiting on data/readiness. State stays InProgress;
 		// child watch events (and the requeue below) drive the next cycle.

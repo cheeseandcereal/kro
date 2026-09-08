@@ -163,6 +163,73 @@ func TestCompilePatch_ReferencingPatchNodeRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), `patch node "p" does not publish a value into scope and cannot be referenced in CEL expressions`)
 }
 
+// TestCompilePatch_ReadyWhenRejected verifies readyWhen on a patch node is
+// rejected up front with an actionable message, whatever the expression
+// references (another node, the patch itself, nothing, or `each` on a forEach
+// patch), rather than failing later in CEL analysis or evaluating against the
+// rendered contribution.
+func TestCompilePatch_ReadyWhenRejected(t *testing.T) {
+	t.Parallel()
+
+	for _, expr := range []string{"${w.status.phase == 'Ready'}", "${p.data.k == 'v'}", "${true}"} {
+		t.Run(expr, func(t *testing.T) {
+			t.Parallel()
+			g := generator.NewGraph("g",
+				generator.WithTemplate("w", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "w"},
+					"data":     map[string]any{"k": "v"},
+				}),
+				generator.WithPatch("p", "v1", "ConfigMap", "existing", map[string]any{
+					"data": map[string]any{"k": "${w.data.k}"},
+				}),
+				generator.WithReadyWhen(expr),
+			)
+
+			_, err := newTestCompiler(t).Compile(g)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `node "p"`)
+			assert.Contains(t, err.Error(), "readyWhen is not supported on patch nodes")
+			assert.Contains(t, err.Error(), "add a ref node for the target and put readyWhen on it")
+		})
+	}
+
+	t.Run("forEach patch with each-based readyWhen", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithDef("src", map[string]any{"names": []any{"a", "b"}}),
+			generator.WithPatchManifest("p", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${n}"},
+				"data":     map[string]any{"k": "v"},
+			}),
+			generator.WithReadyWhen("${each.data.k == 'v'}"),
+		)
+		g.Spec.Nodes[len(g.Spec.Nodes)-1].ForEach = []expv1alpha1.ForEachDimension{{"n": "${src.names}"}}
+		_, err := newTestCompiler(t).Compile(g)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "readyWhen is not supported on patch nodes")
+	})
+
+	// The same rule applies to a patch node inside a nested subgraph frame.
+	t.Run("nested subgraph", func(t *testing.T) {
+		t.Parallel()
+		child := generator.NewGraph("child",
+			generator.WithPatch("cp", "v1", "ConfigMap", "existing", map[string]any{
+				"data": map[string]any{"k": "v"},
+			}),
+			generator.WithReadyWhen("${true}"),
+		)
+		g := generator.NewGraph("g",
+			generator.WithDef("seed", map[string]any{"x": "y"}),
+			generator.WithSubgraph("sub", child),
+		)
+		_, err := newTestCompiler(t).Compile(g)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "readyWhen is not supported on patch nodes")
+	})
+}
+
 // TestCompilePatch_LabelsOnlyTargetsMainResource verifies a patch that only
 // contributes metadata.labels (no status) derives to the main-resource
 // endpoint (empty Subresource), not the status subresource.

@@ -361,12 +361,14 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 		marker.ResourcesConverged()
 	case errors.Is(applyErr, executor.ErrNotReady):
 		watcher.Done(true)
-		// Distinguish the two not-ready flavors so principals can tell
-		// "apply succeeded, cluster still settling" from "upstream data
-		// isn't visible yet, can't even resolve dependents."
-		if errors.Is(applyErr, krotruntime.ErrDataPending) {
+		// Distinguish the not-ready flavors: an ownership conflict (nothing
+		// applied), missing upstream data, or apply succeeded but still settling.
+		switch {
+		case errors.Is(applyErr, executor.ErrFieldManagerConflict):
+			marker.ResourcesFieldManagerConflict(applyErr.Error())
+		case errors.Is(applyErr, krotruntime.ErrDataPending):
 			marker.ResourcesDataPending(applyErr.Error())
-		} else {
+		default:
 			marker.ResourcesNotReady(applyErr.Error())
 		}
 	default:
@@ -852,6 +854,14 @@ func (m *ConditionsMarker) ResourcesNotReady(msg string) {
 // resolution gap.
 func (m *ConditionsMarker) ResourcesDataPending(msg string) {
 	m.cs.SetFalse(ResourcesConverged, "DataPending", msg)
+}
+
+// ResourcesFieldManagerConflict marks ResourcesConverged=False with reason
+// "FieldManagerConflict" — a field a node wants to write is owned by another
+// field manager that kro refuses to steal. Distinct from WaitingForReadiness
+// because nothing was applied and nothing will be until that owner releases it.
+func (m *ConditionsMarker) ResourcesFieldManagerConflict(msg string) {
+	m.cs.SetFalse(ResourcesConverged, "FieldManagerConflict", msg)
 }
 
 // ResourcesApplyFailed marks ResourcesConverged=False with reason

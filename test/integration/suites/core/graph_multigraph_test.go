@@ -212,10 +212,25 @@ var _ = Describe("Graph Multi-Graph Isolation", func() {
 		}, 15*time.Second)
 
 		// owner-b contends for the same field. It must NOT reach Ready=True
-		// (its apply is refused as a field-manager conflict).
+		// (its apply is refused as a field-manager conflict), and the refusal is
+		// reported under its own reason, FieldManagerConflict.
 		env.CreateGraph(t, mkGraph("owner-b", "b"))
 		keyB := types.NamespacedName{Namespace: ns, Name: "owner-b"}
 		env.AwaitCondition(t, keyB, expv1alpha1.GraphConditionTypeReady, metav1.ConditionFalse, 20*time.Second)
+		environment.Eventually(t, 10*time.Second, 200*time.Millisecond, func() error {
+			cur := env.GetGraph(t, keyB)
+			for i := range cur.Status.Conditions {
+				c := &cur.Status.Conditions[i]
+				if string(c.Type) != "ResourcesConverged" {
+					continue
+				}
+				if c.Status != metav1.ConditionFalse || c.Reason == nil || *c.Reason != "FieldManagerConflict" {
+					return fmt.Errorf("owner-b ResourcesConverged: want False/FieldManagerConflict, got %+v", c)
+				}
+				return nil
+			}
+			return fmt.Errorf("owner-b has no ResourcesConverged condition yet")
+		})
 
 		// The value must stay "a" and never flip to "b": no flip-flop, and the
 		// resourceVersion is not churning between the two owners.

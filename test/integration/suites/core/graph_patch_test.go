@@ -17,6 +17,7 @@ package core_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -24,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
@@ -296,6 +298,121 @@ var _ = Describe("Graph Patch", func() {
 			}
 			if data["orig"] != "kept" {
 				return fmt.Errorf("data.orig lost during release: got=%q", data["orig"])
+			}
+			return nil
+		}, 15*time.Second)
+	})
+
+	// A main-resource patch is cooperative: a contributed field already owned by
+	// a foreign field manager is refused and reported as
+	// ResourcesConverged=False/FieldManagerConflict naming the target and the
+	// manager; the field keeps the foreign value until that manager releases it.
+	It("reports a patch field owned by a foreign manager as FieldManagerConflict and converges once released", func() {
+		t := GinkgoT()
+		ns := env.CreateNamespace(t)
+		ctx := env.Context()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+
+		cmGVK := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+		cmKey := types.NamespacedName{Namespace: ns, Name: "app-config"}
+		const foreignManager = "kubectl-client-side-apply"
+
+		// A kubectl-like manager owns data.logLevel via server-side apply.
+		foreignApply := func(data map[string]any) {
+			obj := &unstructured.Unstructured{Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": cmKey.Name, "namespace": ns},
+				"data":       data,
+			}}
+			if err := env.Client.Patch(ctx, obj, client.Apply, client.FieldOwner(foreignManager)); err != nil {
+				t.Fatalf("foreign manager apply: %v", err)
+			}
+		}
+		foreignApply(map[string]any{"logLevel": "info", "other": "kept"})
+
+		g := &expv1alpha1.Graph{
+			ObjectMeta: metav1.ObjectMeta{Name: "loglevel-patcher", Namespace: ns},
+			Spec: expv1alpha1.GraphSpec{
+				Nodes: []expv1alpha1.Node{{
+					ID: "p",
+					Patch: environment.RawExt(t, map[string]any{
+						"apiVersion": "v1",
+						"kind":       "ConfigMap",
+						"metadata":   map[string]any{"name": cmKey.Name},
+						"data":       map[string]any{"logLevel": "debug"},
+					}),
+				}},
+			},
+		}
+		env.CreateGraph(t, g)
+		gKey := types.NamespacedName{Namespace: ns, Name: "loglevel-patcher"}
+
+		// The Graph compiles (Accepted=True) but does not converge: the conflict
+		// is reported under its own reason, and Ready rolls up to False.
+		env.AwaitCondition(t, gKey, expv1alpha1.GraphConditionTypeAccepted, metav1.ConditionTrue, 20*time.Second)
+		environment.Eventually(t, 20*time.Second, 200*time.Millisecond, func() error {
+			cur := env.GetGraph(t, gKey)
+			var conv *expv1alpha1.Condition
+			for i := range cur.Status.Conditions {
+				if string(cur.Status.Conditions[i].Type) == "ResourcesConverged" {
+					conv = &cur.Status.Conditions[i]
+				}
+			}
+			if conv == nil || conv.Status != metav1.ConditionFalse {
+				return fmt.Errorf("ResourcesConverged not False yet: %+v", conv)
+			}
+			if conv.Reason == nil || *conv.Reason != "FieldManagerConflict" {
+				return fmt.Errorf("ResourcesConverged reason: want FieldManagerConflict, got %+v", conv)
+			}
+			msg := ""
+			if conv.Message != nil {
+				msg = *conv.Message
+			}
+			for _, want := range []string{cmKey.Name, foreignManager, "logLevel"} {
+				if !strings.Contains(msg, want) {
+					return fmt.Errorf("ResourcesConverged message %q does not name %q", msg, want)
+				}
+			}
+			return nil
+		})
+		env.AwaitCondition(t, gKey, expv1alpha1.GraphConditionTypeReady, metav1.ConditionFalse, 10*time.Second)
+
+		// The foreign owner's value is untouched: kro did not steal the field,
+		// and no kro patch manager appears on the object.
+		environment.Consistently(t, 2*time.Second, 200*time.Millisecond, func() error {
+			cur := &unstructured.Unstructured{}
+			cur.SetGroupVersionKind(cmGVK)
+			if err := env.Client.Get(ctx, cmKey, cur); err != nil {
+				return err
+			}
+			data, _, _ := unstructured.NestedStringMap(cur.Object, "data")
+			if data["logLevel"] != "info" {
+				return fmt.Errorf("data.logLevel=%q — the foreign owner's value was overwritten", data["logLevel"])
+			}
+			for _, mf := range cur.GetManagedFields() {
+				if strings.HasPrefix(mf.Manager, "kro-graphengine.patch.") {
+					return fmt.Errorf("a kro patch manager %q landed on the contested object", mf.Manager)
+				}
+			}
+			return nil
+		})
+
+		// The foreign manager lets go of data.logLevel (re-applies without it).
+		// SSA drops the field from that manager's set, and the Graph's next
+		// requeue lands the contribution and converges.
+		foreignApply(map[string]any{"other": "kept"})
+
+		env.AwaitCondition(t, gKey, expv1alpha1.GraphConditionTypeReady, metav1.ConditionTrue, 60*time.Second)
+		env.AwaitObject(t, cmGVK, cmKey, func(u *unstructured.Unstructured) error {
+			data, _, _ := unstructured.NestedStringMap(u.Object, "data")
+			if data["logLevel"] != "debug" {
+				return fmt.Errorf("data.logLevel: want=debug got=%q", data["logLevel"])
+			}
+			if data["other"] != "kept" {
+				return fmt.Errorf("data.other: want=kept got=%q", data["other"])
 			}
 			return nil
 		}, 15*time.Second)

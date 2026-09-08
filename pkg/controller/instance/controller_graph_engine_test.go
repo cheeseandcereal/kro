@@ -223,6 +223,21 @@ func (e *errorClient) Get(ctx context.Context, key client.ObjectKey, obj client.
 	return e.Client.Get(ctx, key, obj, opts...)
 }
 
+// managedFieldsInjectingClient stamps a managedFields entry under `manager`
+// onto every object it GETs (the fake client strips managedFields).
+type managedFieldsInjectingClient struct {
+	client.Client
+	manager string
+}
+
+func (m *managedFieldsInjectingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := m.Client.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	obj.SetManagedFields([]metav1.ManagedFieldsEntry{{Manager: m.manager, Operation: metav1.ManagedFieldsOperationApply}})
+	return nil
+}
+
 // -----------------------------------------------------------------------------
 // 1. orphanApplyOrder Tests
 // -----------------------------------------------------------------------------
@@ -941,6 +956,44 @@ func TestReconcileViaGraphEngine_SoftErrors(t *testing.T) {
 		assert.Equal(t, "NotReady", *cond.Reason)
 		require.NotNil(t, cond.Message)
 		assert.Contains(t, *cond.Message, "waiting for unresolved resource")
+
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateInProgress), status["state"])
+	})
+
+	// A field-manager conflict (here the cross-engine guard refusing a template
+	// object owned by a standalone Graph) stays soft, but the message must say so
+	// instead of the generic "waiting for unresolved resource".
+	t.Run("Executor returns field-manager conflict -> ResourcesReady False (NotReady) with a field-manager-conflict message, state InProgress", func(t *testing.T) {
+		inst := newInstanceObject("demo", "default")
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		existing := newConfigMapObject("app-config", "default")
+		fakeRuntimeCl := &managedFieldsInjectingClient{
+			Client: newFakeRuntimeClient(t, existing),
+			// A standalone Graph's template manager: "kro-graphengine.tmpl.<graphSegment>".
+			manager: "kro-graphengine.tmpl.d2ba416cfd76",
+		}
+		spec := testRGDSpecWithConfigMap("app-config", "")
+		c, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, comp, fakeRuntimeCl)
+
+		watcher := &fakeInstanceWatcher{}
+		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
+		require.Error(t, err)
+		assert.True(t, requeue.IsRequeueError(err), "a field-manager conflict stays a soft requeue")
+		assert.True(t, errors.Is(err, executor.ErrNotReady))
+		assert.True(t, errors.Is(err, executor.ErrFieldManagerConflict))
+
+		stored := getStoredParentObject(t, raw)
+		cond := conditionByType(t, stored, ResourcesReady)
+		assert.Equal(t, metav1.ConditionFalse, cond.Status)
+		require.NotNil(t, cond.Reason)
+		assert.Equal(t, "NotReady", *cond.Reason)
+		require.NotNil(t, cond.Message)
+		assert.Contains(t, *cond.Message, "field manager conflict:",
+			"the message must identify the contention instead of the generic readiness wait")
+		assert.NotContains(t, *cond.Message, "waiting for unresolved resource")
+		assert.Contains(t, *cond.Message, "owned by a foreign kro Graph", "the executor's detail is preserved")
 
 		status, _, _ := unstructured.NestedMap(stored.Object, "status")
 		require.NotNil(t, status)

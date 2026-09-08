@@ -20,6 +20,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -92,10 +93,11 @@ func TestUpdateStatusGenerationGuard(t *testing.T) {
 }
 
 // TestReconcileResourcesDataPendingCondition asserts the reconciler
-// distinguishes the two soft-error flavors via reason — DataPending
-// for unresolved CEL refs, WaitingForReadiness for readyWhen=false.
+// distinguishes the soft-error flavors via reason — DataPending for
+// unresolved CEL refs, WaitingForReadiness for readyWhen=false,
+// FieldManagerConflict for a field owned by another manager.
 // The error message reaching the marker decides which reason fires;
-// errors.Is must traverse the fmt.Errorf wrapping chain.
+// errors.Is must traverse the fmt.Errorf (and errors.Join) wrapping chain.
 func TestReconcileResourcesDataPendingCondition(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -111,6 +113,17 @@ func TestReconcileResourcesDataPendingCondition(t *testing.T) {
 			name:       "waiting-for-readiness-routes-to-WaitingForReadiness",
 			applyErr:   fmt.Errorf("apply %q: %w (%w)", "n", krotruntime.ErrWaitingForReadiness, executor.ErrNotReady),
 			wantReason: "WaitingForReadiness",
+		},
+		{
+			// A forEach patch joins per-target soft errors; one conflicting target
+			// is enough for the dedicated reason.
+			name: "field-manager-conflict-routes-to-FieldManagerConflict",
+			applyErr: fmt.Errorf("apply %q (patch): %w", "p", errors.Join(
+				fmt.Errorf("patch target ConfigMap %q not found: %w", "default/a", executor.ErrNotReady),
+				fmt.Errorf("patch field conflict on ConfigMap %q: conflict with %q: .data.k (%w) (%w)",
+					"default/b", "kubectl", executor.ErrFieldManagerConflict, executor.ErrNotReady),
+			)),
+			wantReason: "FieldManagerConflict",
 		},
 	}
 
