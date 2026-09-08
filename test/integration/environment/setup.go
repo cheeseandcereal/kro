@@ -377,6 +377,22 @@ func (e *Environment) setupController() error {
 		return fmt.Errorf("setting up graph revision reconciler: %w", err)
 	}
 
+	// Mirror production (setupGraphEngine): the CRD schema watcher and the Graph
+	// compile cache it invalidates are created regardless of the GraphKind gate.
+	reg := registry.New()
+	sw := schemawatcher.New(
+		zap.New(zap.WriteTo(e.ControllerConfig.LogWriter), zap.UseDevMode(true)).WithName("graph-engine"),
+		schemawatcher.Config{
+			Cache:   e.CtrlManager.GetCache(),
+			Graphs:  reg,
+			Schemas: geCmp,
+		},
+	)
+	if err := e.CtrlManager.Add(sw); err != nil {
+		return fmt.Errorf("adding graph-engine schema watcher to manager: %w", err)
+	}
+	e.SchemaWatcher = sw
+
 	if features.FeatureGate.Enabled(features.GraphKind) {
 		router := watchrouter.NewRouter(
 			zap.New(zap.WriteTo(e.ControllerConfig.LogWriter), zap.UseDevMode(true)).WithName("graph-watch-router"),
@@ -387,20 +403,6 @@ func (e *Environment) setupController() error {
 			return fmt.Errorf("adding graph watch router to manager: %w", err)
 		}
 		e.Router = router
-
-		reg := registry.New()
-		sw := schemawatcher.New(
-			zap.New(zap.WriteTo(e.ControllerConfig.LogWriter), zap.UseDevMode(true)).WithName("graph-schema-watcher"),
-			schemawatcher.Config{
-				Cache:   e.CtrlManager.GetCache(),
-				Graphs:  reg,
-				Schemas: geCmp,
-			},
-		)
-		if err := e.CtrlManager.Add(sw); err != nil {
-			return fmt.Errorf("adding graph schema watcher to manager: %w", err)
-		}
-		e.SchemaWatcher = sw
 
 		exec := executor.NewSimple(e.CtrlManager.GetClient())
 		exec.ApplyConcurrency = e.ControllerConfig.ReconcileConfig.ApplyConcurrency
@@ -420,8 +422,10 @@ func (e *Environment) setupController() error {
 		// grantImpersonatedServiceAccounts) — that keeps Graph behavior unchanged
 		// (the SA can do everything) while still running the impersonated path.
 		// RBAC-confinement is proven separately in a dedicated envtest.
+		// As in production, the impersonated clients use the compiler's mapper and
+		// the client cache is purged by the schema watcher.
 		baseCfg := e.CtrlManager.GetConfig()
-		mapper := e.CtrlManager.GetRESTMapper()
+		mapper := geCmp.RESTMapper()
 		impersonation := ctrlgraph.NewImpersonation(exec, func(user string) (client.Client, error) {
 			cfg := rest.CopyConfig(baseCfg)
 			cfg.Impersonate = rest.ImpersonationConfig{UserName: user}
@@ -435,6 +439,7 @@ func (e *Environment) setupController() error {
 			}
 			return cs.AuthorizationV1(), nil
 		})
+		sw.AddSchemaInvalidator(impersonation)
 
 		graphReconciler := &ctrlgraph.Reconciler{
 			Client:                  e.CtrlManager.GetClient(),

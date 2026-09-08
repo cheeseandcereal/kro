@@ -16,6 +16,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
@@ -37,15 +38,48 @@ import (
 // api/v1alpha1's SchemeBuilder, which main.go already adds — no separate
 // registration is needed here.
 
-// setupGraphController wires the Graph controller into the
-// manager alongside the ResourceGraphDefinition stack. It builds the compile
-// cache, the resource-drift watch router, and the CRD schema watcher, then
-// registers the reconciler. The router and schema watcher are added as manager
-// Runnables so their event channels feed the same work queue as Graph spec
-// changes.
+// setupGraphEngine builds the graph-engine compiler, the Graph compile cache
+// and the CRD schema watcher (added to the manager) and returns them. It runs
+// regardless of the GraphKind gate: the compiler serves every RGD instance
+// controller, and the watcher is what drives Compiler.InvalidateSchema.
+func setupGraphEngine(
+	mgr ctrl.Manager,
+	restConfig *rest.Config,
+	httpClient *http.Client,
+	logger logr.Logger,
+	celCostLimit uint64,
+) (*compiler.Compiler, *registry.Registry, *schemawatcher.SchemaWatcher, error) {
+	cmp, err := compiler.NewCompiler(restConfig, httpClient)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("build graph-engine compiler: %w", err)
+	}
+	cmp.WithCostLimit(celCostLimit)
+
+	// The registry lives here so the watcher can invalidate it (empty while the
+	// gate is off). The watcher needs full CRD objects, so this adds a structured
+	// CRD informer next to the RGD reconciler's metadata-only one.
+	reg := registry.New()
+	sw := schemawatcher.New(logger.WithName("graph-engine"), schemawatcher.Config{
+		Cache:   mgr.GetCache(),
+		Graphs:  reg,
+		Schemas: cmp,
+	})
+	if err := mgr.Add(sw); err != nil {
+		return nil, nil, nil, fmt.Errorf("add graph-engine schema watcher: %w", err)
+	}
+	return cmp, reg, sw, nil
+}
+
+// setupGraphController wires the Graph controller into the manager alongside
+// the ResourceGraphDefinition stack, reusing the compiler, compile cache and
+// CRD schema watcher from setupGraphEngine. It builds the resource-drift watch
+// router (a manager Runnable feeding the Graph work queue) and the impersonated
+// executor clients, then registers the reconciler.
 func setupGraphController(
 	mgr ctrl.Manager,
 	cmp *compiler.Compiler,
+	reg *registry.Registry,
+	sw *schemawatcher.SchemaWatcher,
 	metaClient metadata.Interface,
 	logger logr.Logger,
 	concurrentReconciles int,
@@ -56,16 +90,6 @@ func setupGraphController(
 	router := watchrouter.NewRouter(logger.WithName("graph-watch-router"), watchrouter.Config{}, metaClient)
 	if err := mgr.Add(router); err != nil {
 		return fmt.Errorf("add graph watch router: %w", err)
-	}
-
-	reg := registry.New()
-	sw := schemawatcher.New(logger.WithName("graph-schema-watcher"), schemawatcher.Config{
-		Cache:   mgr.GetCache(),
-		Graphs:  reg,
-		Schemas: cmp,
-	})
-	if err := mgr.Add(sw); err != nil {
-		return fmt.Errorf("add graph schema watcher: %w", err)
 	}
 
 	exec := executor.NewSimple(mgr.GetClient())
@@ -79,11 +103,12 @@ func setupGraphController(
 	// A namespaced Graph applies its resources while impersonating a
 	// ServiceAccount in the Graph's namespace (default, or spec.serviceAccountName).
 	// Build impersonated controller-runtime clients from the manager's REST
-	// config; they share the manager's REST mapper so discovery is not repeated
-	// per ServiceAccount. The kro controller SA needs the "impersonate" verb on
-	// serviceaccounts for this to take effect.
+	// config; they share the compiler's REST mapper — the one the schema watcher
+	// resets — so discovery is not repeated per ServiceAccount and a recreated
+	// CRD's new plural/scope is picked up. The kro controller SA needs the
+	// "impersonate" verb on serviceaccounts for this to take effect.
 	baseCfg := mgr.GetConfig()
-	mapper := mgr.GetRESTMapper()
+	mapper := cmp.RESTMapper()
 	impersonation := ctrlgraph.NewImpersonation(exec, func(user string) (client.Client, error) {
 		cfg := rest.CopyConfig(baseCfg)
 		cfg.Impersonate = rest.ImpersonationConfig{UserName: user}
@@ -101,6 +126,9 @@ func setupGraphController(
 		}
 		return cs.AuthorizationV1(), nil
 	})
+	// Cached clients memoize each GVK's mapping for their lifetime, so CRD
+	// changes must also purge them (see impersonationCache.InvalidateSchema).
+	sw.AddSchemaInvalidator(impersonation)
 
 	reconciler := &ctrlgraph.Reconciler{
 		Client:                   mgr.GetClient(),

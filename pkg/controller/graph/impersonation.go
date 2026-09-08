@@ -37,6 +37,7 @@ import (
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/executor"
+	"github.com/kubernetes-sigs/kro/pkg/graphengine/schemawatcher"
 )
 
 // defaultServiceAccountName is impersonated when a Graph does not set
@@ -75,6 +76,18 @@ type impersonationCache struct {
 	byUser  *lru.Cache[string, executor.Interface]
 	newExec func(user string) (executor.Interface, error)
 }
+
+// InvalidateSchema purges every cached executor: a controller-runtime client
+// memoizes each GVK's REST mapping for life, so a recreated CRD needs fresh clients.
+func (c *impersonationCache) InvalidateSchema(_ schema.GroupKind) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byUser != nil {
+		c.byUser.Purge()
+	}
+}
+
+var _ schemawatcher.SchemaInvalidator = (*impersonationCache)(nil)
 
 // executorFor returns an executor bound to the impersonated identity for g. It
 // is derived from the base executor via the reconciler's client factory so it

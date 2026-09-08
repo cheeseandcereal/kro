@@ -143,7 +143,7 @@ func TestGraphImpersonationConfinement(t *testing.T) {
 	exec.ConflictDetection = true
 
 	baseCfg := mgr.GetConfig()
-	mapper := mgr.GetRESTMapper()
+	mapper := cmp.RESTMapper()
 	impersonation := ctrlgraph.NewImpersonation(exec, func(user string) (client.Client, error) {
 		ic := rest.CopyConfig(baseCfg)
 		ic.Impersonate = rest.ImpersonationConfig{UserName: user}

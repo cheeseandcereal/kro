@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package schemawatcher watches CustomResourceDefinitions and re-enqueues
-// Graphs whose templates reference a Kind whose schema changed.
+// Package schemawatcher watches CustomResourceDefinitions, invalidates the
+// graph engine's schema / REST-mapping caches, and re-enqueues Graphs whose
+// templates reference a Kind whose schema changed.
 //
-// The package solves two correctness problems:
+// The package solves three correctness problems:
 //
 //  1. Without it, a CRD field added / removed / re-validated never
 //     reaches the compile cache. Graphs that reference the Kind keep
@@ -25,6 +26,11 @@
 //  2. Graphs whose templates use CEL in `apiVersion` or `kind` have
 //     unknowable GroupKind dependencies at compile time. They must
 //     re-reconcile on *any* CRD change to stay current.
+//
+//  3. The compiler's schema and REST-mapping caches are only refreshed by
+//     Compiler.InvalidateSchema, which every CRD event drives through the
+//     SchemaInvalidator whether or not any Graph subscribes — so the watcher
+//     runs regardless of the GraphKind gate.
 //
 // Architecture:
 //
@@ -98,9 +104,10 @@ type Config struct {
 	Graphs GraphInvalidator
 
 	// Schemas is invoked on every CRD event that surfaces a schema
-	// change, once per changed GroupKind. Implementations should drop
-	// any cached schema resolution for the GK so the next compile
-	// sees fresh data.
+	// change, once per changed GroupKind, whether or not any Graph
+	// subscribes to it. Implementations should drop any cached schema
+	// resolution / REST mapping for the GK so the next compile sees fresh
+	// data. Further targets can be added with AddSchemaInvalidator.
 	Schemas SchemaInvalidator
 
 	// EventBuffer is the depth of the channel feeding the source.Source
@@ -116,10 +123,15 @@ type Config struct {
 // Concurrent-safe: mu guards every map access. The CRD informer's event
 // goroutine and per-Graph Subscribe call sites can interleave freely.
 type SchemaWatcher struct {
-	log     logr.Logger
-	cache   ctrlcache.Cache
-	graphs  GraphInvalidator
-	schemas SchemaInvalidator
+	log    logr.Logger
+	cache  ctrlcache.Cache
+	graphs GraphInvalidator
+
+	// schemas are the SchemaInvalidator targets in registration order
+	// (Config.Schemas first). Guarded by schemasMu, not mu, so notify can
+	// snapshot them without the reverse-index lock.
+	schemasMu sync.RWMutex
+	schemas   []SchemaInvalidator
 
 	events chan event.GenericEvent
 	closed atomic.Bool
@@ -175,7 +187,6 @@ func New(log logr.Logger, cfg Config) *SchemaWatcher {
 		log:          log.WithName("schema-watcher"),
 		cache:        cfg.Cache,
 		graphs:       cfg.Graphs,
-		schemas:      cfg.Schemas,
 		events:       make(chan event.GenericEvent, buf),
 		dirty:        make(map[client.ObjectKey]struct{}),
 		wakeup:       make(chan struct{}, 1),
@@ -184,6 +195,9 @@ func New(log logr.Logger, cfg Config) *SchemaWatcher {
 		dynamic:      make(map[client.ObjectKey]struct{}),
 		subs:         make(map[client.ObjectKey]*graphSub),
 		schemaHashes: make(map[schema.GroupKind]string),
+	}
+	if cfg.Schemas != nil {
+		w.schemas = append(w.schemas, cfg.Schemas)
 	}
 	// The drainer forwards coalesced dirty keys onto events. Started here
 	// (not in Start) so events flow even for callers that use the watcher
@@ -241,6 +255,18 @@ func (w *SchemaWatcher) drainLoop() {
 // Graph spec changes and drift events.
 func (w *SchemaWatcher) Source() source.Source {
 	return source.Channel(w.events, &handler.EnqueueRequestForObject{})
+}
+
+// AddSchemaInvalidator registers a further target for schema-changing CRD
+// events, for caches wired after the watcher (the gated Graph controller's
+// impersonated-client cache). nil is ignored.
+func (w *SchemaWatcher) AddSchemaInvalidator(inv SchemaInvalidator) {
+	if inv == nil {
+		return
+	}
+	w.schemasMu.Lock()
+	defer w.schemasMu.Unlock()
+	w.schemas = append(w.schemas, inv)
 }
 
 // Start implements manager.Runnable. It attaches the informer event
@@ -528,16 +554,21 @@ func (w *SchemaWatcher) affectedLocked(gk schema.GroupKind) map[client.ObjectKey
 
 // notify invokes the configured invalidators (schema first, then per
 // graph) and pushes a GenericEvent for each affected Graph. The
-// schema invalidator goes first so the next reconcile finds a clean
+// schema invalidators go first so the next reconcile finds a clean
 // resolver cache; the graph invalidator drops the cached Program;
-// then the enqueue triggers the reconcile.
+// then the enqueue triggers the reconcile. The schema invalidators run
+// even with no subscribers: with the GraphKind gate off there are none,
+// but the compiler still serves every RGD instance controller.
 func (w *SchemaWatcher) notify(gk schema.GroupKind, keys map[client.ObjectKey]struct{}, reason string) {
 	if len(keys) == 0 {
 		w.log.V(2).Info("schema event with no subscribers", "gk", gk, "reason", reason)
 	}
 
-	if w.schemas != nil {
-		w.schemas.InvalidateSchema(gk)
+	w.schemasMu.RLock()
+	invalidators := append([]SchemaInvalidator(nil), w.schemas...)
+	w.schemasMu.RUnlock()
+	for _, inv := range invalidators {
+		inv.InvalidateSchema(gk)
 	}
 	for key := range keys {
 		if w.graphs != nil {

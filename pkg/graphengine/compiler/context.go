@@ -266,7 +266,7 @@ func (ctx *CompilationContext) buildNode(p *parser.Parser, n *expv1alpha1.Node, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve schema for %s: %w", gvk, err)
 	}
-	mapping, err := ctx.restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	mapping, err := ctx.restMapping(gvk)
 	if err != nil {
 		return nil, nil, fmt.Errorf("rest mapping for %s: %w", gvk, err)
 	}
@@ -336,6 +336,18 @@ func (ctx *CompilationContext) buildNode(p *parser.Parser, n *expv1alpha1.Node, 
 		// a list into scope like a forEach collection.
 		Collection: kind == NodeKindRef && hasMetadataSelector(payload),
 	}, sch, nil
+}
+
+// restMapping resolves gvk's REST mapping, resetting the mapper and retrying
+// once on a NoMatch: the deferred mapper is a frozen snapshot after its first
+// refresh (see Compiler.InvalidateSchema), so a new Kind is otherwise unmappable.
+func (ctx *CompilationContext) restMapping(gvk k8sschema.GroupVersionKind) (*meta.RESTMapping, error) {
+	mapping, err := ctx.restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err == nil || !meta.IsNoMatchError(err) {
+		return mapping, err
+	}
+	meta.MaybeResetRESTMapper(ctx.restMapper)
+	return ctx.restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 }
 
 type parsedNodeElements struct {

@@ -387,17 +387,19 @@ Integration (envtest):
 ### Two facts that shape the work
 
 1. **Recovery is largely free on the RGD path.** The production
-   `ResourceGraphDefinition` path does **not** use the `SchemaWatcher` (that is
-   wired only into the experimental `kro.run/v1alpha1` **Graph** controller,
-   `cmd/controller/graphengine.go`). It does not need it: a `Deferred` node
+   `ResourceGraphDefinition` path does **not** subscribe to the `SchemaWatcher`
+   (per-Graph re-enqueue is wired only into the experimental `kro.run/v1alpha1`
+   **Graph** controller; the watcher itself runs unconditionally and resets the
+   compiler's schema/REST-mapping caches on CRD events). It does not need a
+   subscription: a `Deferred` node
    resolves its GVR *lazily at apply time* (identical to `DynamicGVK`), and the
    instance controller already soft-requeues on `ErrNotReady`
    (`controller_graph_engine.go` → `requeue.NeededAfter`) and re-reconciles on
    child-resource events. In the motivating example the re-trigger is `operator`
    becoming Ready — a child-watch event that re-runs the instance, at which point
    the now-present `InstallAddon` CRD maps successfully. So **no new recovery
-   wiring is required for correctness**; the CRD-add→enqueue bridge and
-   `RESTMapper` reset are latency optimizations only.
+   wiring is required for correctness**; the CRD-add→enqueue bridge is a latency
+   optimization only.
 
 2. **The classic builder is the harder half.** `pkg/graph/builder.go` has no
    `dyn`-identifier path today — every node always carries a resolved schema, so

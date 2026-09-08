@@ -108,6 +108,12 @@ func (c *Compiler) WithCostLimit(limit uint64) *Compiler {
 	return c
 }
 
+// RESTMapper returns the compiler's REST mapper so executor clients resolve
+// plural/scope through the mapper InvalidateSchema resets.
+func (c *Compiler) RESTMapper() meta.RESTMapper {
+	return c.restMapper
+}
+
 // rootContext builds a fresh root CompilationContext for a single Compile.
 // It carries the compiler's shared schema resolver and REST mapper plus a
 // per-compile field cache; parent is nil (the root lexical frame).
@@ -117,21 +123,12 @@ func (c *Compiler) rootContext() *CompilationContext {
 	return ctx
 }
 
-// InvalidateSchema drops cached schema entries for the supplied
-// GroupKind from the compiler's resolver cache, so the next compile
-// re-fetches fresh data. The schema watcher calls this when a CRD's
-// content changes. No-op when the compiler was built without a
-// cached resolver (tests).
-//
-// It also resets the REST mapping / discovery caches. The mapper is a
-// DeferredDiscoveryRESTMapper whose delegate caches every GVR->scope/plural
-// mapping; that cache only self-heals on a NoMatch, so recreating a CRD with
-// the same GroupKind+version but a new scope (Namespaced<->Cluster) or plural
-// would otherwise keep routing to the stale endpoint until restart. The mapper
-// has no per-GroupKind eviction, so we do a full Reset() (invalidates the
-// discovery cache and drops the delegate mapper); it re-discovers lazily on the
-// next mapping request. Schema invalidations are rare (CRD content changes), so
-// the cost of a full re-discovery here is acceptable.
+// InvalidateSchema drops the cached schemas for gk and resets the REST mapper's
+// discovery cache; the schema watcher calls it on every CRD add, schema change
+// and delete. The DeferredDiscoveryRESTMapper self-heals a NoMatch only while
+// its discovery cache is unpopulated, so after the first compile it is frozen
+// until Reset() — a same-GVK plural/scope change is never a NoMatch and is only
+// observed here (the RGD path's program cache and executor client still are not).
 func (c *Compiler) InvalidateSchema(gk k8sschema.GroupKind) {
 	if c.resolverCache == nil {
 		return

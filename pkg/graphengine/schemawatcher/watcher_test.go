@@ -534,6 +534,65 @@ func TestNoopFallbacks(t *testing.T) {
 	assert.ElementsMatch(t, []client.ObjectKey{graphA}, got)
 }
 
+// TestCRDEventWithNoSubscribersStillInvalidatesSchema: with no Graph
+// subscribed (GraphKind off), every schema-changing CRD event must still reach
+// the schema invalidator while nothing is enqueued.
+func TestCRDEventWithNoSubscribersStillInvalidatesSchema(t *testing.T) {
+	gk := schema.GroupKind{Group: "spot.example.com", Kind: "Widget"}
+	v0 := makeCRD("spot.example.com", "Widget", "v0")
+	v1 := makeCRD("spot.example.com", "Widget", "v1")
+
+	cases := []struct {
+		name  string
+		event func(sw *SchemaWatcher)
+	}{
+		{"add", func(sw *SchemaWatcher) { sw.onAdd(v0) }},
+		{"schema-changing update", func(sw *SchemaWatcher) { sw.onUpdate(v0, v1) }},
+		{"delete", func(sw *SchemaWatcher) { sw.onDelete(v0) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sw, gi, si := newTestWatcher(t)
+			sw.onAdd(v0) // seed the hash so the update is not deduped
+			si.calls = nil
+			tc.event(sw)
+			assert.Equal(t, []schema.GroupKind{gk}, si.snapshot())
+			assert.Empty(t, gi.snapshot())
+			assert.Empty(t, drainEvents(sw, 50*time.Millisecond))
+		})
+	}
+}
+
+// TestAddSchemaInvalidatorFansOut: late-registered invalidators see every
+// schema-changing event in registration order; nil is ignored.
+func TestAddSchemaInvalidatorFansOut(t *testing.T) {
+	var order []string
+	record := func(name string) *funcInvalidator {
+		return &funcInvalidator{fn: func(schema.GroupKind) { order = append(order, name) }}
+	}
+
+	sw := New(logr.Discard(), Config{Schemas: record("config"), EventBuffer: 16})
+	sw.AddSchemaInvalidator(record("added-1"))
+	sw.AddSchemaInvalidator(nil)
+	sw.AddSchemaInvalidator(record("added-2"))
+	sw.onAdd(makeCRD("spot.example.com", "Widget", "v0"))
+	assert.Equal(t, []string{"config", "added-1", "added-2"}, order)
+
+	// Without Config.Schemas only the added targets run.
+	order = nil
+	sw2 := New(logr.Discard(), Config{EventBuffer: 16})
+	sw2.AddSchemaInvalidator(record("only"))
+	sw2.onDelete(makeCRD("spot.example.com", "Widget", "v0"))
+	assert.Equal(t, []string{"only"}, order)
+}
+
+// funcInvalidator adapts a func to SchemaInvalidator.
+type funcInvalidator struct {
+	fn func(schema.GroupKind)
+}
+
+func (f *funcInvalidator) InvalidateSchema(gk schema.GroupKind) { f.fn(gk) }
+
 // TestRequiredDoneCount confirms SubscribedGraphs returns 0 after the
 // last Graph is removed.
 func TestRequiredDoneCount(t *testing.T) {

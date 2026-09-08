@@ -112,6 +112,49 @@ func TestExecutorFor_ImpersonationOverride(t *testing.T) {
 	}, builtFor)
 }
 
+// TestImpersonationCache_InvalidateSchemaRebuildsClients: a schema invalidation
+// drops every cached impersonated executor so the next reconcile rebuilds it.
+func TestImpersonationCache_InvalidateSchemaRebuildsClients(t *testing.T) {
+	base := executor.NewSimple(fake.NewClientBuilder().Build())
+
+	var builtFor []string
+	imp := NewImpersonation(base, func(user string) (client.Client, error) {
+		builtFor = append(builtFor, user)
+		return fake.NewClientBuilder().Build(), nil
+	}, nil)
+	r := &Reconciler{Executor: base, Impersonation: imp}
+
+	exA, err := r.executorFor(graphWithSA("team-a", "deployer"))
+	require.NoError(t, err)
+	exB, err := r.executorFor(graphWithSA("team-b", "deployer"))
+	require.NoError(t, err)
+	require.Len(t, builtFor, 2)
+
+	imp.InvalidateSchema(schema.GroupKind{Group: "spot.example.com", Kind: "Widget"})
+
+	exA2, err := r.executorFor(graphWithSA("team-a", "deployer"))
+	require.NoError(t, err)
+	exB2, err := r.executorFor(graphWithSA("team-b", "deployer"))
+	require.NoError(t, err)
+	assert.NotSame(t, exA, exA2, "team-a executor must be rebuilt after a schema invalidation")
+	assert.NotSame(t, exB, exB2, "team-b executor must be rebuilt after a schema invalidation")
+	assert.Equal(t, []string{
+		"system:serviceaccount:team-a:deployer",
+		"system:serviceaccount:team-b:deployer",
+		"system:serviceaccount:team-a:deployer",
+		"system:serviceaccount:team-b:deployer",
+	}, builtFor, "each identity is rebuilt exactly once after the purge")
+
+	exA3, err := r.executorFor(graphWithSA("team-a", "deployer"))
+	require.NoError(t, err)
+	assert.Same(t, exA2, exA3)
+	require.Len(t, builtFor, 4)
+
+	// An unpopulated cache must not panic.
+	empty := &impersonationCache{newExec: imp.newExec}
+	empty.InvalidateSchema(schema.GroupKind{})
+}
+
 // TestExecutorFor_DefaultServiceAccount verifies that without an override, a
 // Graph impersonates the default ServiceAccount of its namespace.
 func TestExecutorFor_DefaultServiceAccount(t *testing.T) {
