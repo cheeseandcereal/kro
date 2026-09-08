@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 
@@ -146,5 +147,141 @@ var _ = Describe("ResourcePruning", func() {
 			Name:      name + "-gate",
 			Namespace: namespace,
 		}, &corev1.ConfigMap{})).To(Succeed(), "still-declared resource must not be pruned")
+	})
+
+	// Pruning is decided per node: an unresolved node protects only its own
+	// members, while retired members of nodes that did resolve are deleted. A
+	// dependent that reads into a collection becomes unresolvable exactly when
+	// the collection shrinks to nothing, so an instance-wide veto would leak
+	// every retired member for as long as the collection stays empty.
+	It("prunes retired collection members while a dependent node is unresolved", func(ctx SpecContext) {
+		// "cms" renders one ConfigMap per spec.values entry; "summary" reads
+		// cms[0], so it resolves only while the collection is non-empty.
+		rgd := generator.NewResourceGraphDefinition("test-prune-per-node",
+			generator.WithSchema(
+				"TestPrunePerNode", "v1alpha1",
+				map[string]any{
+					"name":   "string",
+					"values": "[]string",
+				},
+				nil,
+			),
+			generator.WithResourceCollection("cms", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name": "${schema.spec.name}-cp-${v}",
+				},
+				"data": map[string]any{
+					"value": "${v}",
+				},
+			},
+				[]krov1alpha1.ForEachDimension{
+					{"v": "${schema.spec.values}"},
+				},
+				nil, nil),
+			generator.WithResource("summary", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name": "${schema.spec.name}-summary",
+				},
+				"data": map[string]any{
+					"first": "${cms[0].metadata.name}",
+				},
+			}, nil, nil),
+		)
+		Expect(env.Client.Create(ctx, rgd)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			Expect(env.Client.Delete(ctx, rgd)).To(Succeed())
+		})
+		waitForRGDActive(ctx, rgd.Name)
+
+		name := "prune-per-node"
+		instance := newInstance("TestPrunePerNode", name, namespace, map[string]any{
+			"name":   name,
+			"values": []any{"a1", "a2"},
+		})
+		Expect(env.Client.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			_ = env.Client.Delete(ctx, instance)
+		})
+
+		getCM := func(ctx SpecContext, suffix string) (*corev1.ConfigMap, error) {
+			cm := &corev1.ConfigMap{}
+			err := env.Client.Get(ctx, types.NamespacedName{
+				Name:      name + suffix,
+				Namespace: namespace,
+			}, cm)
+			return cm, err
+		}
+		setValues := func(ctx SpecContext, values []string) {
+			Eventually(func(g Gomega, ctx SpecContext) {
+				g.Expect(env.Client.Get(ctx, types.NamespacedName{
+					Name:      name,
+					Namespace: namespace,
+				}, instance)).To(Succeed())
+				g.Expect(unstructured.SetNestedStringSlice(instance.Object, values, "spec", "values")).To(Succeed())
+				g.Expect(env.Client.Update(ctx, instance)).To(Succeed())
+			}, 20*time.Second, time.Second).WithContext(ctx).Should(Succeed())
+		}
+
+		By("converging with two collection members and a resolved summary")
+		waitForInstanceState(ctx, instance, name, namespace, "ACTIVE")
+		for _, suffix := range []string{"-cp-a1", "-cp-a2"} {
+			_, err := getCM(ctx, suffix)
+			Expect(err).ToNot(HaveOccurred(), "collection member %s must exist once ACTIVE", name+suffix)
+		}
+		summary, err := getCM(ctx, "-summary")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(summary.Data).To(HaveKeyWithValue("first", name+"-cp-a1"))
+
+		By("shrinking the collection to nothing, which leaves summary unresolvable")
+		setValues(ctx, []string{})
+
+		// The retired members are pruned while summary is data-pending.
+		for _, suffix := range []string{"-cp-a1", "-cp-a2"} {
+			Eventually(func(g Gomega, ctx SpecContext) {
+				_, err := getCM(ctx, suffix)
+				if !apierrors.IsNotFound(err) {
+					// Refresh so the failure output shows this cycle's conditions.
+					_ = env.Client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, instance)
+				}
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+					"retired collection member %s was not pruned (err=%v); instance conditions: %s",
+					name+suffix, err, instanceConditions(instance))
+			}, 60*time.Second, 2*time.Second).WithContext(ctx).Should(Succeed())
+		}
+
+		// Orphans are deleted dependents-first in one pass, so had summary been
+		// targeted it would already be gone.
+		_, err = getCM(ctx, "-summary")
+		Expect(err).ToNot(HaveOccurred(), "the unresolved node's own resource must be retained")
+
+		// The status write lands after the prune in the same reconcile.
+		Eventually(func(g Gomega, ctx SpecContext) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{
+				Name:      name,
+				Namespace: namespace,
+			}, instance)).To(Succeed())
+			state, _, err := unstructured.NestedString(instance.Object, "status", "state")
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(state).ToNot(Equal("ACTIVE"),
+				"an instance with an unresolved node must not report ACTIVE; conditions: %s", instanceConditions(instance))
+		}, 20*time.Second, time.Second).WithContext(ctx).Should(Succeed())
+
+		By("growing the collection back, which lets summary resolve again")
+		setValues(ctx, []string{"a1"})
+		waitForInstanceState(ctx, instance, name, namespace, "ACTIVE")
+
+		_, err = getCM(ctx, "-cp-a1")
+		Expect(err).ToNot(HaveOccurred(), "re-added collection member must be recreated")
+		_, err = getCM(ctx, "-cp-a2")
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "member that stayed retired must not reappear")
+		Eventually(func(g Gomega, ctx SpecContext) {
+			summary, err := getCM(ctx, "-summary")
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(summary.Data).To(HaveKeyWithValue("first", name+"-cp-a1"))
+		}, 30*time.Second, time.Second).WithContext(ctx).Should(Succeed())
 	})
 })

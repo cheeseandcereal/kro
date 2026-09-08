@@ -1103,6 +1103,132 @@ func TestReconcileViaGraphEngine_HardErrorsAndInventory(t *testing.T) {
 		assert.Error(t, getErr, "orphan-deploy owned by a removed template node must be pruned despite the unresolved ownerless ref node")
 	})
 
+	// "cms" is a forEach ConfigMap collection over spec.values and "summary"
+	// reads cms[0]. With spec.values shrunk to [], cms resolves to nothing while
+	// summary is data-pending: the retired cms member must be pruned on this
+	// very cycle and summary's own ConfigMap retained.
+	t.Run("unresolved owning node retains its members but does not veto pruning of a resolved node's retired members", func(t *testing.T) {
+		inst := newInstanceObject("demo", "default")
+		require.NoError(t, unstructured.SetNestedSlice(inst.Object, []any{}, "spec", "values"))
+		addDeletionScope(inst, controllerTestCMGVK, "default")
+
+		// Live applyset members from an earlier cycle: a retired collection
+		// member (node cms) and the unresolved node's own resource (node summary).
+		retired := newManagedObject(newConfigMapObject("demo-cp-a1", "default"), inst, "cms", 1)
+		retained := newManagedObject(newConfigMapObject("demo-summary", "default"), inst, "summary", 2)
+
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy(), retired, retained)
+		fakeRuntimeCl := newFakeRuntimeClient(t)
+
+		spec := &v1alpha1.ResourceGraphDefinitionSpec{
+			Schema: &v1alpha1.Schema{
+				APIVersion: "v1alpha1",
+				Kind:       "WebApp",
+				Group:      "kro.run",
+				Spec:       apimachineryruntime.RawExtension{Raw: []byte(`{"values":"[]string"}`)},
+			},
+			Resources: []*v1alpha1.Resource{
+				{
+					ID:      "cms",
+					ForEach: []v1alpha1.ForEachDimension{{"v": "${schema.spec.values}"}},
+					Template: apimachineryruntime.RawExtension{
+						Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"demo-cp-${v}","namespace":"default"},"data":{"value":"${v}"}}`),
+					},
+				},
+				{
+					ID: "summary",
+					Template: apimachineryruntime.RawExtension{
+						Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"demo-summary","namespace":"default"},"data":{"first":"${cms[0].metadata.name}"}}`),
+					},
+				},
+			},
+		}
+		c, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, comp, fakeRuntimeCl)
+
+		watcher := &fakeInstanceWatcher{}
+		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
+		require.Error(t, err, "summary is data-pending, so the cycle must soft-requeue")
+		assert.True(t, requeue.IsRequeueError(err), "an unresolved node should only soft-requeue, got %v", err)
+		assert.Contains(t, err.Error(), "summary", "the soft error must name the unresolved node")
+
+		_, getErr := raw.Tracker().Get(controllerTestCMGVR, "default", "demo-cp-a1")
+		assert.Error(t, getErr, "retired member of the resolved collection node cms must be pruned despite the unresolved summary node")
+		_, getErr = raw.Tracker().Get(controllerTestCMGVR, "default", "demo-summary")
+		assert.NoError(t, getErr, "the unresolved node's own resource must be retained")
+
+		// The inventory keeps the ConfigMap GroupKind: it must not shrink to the
+		// (empty) applied batch while summary's member is retained.
+		stored := getStoredParentObject(t, raw)
+		assert.Contains(t, stored.GetAnnotations()[applyset.ApplySetGKsAnnotation], "ConfigMap",
+			"inventory must not shrink while an owning node is unresolved")
+		assert.NotEqual(t, string(v1alpha1.InstanceStateActive), stored.Object["status"].(map[string]any)["state"],
+			"an instance with an unresolved node must not report ACTIVE")
+	})
+
+	// On a partially-resolved cycle applyErr is the unresolved node's soft
+	// ErrNotReady; a hard prune failure must still reach ResourcesReady.
+	t.Run("hard prune error on a partially-resolved cycle surfaces in ResourcesReady", func(t *testing.T) {
+		inst := newInstanceObject("demo", "default")
+		require.NoError(t, unstructured.SetNestedSlice(inst.Object, []any{}, "spec", "values"))
+		addDeletionScope(inst, controllerTestCMGVK, "default")
+
+		retired := newManagedObject(newConfigMapObject("demo-cp-a1", "default"), inst, "cms", 1)
+		retained := newManagedObject(newConfigMapObject("demo-summary", "default"), inst, "summary", 2)
+
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy(), retired, retained)
+		// The retired member's delete is denied (e.g. missing RBAC / admission).
+		raw.PrependReactor("delete", "configmaps", func(action k8stesting.Action) (bool, apimachineryruntime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, action.(k8stesting.DeleteAction).GetName(), errors.New("delete denied by policy"))
+		})
+		fakeRuntimeCl := newFakeRuntimeClient(t)
+
+		spec := &v1alpha1.ResourceGraphDefinitionSpec{
+			Schema: &v1alpha1.Schema{
+				APIVersion: "v1alpha1",
+				Kind:       "WebApp",
+				Group:      "kro.run",
+				Spec:       apimachineryruntime.RawExtension{Raw: []byte(`{"values":"[]string"}`)},
+			},
+			Resources: []*v1alpha1.Resource{
+				{
+					ID:      "cms",
+					ForEach: []v1alpha1.ForEachDimension{{"v": "${schema.spec.values}"}},
+					Template: apimachineryruntime.RawExtension{
+						Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"demo-cp-${v}","namespace":"default"},"data":{"value":"${v}"}}`),
+					},
+				},
+				{
+					ID: "summary",
+					Template: apimachineryruntime.RawExtension{
+						Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"demo-summary","namespace":"default"},"data":{"first":"${cms[0].metadata.name}"}}`),
+					},
+				},
+			},
+		}
+		c, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, comp, fakeRuntimeCl)
+
+		err := c.reconcileViaGraphEngine(context.Background(), inst, &fakeInstanceWatcher{})
+		require.Error(t, err)
+		assert.True(t, requeue.IsRequeueError(err), "a prune failure is requeued, got %v", err)
+		assert.Contains(t, err.Error(), "delete denied by policy", "the hard prune error must be the returned error")
+		assert.False(t, errors.Is(err, executor.ErrNotReady), "the hard prune error must not be downgraded to the unresolved node's soft not-ready")
+
+		stored := getStoredParentObject(t, raw)
+		cond := conditionByType(t, stored, ResourcesReady)
+		assert.Equal(t, metav1.ConditionFalse, cond.Status)
+		require.NotNil(t, cond.Message)
+		assert.Contains(t, *cond.Message, "prune of retired resources failed",
+			"the prune failure must reach the condition, not only the log")
+		assert.Contains(t, *cond.Message, "delete denied by policy")
+		assert.NotEqual(t, string(v1alpha1.InstanceStateActive), stored.Object["status"].(map[string]any)["state"])
+
+		// Nothing was deleted: the denied orphan and the retained member are both live.
+		_, getErr := raw.Tracker().Get(controllerTestCMGVR, "default", "demo-cp-a1")
+		assert.NoError(t, getErr, "the orphan whose delete was denied is still in the cluster")
+		_, getErr = raw.Tracker().Get(controllerTestCMGVR, "default", "demo-summary")
+		assert.NoError(t, getErr, "the unresolved node's own resource must be retained")
+	})
+
 	t.Run("ApplySet orphan pruning with UID conflict preserves inventory", func(t *testing.T) {
 		inst := newInstanceObject("demo", "default")
 		addDeletionScope(inst, controllerTestDeployGVK, "default")
@@ -1437,7 +1563,7 @@ func TestReconcileApplySetInventory_Direct(t *testing.T) {
 			},
 		}
 
-		err := c.reconcileApplySetInventory(context.Background(), c.log, inst, nil, applied, applyset.Metadata{}, true)
+		err := c.reconcileApplySetInventory(context.Background(), c.log, inst, nil, applied, applyset.Metadata{}, true, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "applyset union:")
 	})
@@ -1494,9 +1620,52 @@ func TestReconcileApplySetInventory_Direct(t *testing.T) {
 		})
 
 		c, _ := newGraphEngineControllerUnderTest(t, raw, testEmptyRGDSpec(), revisions.RevisionStateActive, comp, nil)
-		err := c.reconcileApplySetInventory(context.Background(), c.log, inst, nil, nil, applyset.Metadata{}, true)
+		err := c.reconcileApplySetInventory(context.Background(), c.log, inst, nil, nil, applyset.Metadata{}, true, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "align inventory after apply/prune: shrink patch failed")
+	})
+
+	// An unresolved owning node must neither shrink the inventory (its retained
+	// members' GroupKinds may be absent from the batch) nor stop other nodes'
+	// orphans from being pruned.
+	t.Run("Unresolved owning node prunes other orphans and keeps the superset inventory", func(t *testing.T) {
+		inst := newInstanceObject("demo", "default")
+		addDeletionScope(inst, controllerTestDeployGVK, "default")
+		addDeletionScope(inst, controllerTestCMGVK, "default")
+
+		// The unresolved node "summary" owns a ConfigMap; the resolved node
+		// "cms" rendered nothing this cycle, so its Deployment is retired.
+		retained := newManagedObject(newConfigMapObject("summary-cm", "default"), inst, "summary", 2)
+		retired := newManagedObject(newDeploymentObject("cms-deploy", "default"), inst, "cms", 1)
+		unlabelled := newManagedObject(newDeploymentObject("legacy-deploy", "default"), inst, "legacy", 1)
+		labels := unlabelled.GetLabels()
+		delete(labels, metadata.NodeIDLabel)
+		unlabelled.SetLabels(labels)
+
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy(), retained, retired, unlabelled)
+		c, _ := newGraphEngineControllerUnderTest(t, raw, testEmptyRGDSpec(), revisions.RevisionStateActive, comp, nil)
+
+		before := inst.GetAnnotations()[applyset.ApplySetGKsAnnotation]
+		require.Contains(t, before, "Deployment.apps")
+		require.Contains(t, before, "ConfigMap")
+
+		pruneOK, retain := pruneGate(false, []string{"summary"})
+		err := c.reconcileApplySetInventory(context.Background(), c.log, inst, nil, nil, applyset.Metadata{}, pruneOK, retain)
+		require.NoError(t, err)
+
+		_, err = raw.Tracker().Get(controllerTestCMGVR, "default", "summary-cm")
+		require.NoError(t, err, "member of the unresolved node must be retained")
+		_, err = raw.Tracker().Get(controllerTestDeployGVR, "default", "legacy-deploy")
+		require.NoError(t, err, "member with no node-id label cannot be attributed and must be retained")
+		_, err = raw.Tracker().Get(controllerTestDeployGVR, "default", "cms-deploy")
+		require.Error(t, err, "orphan of a resolved node must be pruned")
+
+		// Nothing was applied this cycle, yet the inventory must keep both
+		// GroupKinds so the deletion path can still find the retained members.
+		stored := getStoredParentObject(t, raw)
+		after := stored.GetAnnotations()[applyset.ApplySetGKsAnnotation]
+		assert.Contains(t, after, "Deployment.apps", "inventory must not shrink while an owning node is unresolved")
+		assert.Contains(t, after, "ConfigMap", "inventory must not shrink while an owning node is unresolved")
 	})
 
 	t.Run("Duplicate resources in applied set returns ErrDuplicateResource", func(t *testing.T) {
@@ -1522,7 +1691,7 @@ func TestReconcileApplySetInventory_Direct(t *testing.T) {
 			},
 		}
 
-		err := c.reconcileApplySetInventory(context.Background(), c.log, inst, nil, applied, applyset.Metadata{}, true)
+		err := c.reconcileApplySetInventory(context.Background(), c.log, inst, nil, applied, applyset.Metadata{}, true, nil)
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, applyset.ErrDuplicateResource))
 	})
@@ -1566,7 +1735,7 @@ func TestPruneGraphEngineOrphans_Direct(t *testing.T) {
 		meta := applySetMetadataFromApplied(inst, applied)
 		supersetMeta, _ := applier.Union(meta)
 
-		pruned, conflictFree, err := c.pruneGraphEngineOrphans(context.Background(), c.log, applier, applied, supersetMeta)
+		pruned, conflictFree, err := c.pruneGraphEngineOrphans(context.Background(), c.log, applier, applied, supersetMeta, nil)
 		require.NoError(t, err)
 		assert.True(t, pruned)
 		assert.True(t, conflictFree)
@@ -1600,7 +1769,7 @@ func TestPruneGraphEngineOrphans_Direct(t *testing.T) {
 		}, inst)
 
 		supersetMeta, _ := applier.Project(nil)
-		_, _, err := c.pruneGraphEngineOrphans(context.Background(), c.log, applier, nil, supersetMeta)
+		_, _, err := c.pruneGraphEngineOrphans(context.Background(), c.log, applier, nil, supersetMeta, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "delete failed: internal server error")
 	})

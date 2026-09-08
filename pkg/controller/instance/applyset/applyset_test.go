@@ -631,6 +631,95 @@ func TestPrune(t *testing.T) {
 	}
 }
 
+// TestListOrphans_Retain pins that a member outside KeepUIDs is still excluded
+// from the orphan candidates when Retain returns true for it.
+func TestListOrphans_Retain(t *testing.T) {
+	ctx := t.Context()
+	mapper := newTestRESTMapper()
+
+	parent := &testParent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-instance",
+			Namespace: "default",
+			UID:       types.UID("test-parent-uid"),
+			Annotations: map[string]string{
+				ApplySetGKsAnnotation:                  "ConfigMap",
+				ApplySetAdditionalNamespacesAnnotation: "",
+			},
+		},
+		gvk: schema.GroupVersionKind{Group: "kro.run", Version: "v1alpha1", Kind: "TestKind"},
+	}
+	applySetID := ID(parent)
+
+	member := func(name, nodeID string) *unstructured.Unstructured {
+		obj := newConfigMap(name, "default")
+		obj.SetLabels(map[string]string{
+			ApplysetPartOfLabel: applySetID,
+			"kro.run/node-id":   nodeID,
+		})
+		obj.SetUID(types.UID(name + "-uid"))
+		return obj
+	}
+	kept := member("kept-cm", "resolved")
+	retained := member("retained-cm", "unresolved")
+	retired := member("retired-cm", "resolved")
+
+	client := newFakeDynamicClient(kept, retained, retired)
+	applier := New(Config{
+		Client:          client,
+		RESTMapper:      mapper,
+		Log:             logr.Discard(),
+		ParentNamespace: "default",
+	}, parent)
+	scope := &PruneScope{
+		GroupKinds: sets.New(schema.GroupKind{Kind: "ConfigMap"}),
+		Namespaces: sets.New[string](),
+	}
+
+	t.Run("nil Retain reports every member outside KeepUIDs", func(t *testing.T) {
+		candidates, err := applier.ListOrphans(ctx, PruneOptions{
+			KeepUIDs: sets.New(kept.GetUID()),
+			Scope:    scope,
+		})
+		if err != nil {
+			t.Fatalf("ListOrphans() error = %v", err)
+		}
+		if got := candidateNames(candidates); !got.Equal(sets.New("retained-cm", "retired-cm")) {
+			t.Fatalf("ListOrphans() candidates = %v, want retained-cm and retired-cm", sets.List(got))
+		}
+	})
+
+	t.Run("Retain excludes the members it claims and only those", func(t *testing.T) {
+		var consulted []string
+		candidates, err := applier.ListOrphans(ctx, PruneOptions{
+			KeepUIDs: sets.New(kept.GetUID()),
+			Retain: func(obj *unstructured.Unstructured) bool {
+				consulted = append(consulted, obj.GetName())
+				return obj.GetLabels()["kro.run/node-id"] == "unresolved"
+			},
+			Scope: scope,
+		})
+		if err != nil {
+			t.Fatalf("ListOrphans() error = %v", err)
+		}
+		if got := candidateNames(candidates); !got.Equal(sets.New("retired-cm")) {
+			t.Fatalf("ListOrphans() candidates = %v, want only retired-cm", sets.List(got))
+		}
+		// KeepUIDs is decided first: a kept member is never offered to Retain.
+		if sets.New(consulted...).Has("kept-cm") {
+			t.Fatalf("Retain was consulted for a member already covered by KeepUIDs: %v", consulted)
+		}
+	})
+}
+
+func candidateNames(candidates []OrphanCandidate) sets.Set[string] {
+	names := sets.New[string]()
+	for _, c := range candidates {
+		names.Insert(c.Object.GetName())
+	}
+	return names
+}
+
 func TestListOrphansRefreshesNoMatchErrors(t *testing.T) {
 	gk := schema.GroupKind{Kind: "ConfigMap"}
 	delegate := newTestRESTMapper()

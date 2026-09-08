@@ -98,6 +98,11 @@ type PruneOptions struct {
 	// KeepUIDs are UIDs of resources that should NOT be pruned.
 	// Typically from ApplyResult.ObservedUIDs().
 	KeepUIDs sets.Set[types.UID]
+	// Retain, when non-nil, is consulted for every member not covered by
+	// KeepUIDs; a member for which it returns true is not reported as an orphan
+	// (used to keep members of nodes whose desired set could not be computed
+	// this cycle instead of withholding the whole prune).
+	Retain func(*unstructured.Unstructured) bool
 	// Scope defines GKs and namespaces to prune from (required).
 	// Use Metadata.PruneScope() to get the scope from Project() output.
 	// Pass the superset scope (union of batch + parent) to ensure
@@ -466,9 +471,9 @@ func (a *ApplySet) resolveNamespace(ns string) string {
 	return ns
 }
 
-// ListOrphans discovers orphaned resources (applyset members not in KeepUIDs)
-// without deleting them. The caller can order the returned candidates before
-// issuing deletes via DeleteOrphan.
+// ListOrphans discovers orphaned resources (applyset members not in KeepUIDs
+// and not held back by Retain) without deleting them. The caller can order the
+// returned candidates before issuing deletes via DeleteOrphan.
 func (a *ApplySet) ListOrphans(ctx context.Context, opts PruneOptions) ([]OrphanCandidate, error) {
 	scopeGKs := opts.Scope.GroupKinds
 
@@ -491,7 +496,7 @@ func (a *ApplySet) ListOrphans(ctx context.Context, opts PruneOptions) ([]Orphan
 		mappings = append(mappings, mapping)
 	}
 
-	return a.listOrphans(ctx, mappings, scopeNamespaces, opts.KeepUIDs)
+	return a.listOrphans(ctx, mappings, scopeNamespaces, opts.KeepUIDs, opts.Retain)
 }
 
 // restMappingForPrune refreshes stale discovery once before concluding that a
@@ -556,13 +561,15 @@ func (a *ApplySet) DeleteOrphan(ctx context.Context, candidate OrphanCandidate) 
 	return DeleteOrphanResult{Pruned: &PruneResultItem{Object: candidate.Object}}, nil
 }
 
-// listOrphans lists applyset members not in keepUIDs. This is the listing half
-// of the former prune() method.
+// listOrphans lists applyset members not in keepUIDs and not held back by
+// retain (which may be nil). This is the listing half of the former prune()
+// method.
 func (a *ApplySet) listOrphans(
 	ctx context.Context,
 	mappings []*meta.RESTMapping,
 	namespaces sets.Set[string],
 	keepUIDs sets.Set[types.UID],
+	retain func(*unstructured.Unstructured) bool,
 ) ([]OrphanCandidate, error) {
 	type listTask struct {
 		gvr       schema.GroupVersionResource
@@ -608,9 +615,13 @@ func (a *ApplySet) listOrphans(
 			var local []OrphanCandidate
 			for i := range list.Items {
 				obj := &list.Items[i]
-				if !keepUIDs.Has(obj.GetUID()) {
-					local = append(local, OrphanCandidate{Object: obj, GVR: task.gvr})
+				if keepUIDs.Has(obj.GetUID()) {
+					continue
 				}
+				if retain != nil && retain(obj) {
+					continue
+				}
+				local = append(local, OrphanCandidate{Object: obj, GVR: task.gvr})
 			}
 
 			mu.Lock()

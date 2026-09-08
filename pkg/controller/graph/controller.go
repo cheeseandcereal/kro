@@ -399,8 +399,8 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	// the resources whose owning node is genuinely gone or resolved — safe to
 	// delete even while OTHER nodes are still soft not-ready. Previously all
 	// pruning was gated on a fully clean apply, so a single never-ready node
-	// vetoed pruning of every unrelated retired node (this is the Graph-path twin
-	// of the instance ownedUnresolved/pruneGate narrowing).
+	// vetoed pruning of every unrelated retired node (the instance path applies
+	// the analogous per-node rule in pruneGate, attributing members by label).
 	hardErr := applyErr != nil && !errors.Is(applyErr, executor.ErrNotReady)
 	// The full pre-apply superset (previous + applied + intent), reused wherever
 	// the inventory must not shrink below what the write-ahead already advertised.
