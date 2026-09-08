@@ -177,15 +177,14 @@ func NewController(
 		})
 	}
 	// Surface a tolerated collection-update rejection (an already-existing item
-	// whose SSA update was rejected — e.g. an immutable field — that we keep-live
-	// and converge on) as a Warning Event on the affected CHILD object, so the
-	// dropped desired change is visible in `kubectl describe` and not just the
-	// controller log. Observational only: this hook never influences readiness or
-	// requeue (the node still converges), so it cannot reintroduce the wedge an
-	// unfixable update would otherwise cause. Set at construction (not per
-	// reconcile) because the executor is shared across concurrent reconcile
-	// workers; the event subject is derived from the rejection's own target
-	// identity rather than any per-reconcile instance state.
+	// whose SSA update was permanently rejected — e.g. an immutable field — that
+	// we keep-live and converge on) as a Warning Event on the affected CHILD
+	// object, so the dropped desired change is visible in `kubectl describe`.
+	// Observational only: the hook never influences readiness or requeue.
+	// Transient failures never reach it (they hold the node not-ready and their
+	// cause is on the ResourcesReady condition). Set at construction because the
+	// executor is shared across concurrent reconcile workers; the event subject
+	// is derived from the rejection's own target identity.
 	if eventRecorder != nil {
 		exec.OnToleratedRejection = func(r executor.ToleratedRejection) {
 			ref := &corev1.ObjectReference{

@@ -128,12 +128,12 @@ type Contribution struct {
 }
 
 // ToleratedRejection describes a collection item whose server-side-apply UPDATE
-// was rejected on an ALREADY-EXISTING object and tolerated: the live object is
-// kept and the node still converges (so an unfixable update — e.g. an immutable
-// field — does not wedge the instance forever). The desired change did NOT land,
-// so this is surfaced as an observational signal (log + optional Warning event
-// via Simple.OnToleratedRejection) WITHOUT affecting readiness gating or
-// requeue — flipping those would reintroduce the wedge.
+// was permanently rejected (Invalid/BadRequest, e.g. an immutable field) on an
+// ALREADY-EXISTING object and tolerated: the live object is kept and the node
+// still converges so an unfixable update does not wedge the instance. It is an
+// observational signal (log + optional Warning event via
+// Simple.OnToleratedRejection) and must not affect readiness or requeue.
+// Transient failures are retried, not tolerated, and never produce it.
 type ToleratedRejection struct {
 	NodeID     string // fully-qualified node path
 	APIVersion string // target apiVersion ("apps/v1", "v1", ...)
@@ -141,15 +141,8 @@ type ToleratedRejection struct {
 	Namespace  string
 	Name       string
 	// Reason is a short operator-facing classification of WHY the update was
-	// rejected (e.g. "field immutable", "invalid request", or a transient cause
-	// that will be retried on a later reconcile). Derived from the typed API
-	// error, since a permanent immutable-field rejection and a transient one are
-	// not distinguishable by outcome here (both keep the live object).
+	// rejected (e.g. "field immutable", "invalid request").
 	Reason string
-	// Permanent is true when the rejection cannot succeed by retrying the same
-	// payload (Invalid/BadRequest); false for transient causes that a later
-	// reconcile may resolve.
-	Permanent bool
 	// Cause is the raw API error string, for the log/event detail.
 	Cause string
 }

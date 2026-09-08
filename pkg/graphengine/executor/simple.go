@@ -112,13 +112,12 @@ type Simple struct {
 	// remains as a backstop.
 	identityClaims *identityClaimSet
 	// OnToleratedRejection, when non-nil, is invoked for each collection item
-	// whose UPDATE was rejected on an already-existing object and tolerated
-	// (the live object is kept and the node still converges). It is a purely
-	// OBSERVATIONAL hook — it must not influence readiness or requeue, or the
-	// anti-wedge tolerance would be lost. The instance controller wires it to an
-	// event recorder (Warning event); the Graph controller leaves it nil
-	// (log-only, it has no recorder). Called from parallel apply goroutines, so
-	// the implementation must be safe for concurrent use (an EventRecorder is).
+	// whose UPDATE was permanently rejected (Invalid/BadRequest) on an
+	// already-existing object and tolerated (live object kept, node converges).
+	// Transient failures are retried, not tolerated, and never reach it. Purely
+	// OBSERVATIONAL — it must not influence readiness or requeue. The instance
+	// controller wires it to an event recorder; the Graph controller leaves it
+	// nil. Called from parallel apply goroutines, so it must be concurrency-safe.
 	OnToleratedRejection func(ToleratedRejection)
 }
 
@@ -605,13 +604,11 @@ var errSchemaNotReady = errors.New("executor: target GVK not yet known to the cl
 // read-only and handled by applyRef/applyRefCollection, not here).
 //
 // Collection nodes apply each item INDEPENDENTLY and tolerate per-item SSA
-// failures: a failure to
-// UPDATE an already-present item (e.g. an immutable field) does not abort
-// the node — the live object is recorded as applied so tracking/prune stay
-// correct and the node can still converge. A failure to CREATE an item that
-// is not yet present marks the node soft not-ready so downstream gates and
-// the reconcile requeues. A scalar node still returns an SSA error as a hard
-// error, unchanged.
+// failures: a permanent (Invalid/BadRequest) rejection of an UPDATE to an
+// already-present item records the live object as applied and the node still
+// converges; a transient one keeps the live object tracked but holds the node
+// soft not-ready so it is retried; a failed CREATE holds the node soft
+// not-ready. A scalar node still returns an SSA error as a hard error.
 func (s *Simple) applyTemplate(ctx context.Context, rt *runtime.Runtime, w watchrouter.Watcher, n *runtime.Node, desired []*unstructured.Unstructured) ([]expv1alpha1.ManagedResource, error) {
 	mappings, err := s.buildMappings(n, desired)
 	if err != nil {
@@ -785,16 +782,13 @@ func (st *collectionApplyState) recordApplied(i int, mr expv1alpha1.ManagedResou
 	st.mu.Unlock()
 }
 
-// classifyRejection turns a tolerated collection-update rejection into a short
-// operator-facing reason and a permanent/transient flag. A permanent rejection
-// (Invalid/BadRequest) cannot succeed by retrying the same payload; an Invalid
-// whose status causes name an immutable field is reported specifically so the
-// operator sees WHY the desired change never landed. Transient causes
-// (Conflict, timeouts, throttling, unavailability) are retried on a later
-// reconcile, so they are flagged non-permanent. This is best-effort: a webhook
-// Forbidden or a CEL-validation Invalid that depends on other mutable cluster
-// state cannot be perfectly classified by error code, which is exactly why the
-// node converges and merely SURFACES the rejection rather than gating on it.
+// classifyRejection maps a rejected UPDATE of an already-existing collection
+// item to an operator-facing reason and whether retrying the same payload can
+// never succeed. "Permanent" is kept narrow (Invalid/BadRequest): misreading a
+// transient cause as permanent tolerates a stale member as converged, while the
+// reverse only costs a visible retry. Hence a 400-coded webhook denial (the
+// apiserver default when the webhook sets no code) or a 422
+// ValidatingAdmissionPolicy Invalid is tolerated; a 403-coded denial is retried.
 func classifyRejection(err error) (reason string, permanent bool) {
 	switch {
 	case apierrors.IsInvalid(err):
@@ -838,9 +832,9 @@ func isImmutableFieldError(err error) bool {
 	return false
 }
 
-// recordUpdateRejected records a tolerated per-item UPDATE failure on an
-// already-present object: the live identity is tracked and the desired slot is
-// replaced with the live object so downstream scope sees what actually landed.
+// recordUpdateRejected records a tolerated permanent per-item UPDATE rejection
+// on an already-present object: the live identity is tracked and the desired
+// slot is replaced with the live object so downstream scope sees what landed.
 func (st *collectionApplyState) recordUpdateRejected(i int, mr expv1alpha1.ManagedResource, desired []*unstructured.Unstructured, current *unstructured.Unstructured) {
 	st.mu.Lock()
 	st.results[i] = &mr
@@ -910,9 +904,11 @@ func (st *collectionApplyState) softError(nodeID string) error {
 // parallelism. It registers ONE selector watch for the whole node up front,
 // then applies each item independently, tolerating per-item failures: a
 // rejected UPDATE on an already-present item records the live identity and
-// converges; a failed CREATE holds the node soft not-ready; a terminating item
-// gates the node. Hard errors (bad GET, namespace, applyset conflict, permanent
-// validation rejection) abort and are deterministically joined by item index.
+// converges only when the rejection is permanent; a failed CREATE (or a
+// transiently rejected UPDATE) holds the node soft not-ready; a terminating
+// item gates the node. Hard errors (bad GET, namespace, applyset conflict,
+// permanent validation rejection of a CREATE) abort and are deterministically
+// joined by item index.
 func (s *Simple) applyCollectionTemplate(ctx context.Context, w watchrouter.Watcher, rt *runtime.Runtime, n *runtime.Node, desired []*unstructured.Unstructured, mappings []applyMapping) ([]expv1alpha1.ManagedResource, error) {
 	if len(desired) == 0 {
 		return []expv1alpha1.ManagedResource{}, nil
@@ -982,8 +978,8 @@ func (s *Simple) applyCollectionTemplate(ctx context.Context, w watchrouter.Watc
 	if deletingErr := st.deletingError(); deletingErr != nil {
 		return st.appliedResources(), deletingErr
 	}
-	// Any create failure holds the collection soft not-ready so downstream
-	// gates and the reconcile requeues (never a hard abort).
+	// Item failures (failed creates, transiently rejected updates) hold the
+	// collection soft not-ready so downstream gates and the reconcile requeues.
 	if softErr := st.softError(n.ID()); softErr != nil {
 		return st.appliedResources(), softErr
 	}
@@ -1049,30 +1045,33 @@ func (s *Simple) applyCollectionItem(ctx context.Context, rt *runtime.Runtime, n
 			return nil
 		}
 		if current != nil {
-			// The object already exists; only the UPDATE was rejected. This is
-			// tolerated BY DESIGN, including permanent rejections such as a
-			// Kubernetes immutable-field update (`Forbidden: pod updates may not
-			// change fields ...`): the object is present in the cluster, so record
-			// the live identity and let the collection converge rather than block
-			// the node forever on an unfixable update. (Integration coverage:
-			// collection_test.go deep-chaining scale up/down relies on this.)
-			//
-			// The rejection is NOT escalated to a hard error or a soft not-ready
-			// (that would wedge the node on an unfixable update), but it must not
-			// be fully SILENT either: a desired change did not land while the node
-			// still converges. Emit a warning to the controller log AND, when the
-			// caller wired OnToleratedRejection, an observational signal (the
-			// instance controller records a Warning event) classifying WHY — so a
-			// stale live object is diagnosable in `kubectl describe`, not just in
-			// logs. The signal is observational ONLY: it never touches readiness
-			// gating or requeue, or the anti-wedge tolerance would be lost.
+			// The object exists; only the UPDATE was rejected. A permanent
+			// rejection (Invalid/BadRequest, e.g. an immutable field) is tolerated
+			// so one unfixable member cannot wedge the node: record the live
+			// identity, converge, and surface the dropped change via the log and
+			// OnToleratedRejection (observational only). Anything else keeps the
+			// live identity tracked but is an ordinary item failure, so the node is
+			// held not-ready and the update retried — treating it as converged
+			// would leave the member stale with nothing requeued.
 			reason, permanent := classifyRejection(err)
-			log.FromContext(ctx).Info("collection item update rejected; keeping live object and converging (desired change did not land)",
+			if !permanent {
+				log.FromContext(ctx).Info("collection item update rejected; keeping live object tracked and holding the node not-ready, will retry",
+					"node", s.qualifiedPath(n.ID()),
+					"object", obj.GetNamespace()+"/"+obj.GetName(),
+					"gvk", obj.GroupVersionKind().String(),
+					"reason", reason,
+					"cause", err.Error())
+				// desired[i] is left alone: a not-ready node never publishes scope,
+				// so there is no downstream reader to show the live object to.
+				st.recordApplied(i, managedResourceFrom(n, current))
+				st.recordFailure(i, fmt.Errorf("item %s/%s: %w", obj.GetNamespace(), obj.GetName(), err))
+				return nil
+			}
+			log.FromContext(ctx).Info("collection item update rejected permanently; keeping live object and converging (desired change did not land)",
 				"node", s.qualifiedPath(n.ID()),
 				"object", obj.GetNamespace()+"/"+obj.GetName(),
 				"gvk", obj.GroupVersionKind().String(),
 				"reason", reason,
-				"permanent", permanent,
 				"cause", err.Error())
 			if s.OnToleratedRejection != nil {
 				gvk := obj.GroupVersionKind()
@@ -1083,7 +1082,6 @@ func (s *Simple) applyCollectionItem(ctx context.Context, rt *runtime.Runtime, n
 					Namespace:  obj.GetNamespace(),
 					Name:       obj.GetName(),
 					Reason:     reason,
-					Permanent:  permanent,
 					Cause:      err.Error(),
 				})
 			}
