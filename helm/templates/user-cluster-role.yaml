@@ -12,12 +12,9 @@ metadata:
 rules:
 - apiGroups:
   - kro.run
-  # Graph is an advanced, privileged primitive that must NOT be grantable through the
-  # built-in edit/admin/view roles (it is gated behind the GraphKind feature and needs
-  # an explicit, separate role). Therefore, enumerate resources explicitly and omit graphs.
-  resources:
-  - resourcegraphdefinitions
-  - resourcegraphdefinitions/status
+  # "*" is needed so RGD-generated kinds (default group kro.run) stay covered;
+  # it also grants graphs.kro.run when that CRD is installed.
+  resources: ["*"]
   verbs:
   - create
   - delete
@@ -40,12 +37,8 @@ metadata:
 rules:
 - apiGroups:
   - kro.run
-  # Graph is an advanced, privileged primitive that must NOT be grantable through the
-  # built-in edit/admin/view roles (it is gated behind the GraphKind feature and needs
-  # an explicit, separate role). Therefore, enumerate resources explicitly and omit graphs.
-  resources:
-  - resourcegraphdefinitions
-  - resourcegraphdefinitions/status
+  # "*" for the same reason as in the -edit role above.
+  resources: ["*"]
   verbs:
   - get
   - list

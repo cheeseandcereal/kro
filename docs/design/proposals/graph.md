@@ -473,10 +473,9 @@ guard covers only the controller's _own_ SA; any _other_ privileged ServiceAccou
 namespace remains the operator's responsibility to scope via RBAC (and, if desired, by restricting the
 controller's `impersonate` grant with `resourceNames`).
 
-Because `Graph` is a privileged, user-creatable kind, it must **not** be aggregated into the built-in
-Kubernetes user roles (`edit`, `admin`, `view`). Access to create or manage `Graph` resources must be
-explicitly granted via separate, dedicated roles and is gated behind the `GraphKind` feature gate
-(see the Helm `user-cluster-role.yaml` configuration).
+`Graph` lives in the `kro.run` API group, so the chart's aggregated `kro-edit`/`kro-view` ClusterRoles
+(`resources: ["*"]` on `kro.run`, required so RGD-generated kinds stay covered) also grant it to the
+built-in `edit`/`admin`/`view` roles. The `create pod` trust model above is what bounds that grant.
 
 This inverts the earlier posture: a Graph's blast radius is now bounded by a namespace ServiceAccount
 by default rather than the controller identity. Remaining follow-ups are finer-grained credential

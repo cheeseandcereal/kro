@@ -143,15 +143,9 @@ rules:
   - update
   - patch
   - delete
-{{- if index .Values.config.featureGates "GraphKind" }}
-# kro impersonates a ServiceAccount in the instance's namespace when applying a
-# graph's child resources (see GraphSpec.serviceAccountName),
-# confining child-resource access to that ServiceAccount's RBAC by default. The
-# controller therefore needs the "impersonate" verb on serviceaccounts.
-# This is ONLY used by the Graph controller (the RGD/instance path applies under
-# the controller's own identity), so the grant is gated behind the GraphKind
-# feature — a default install without GraphKind does not receive cluster-wide
-# ServiceAccount impersonation.
+{{- if get (.Values.config.featureGates | default dict) "GraphKind" }}
+# Only the Graph controller impersonates (a Graph applies as a ServiceAccount in its namespace),
+# so this is gated on GraphKind. The rbac.mode=unrestricted wildcard already includes impersonate.
 - apiGroups:
   - ""
   resources:
