@@ -1,0 +1,8 @@
+apiVersion: test.kro.run/v1alpha1
+kind: PluralFnApp
+metadata:
+  name: plural-fn-app
+spec:
+  namespace: default
+  kind: ClusterPolicy
+  group: example.com

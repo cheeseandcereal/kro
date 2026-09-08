@@ -1,0 +1,25 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cel-strings-plural
+spec:
+  schema:
+    apiVersion: v1alpha1
+    group: test.kro.run
+    kind: PluralFnApp
+    spec:
+      namespace: string
+      kind: string
+      group: string
+  resources:
+  - id: cm
+    template:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: plural-fn-app
+        namespace: ${schema.spec.namespace}
+      data:
+        pluralKind: ${strings.plural(schema.spec.kind)}
+        pluralResource: ${strings.plural(schema.spec.kind.lowerAscii())}
+        crdName: ${strings.plural(schema.spec.kind.lowerAscii()) + "." + schema.spec.group}

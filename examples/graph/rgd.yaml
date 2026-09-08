@@ -10,8 +10,8 @@
 # shipped engine, so applying it will not fully reconcile. Kept in-tree as the
 # design's north star; the gaps below are tracked follow-up work, not bugs in
 # this PR:
-#   - simpleSchema.toOpenAPI() and plural() CEL functions are not registered in
-#     the shipped CEL environment (needed at L1 to synthesize the Kind's CRD).
+#   - The simpleSchema.toOpenAPI() CEL function is not registered in the
+#     shipped CEL environment (needed at L1 to synthesize the Kind's CRD).
 #   - .ready() on a node is deferred to KREP-006 (readiness lifecycle) — used
 #     here for status gating; there is no working replacement yet.
 #   - propagateWhen (conditional status updates) is deferred to KREP-006.
@@ -193,7 +193,7 @@ spec:
                 kind: CustomResourceDefinition
                 metadata:
                   name: >-
-                    ${"${plural(schema.spec.schema.kind).lowerAscii()}"}.${"${schema.spec.schema.group}"}
+                    ${"${strings.plural(schema.spec.schema.kind.lowerAscii())}"}.${"${schema.spec.schema.group}"}
                   labels: >-
                     ${"${schema.?spec.?schema.?metadata.?labels.orValue({})}"}
                   annotations: >-
@@ -205,7 +205,7 @@ spec:
                     kind: >-
                       ${"${schema.spec.schema.kind}"}
                     plural: >-
-                      ${"${plural(schema.spec.schema.kind).lowerAscii()}"}
+                      ${"${strings.plural(schema.spec.schema.kind.lowerAscii())}"}
                   scope: >-
                     ${"${schema.spec.schema.scope}"}
                   versions:

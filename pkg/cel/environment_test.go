@@ -15,6 +15,7 @@
 package cel
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -293,6 +294,112 @@ func TestDefaultEnvironment_CelBind(t *testing.T) {
 	}
 }
 
+// TestDefaultEnvironment_StringsPlural evaluates the strings.plural recipes
+// from the docs through the production environment, where cel-go's
+// ext.Strings() is registered before kro's library.Strings() (the reverse of
+// the library's own tests). Both cached base environments are covered.
+func TestDefaultEnvironment_StringsPlural(t *testing.T) {
+	vars := map[string]any{
+		"schema": map[string]any{
+			"spec": map[string]any{
+				"kind":       "ClusterPolicy",
+				"apiVersion": "example.com/v1",
+			},
+		},
+	}
+
+	tests := []struct {
+		name string
+		expr string
+		want string
+	}{
+		{
+			name: "plural resource name from a kind",
+			expr: `strings.plural(schema.spec.kind.lowerAscii())`,
+			want: "clusterpolicies",
+		},
+		{
+			name: "CRD name from a kind and apiVersion",
+			expr: `strings.plural(schema.spec.kind.lowerAscii()) + "." + schema.spec.apiVersion.split("/")[0]`,
+			want: "clusterpolicies.example.com",
+		},
+		{
+			name: "human-readable plural",
+			expr: `strings.plural(schema.spec.kind)`,
+			want: "ClusterPolicies",
+		},
+		{
+			name: "chained with cel-go strings helpers",
+			expr: `strings.quote(strings.plural(schema.spec.kind)).trim()`,
+			want: `"ClusterPolicies"`,
+		},
+		{
+			name: "optional field access",
+			expr: `strings.plural(schema.?spec.?missing.orValue('Pod'))`,
+			want: "Pods",
+		},
+	}
+
+	for _, runtimeLib := range []bool{true, false} {
+		env, err := DefaultEnvironment(WithRuntimeLibrary(runtimeLib), WithResourceIDs([]string{"schema"}))
+		require.NoError(t, err)
+		require.True(t, env.HasLibrary("kro.strings"))
+		require.True(t, env.HasLibrary("cel.lib.ext.strings"))
+
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("runtime=%t/%s", runtimeLib, tc.name), func(t *testing.T) {
+				ast, issues := env.Compile(tc.expr)
+				require.NoError(t, issues.Err(), "compile failed")
+				require.Equal(t, cel.StringType, ast.OutputType())
+
+				prog, err := env.Program(ast)
+				require.NoError(t, err, "program creation failed")
+
+				out, _, err := prog.Eval(vars)
+				require.NoError(t, err, "eval failed")
+				assert.Equal(t, tc.want, out.Value())
+			})
+		}
+	}
+}
+
+// TestTypedEnvironment_StringsPlural checks that strings.plural type-checks
+// against the OpenAPI-derived field type of a typed resource, so an RGD that
+// pluralizes a non-string field is rejected when the RGD is built, not when
+// an instance is reconciled.
+func TestTypedEnvironment_StringsPlural(t *testing.T) {
+	schemaWithKind := func(kindType string) map[string]*spec.Schema {
+		return map[string]*spec.Schema{
+			"schema": {
+				SchemaProps: spec.SchemaProps{
+					Type: []string{"object"},
+					Properties: map[string]spec.Schema{
+						"spec": {
+							SchemaProps: spec.SchemaProps{
+								Type: []string{"object"},
+								Properties: map[string]spec.Schema{
+									"kind": {SchemaProps: spec.SchemaProps{Type: []string{kindType}}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	env, err := TypedEnvironment(schemaWithKind("string"))
+	require.NoError(t, err)
+	_, issues := env.Compile(`strings.plural(schema.spec.kind.lowerAscii())`)
+	assert.NoError(t, issues.Err())
+
+	env, err = TypedEnvironment(schemaWithKind("integer"))
+	require.NoError(t, err)
+	_, issues = env.Compile(`strings.plural(schema.spec.kind)`)
+	require.Error(t, issues.Err())
+	assert.Contains(t, issues.Err().Error(), "found no matching overload for 'strings.plural' applied to '(int)'")
+}
+
 func TestBaseDeclarations_ReturnsSameSlice(t *testing.T) {
 	a := BaseDeclarations()
 	b := BaseDeclarations()
@@ -398,6 +505,10 @@ func Test_CELEnvHasFunction(t *testing.T) {
 		"random.seededString",
 		"json.unmarshal",
 		"json.marshal",
+		"strings.plural",
+		// cel-go ext.Strings() shares the `strings.` namespace with kro's
+		// library.Strings(); both must be present in the same environment.
+		"strings.quote",
 	}
 	for _, fn := range expectedFns {
 		t.Run(fn, func(t *testing.T) {

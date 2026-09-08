@@ -756,6 +756,107 @@ func TestCompile(t *testing.T) {
 	}
 }
 
+// ---- TestCompile_StringsPlural ----------------------------------------------
+
+// TestCompile_StringsPlural covers the Graph compiler's handling of the
+// namespaced strings.plural() function: the inspector must treat `strings` as
+// a function namespace rather than an unknown node id (even when a node is
+// literally named `strings`), the dependency on the def node feeding the call
+// must be recorded, and a non-string argument must be rejected at compile
+// time.
+func TestCompile_StringsPlural(t *testing.T) {
+	t.Parallel()
+
+	rgdSchema := map[string]any{"kind": "ClusterPolicy", "group": "example.com"}
+
+	cases := []struct {
+		name    string
+		graph   *expv1alpha1.Graph
+		wantErr string // substring; empty means success
+		after   func(t *testing.T, prog *Program)
+	}{
+		{
+			name: "def-fed call records a hard dependency",
+			graph: generator.NewGraph("g",
+				generator.WithDef("rgdSchema", rgdSchema),
+				generator.WithTemplate("cm", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "${strings.plural(rgdSchema.kind.lowerAscii())}"},
+					"data": map[string]any{
+						"crdName": `${strings.plural(rgdSchema.kind.lowerAscii()) + "." + rgdSchema.group}`,
+						"label":   "${strings.plural(rgdSchema.kind)}",
+					},
+				}),
+			),
+			after: func(t *testing.T, prog *Program) {
+				assert.Equal(t, []string{"rgdSchema"}, prog.Nodes["cm"].HardDepIDs())
+				assert.Equal(t, []string{"rgdSchema", "cm"}, prog.TopologicalOrder)
+			},
+		},
+		{
+			name: "CRD name derived from a def records a hard dependency",
+			graph: generator.NewGraph("g",
+				generator.WithDef("rgdSchema", rgdSchema),
+				generator.WithTemplate("crd", map[string]any{
+					"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+					"metadata": map[string]any{
+						"name": `${strings.plural(rgdSchema.kind.lowerAscii()) + "." + rgdSchema.group}`,
+					},
+					"spec": map[string]any{
+						"group": "example.com",
+						"names": map[string]any{"kind": "ClusterPolicy", "plural": "clusterpolicies"},
+						"scope": "Namespaced",
+					},
+				}),
+			),
+			after: func(t *testing.T, prog *Program) {
+				assert.Equal(t, []string{"rgdSchema"}, prog.Nodes["crd"].HardDepIDs())
+			},
+		},
+		{
+			name: "def node named 'strings' does not shadow the function",
+			graph: generator.NewGraph("g",
+				generator.WithDef("strings", rgdSchema),
+				generator.WithTemplate("cm", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "${strings.plural(strings.kind.lowerAscii())}"},
+					"data":     map[string]any{"quoted": "${strings.quote(strings.kind)}"},
+				}),
+			),
+			after: func(t *testing.T, prog *Program) {
+				assert.Equal(t, []string{"strings"}, prog.Nodes["cm"].HardDepIDs())
+			},
+		},
+		{
+			name:    "non-string argument is rejected at compile time",
+			wantErr: "found no matching overload for 'strings.plural' applied to '(int)'",
+			graph: generator.NewGraph("g",
+				generator.WithDef("rgdSchema", map[string]any{"replicas": int64(3)}),
+				generator.WithTemplate("cm", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "cm"},
+					"data":     map[string]any{"bad": "${strings.plural(rgdSchema.replicas)}"},
+				}),
+			),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			prog, err := newTestCompiler(t).Compile(tc.graph)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, prog)
+			tc.after(t, prog)
+		})
+	}
+}
+
 // ---- TestCompile_PreservesInput --------------------------------------------
 
 func TestCompile_PreservesInputGraph(t *testing.T) {

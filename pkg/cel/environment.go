@@ -145,6 +145,7 @@ func coreDeclarations() []cel.EnvOption {
 		library.JSON(),
 		library.Hash(),
 		library.Lists(),
+		library.Strings(),
 		// Omit() is registered globally so CEL can parse and type-check it
 		// everywhere. The graph builder rejects it in restricted contexts
 		// (includeWhen, readyWhen, forEach) via inspectExpressionRestricted

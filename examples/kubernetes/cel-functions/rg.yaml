@@ -55,6 +55,10 @@ spec:
                       value: ${base64.encode(hash.fnv64a(schema.spec.name))}
                     - name: HASH_SHA256_BASE64
                       value: ${base64.encode(hash.sha256(schema.spec.name))}
+                    - name: STRINGS_PLURAL
+                      value: ${strings.plural('ClusterPolicy')}
+                    - name: STRINGS_PLURAL_RESOURCE
+                      value: ${strings.plural('ClusterPolicy'.lowerAscii())}
     - id: service
       template:
         apiVersion: v1

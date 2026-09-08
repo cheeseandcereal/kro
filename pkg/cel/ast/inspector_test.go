@@ -834,6 +834,35 @@ func TestNewInspectorWithEnv_CustomFunctionsNotResources(t *testing.T) {
 			wantUnknownRes: nil,
 		},
 		{
+			name:       "strings.plural is a function, not a resource",
+			resources:  []string{"schema"},
+			expression: `strings.plural(schema.spec.kind.lowerAscii()) + "." + schema.spec.group`,
+			wantResources: []ResourceDependency{
+				{ID: "schema", Path: "schema.spec.kind"},
+				{ID: "schema", Path: "schema.spec.group"},
+			},
+			wantFunctions: []FunctionCall{
+				{Name: "strings.plural"},
+			},
+			wantUnknownFns: nil,
+			wantUnknownRes: nil,
+		},
+		{
+			name:       "resource named 'strings' coexists with strings.plural and cel-go strings.quote",
+			resources:  []string{"strings"},
+			expression: `strings.plural(strings.spec.kind) != "" && strings.quote(strings.status.phase) != ""`,
+			wantResources: []ResourceDependency{
+				{ID: "strings", Path: "strings.spec.kind"},
+				{ID: "strings", Path: "strings.status.phase"},
+			},
+			wantFunctions: []FunctionCall{
+				{Name: "strings.plural"},
+				{Name: "strings.quote"},
+			},
+			wantUnknownFns: nil,
+			wantUnknownRes: nil,
+		},
+		{
 			name:       "multiple custom functions in one expression",
 			resources:  []string{"schema"},
 			expression: `json.marshal(json.unmarshal(random.seededString(5, schema.metadata.uid)))`,

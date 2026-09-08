@@ -1,0 +1,20 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cel-strings-plural
+spec:
+  steps:
+  - name: Apply RGD
+    try:
+    - apply:
+        file: rgd.yaml
+    - assert:
+        file: assert-rgd-active.yaml
+  - name: Create instance
+    try:
+    - apply:
+        file: instance.yaml
+    - assert:
+        file: assert-instance-ready.yaml
+    - assert:
+        file: assert-configmap.yaml

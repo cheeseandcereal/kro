@@ -15,8 +15,9 @@ kro includes a rich set of CEL function libraries from three sources: kro's own 
 | Random                      | kro        | [kro](#random), [Go doc](https://pkg.go.dev/github.com/kubernetes-sigs/kro/pkg/cel/library#Random) |
 | Maps                        | kro        | [kro](#maps), [Go doc](https://pkg.go.dev/github.com/kubernetes-sigs/kro/pkg/cel/library#Maps) |
 | Index Mutation              | kro        | [kro](#index-mutation), [Go doc](https://pkg.go.dev/github.com/kubernetes-sigs/kro/pkg/cel/library#Lists) |
+| Strings (kro)               | kro        | [kro](#strings-kro), [Go doc](https://pkg.go.dev/github.com/kubernetes-sigs/kro/pkg/cel/library#Strings) |
 | Omit                        | kro        | [kro](#omit), [Go doc](https://pkg.go.dev/github.com/kubernetes-sigs/kro/pkg/cel/library#Omit) |
-| Strings                     | cel-go     | [kro](#strings), [Go doc](https://pkg.go.dev/github.com/google/cel-go/ext#Strings) |
+| Strings (cel-go)            | cel-go     | [kro](#strings-cel-go), [Go doc](https://pkg.go.dev/github.com/google/cel-go/ext#Strings) |
 | Lists (cel-go)              | cel-go     | [kro](#lists-cel-go), [Go doc](https://pkg.go.dev/github.com/google/cel-go/ext#Lists) |
 | Encoders                    | cel-go     | [kro](#encoders), [Go doc](https://pkg.go.dev/github.com/google/cel-go/ext#Encoders) |
 | Two-Variable Comprehensions | cel-go     | [kro](#two-variable-comprehensions), [Go doc](https://pkg.go.dev/github.com/google/cel-go/ext#TwoVarComprehensions) |
@@ -143,6 +144,50 @@ ports: ${lists.removeAtIndex(schema.spec.ports, 0)}
 swapped: ${lists.setAtIndex(lists.setAtIndex(schema.spec.items, 0, schema.spec.items[1]), 1, schema.spec.items[0])}
 ```
 
+### Strings (kro)
+
+kro-specific string functions. These live in the same `strings.` namespace as the [cel-go Strings](#strings-cel-go) extension and can be used together with it.
+
+| Function | Returns | Description |
+| --- | --- | --- |
+| `strings.plural(string)` | `string` | English plural of a word, using the same inflection rules kro uses to derive CRD resource names from kinds. Lowercase and CamelCase input keeps its case (`ClusterPolicy` -> `ClusterPolicies`). Input that is already plural is usually returned unchanged (`Endpoints` -> `Endpoints`), but this is heuristic, not guaranteed. |
+
+**Examples** (the instance schema here declares `kind` and `apiVersion` fields, as an RGD that emits a CRD would):
+
+```kro
+# Plural resource name from a kind
+plural: ${strings.plural(schema.spec.kind.lowerAscii())}
+# ClusterPolicy -> clusterpolicies
+
+# Build a CRD name (<plural>.<group>) from a kind and apiVersion
+name: ${strings.plural(schema.spec.kind.lowerAscii()) + "." + schema.spec.apiVersion.split("/")[0]}
+# ClusterPolicy + example.com/v1 -> clusterpolicies.example.com
+
+# Human-readable plural
+label: ${strings.plural(schema.spec.kind)}
+# Ingress -> Ingresses
+```
+
+:::note Lowercase first for resource names
+To reproduce the plural resource name kro assigns to a ResourceGraphDefinition's
+CRD, lowercase the kind *before* pluralizing: `strings.plural(kind.lowerAscii())`.
+Pluralizing first and lowercasing afterwards gives a different result for kinds
+that end in an upper-case acronym or are written in all caps. For example,
+`ServiceDNS` becomes `servicedns` with lowercase-first, but `servicednses` with
+pluralize-first, and `POLICY` becomes `policies` versus `policys`.
+
+The same applies to any input whose case you do not control: all-caps words are
+not pluralized well (`POLICY` -> `POLICYs`) and irregular nouns come back in
+dictionary case (`PERSON` -> `People`).
+:::
+
+:::note
+`strings.plural` does not trim its input: leading or trailing whitespace stays
+in place and whitespace-only input returns an empty string. Call `.trim()`
+first on user-supplied values. Only the last word is inflected, so separators
+are kept (`cluster-policy` -> `cluster-policies`).
+:::
+
 ### Omit
 
 The `omit()` sentinel tells kro to remove a field from the rendered resource. This is useful for conditionally excluding fields.
@@ -188,9 +233,9 @@ See [Custom Status Conditions](./06-status-conditions.md) for details.
 
 ## cel-go Libraries
 
-### Strings
+### Strings (cel-go)
 
-Extended string manipulation functions from [cel-go/ext](https://pkg.go.dev/github.com/google/cel-go/ext#Strings).
+Extended string manipulation functions from [cel-go/ext](https://pkg.go.dev/github.com/google/cel-go/ext#Strings). See [Strings (kro)](#strings-kro) for kro's additions to the `strings.` namespace.
 
 | Function | Returns | Description |
 | --- | --- | --- |

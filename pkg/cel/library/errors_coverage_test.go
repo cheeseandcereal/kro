@@ -53,6 +53,15 @@ func TestHashRejectsNonStringArguments(t *testing.T) {
 	}
 }
 
+func TestStringsPluralRejectsNonStringArguments(t *testing.T) {
+	t.Parallel()
+
+	assertCELErr(t, stringsPlural(types.Bool(true)), "strings.plural")
+	assertCELErr(t, stringsPlural(types.Int(1)), "strings.plural")
+	assertCELErr(t, stringsPlural(types.NewRefValList(
+		types.DefaultTypeAdapter, []ref.Val{types.String("Pod")})), "strings.plural")
+}
+
 func TestJSONErrorPaths(t *testing.T) {
 	t.Parallel()
 

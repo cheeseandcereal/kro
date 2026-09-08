@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: plural-fn-app
+  namespace: default
+data:
+  pluralKind: ClusterPolicies
+  pluralResource: clusterpolicies
+  crdName: clusterpolicies.example.com

@@ -755,6 +755,61 @@ func TestGraphBuilder_Validation(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "crds can derive their name from a kind with strings.plural",
+			resourceGraphDefinitionOpts: []generator.ResourceGraphDefinitionOption{
+				generator.WithSchema(
+					"Test", "v1alpha1",
+					map[string]any{
+						"kind":  "string",
+						"group": "string",
+					},
+					nil,
+				),
+				generator.WithResource("somecrd", map[string]any{
+					"apiVersion": "apiextensions.k8s.io/v1",
+					"kind":       "CustomResourceDefinition",
+					"metadata": map[string]any{
+						"name": `${strings.plural(schema.spec.kind.lowerAscii()) + "." + schema.spec.group}`,
+					},
+					"spec": map[string]any{
+						"group":   "ec2.services.k8s.aws",
+						"version": "v1alpha1",
+						"names": map[string]any{
+							"kind":     "VPC",
+							"listKind": "VPCList",
+							"singular": "vpc",
+							"plural":   "vpcs",
+						},
+						"scope": "Namespaced",
+					},
+				}, nil, nil),
+			},
+			wantErr: false,
+		},
+		{
+			name: "resource id 'strings' coexists with the strings.* functions",
+			resourceGraphDefinitionOpts: []generator.ResourceGraphDefinitionOption{
+				generator.WithSchema(
+					"Test", "v1alpha1",
+					map[string]any{
+						"kind": "string",
+					},
+					map[string]any{
+						"plural": "${strings.plural(schema.spec.kind)}",
+						"quoted": "${strings.quote(strings.metadata.name)}",
+					},
+				),
+				generator.WithResource("strings", map[string]any{
+					"apiVersion": "v1",
+					"kind":       "ConfigMap",
+					"metadata": map[string]any{
+						"name": "${strings.plural(schema.spec.kind.lowerAscii())}",
+					},
+				}, []string{"${strings.plural(strings.metadata.name) != ''}"}, nil),
+			},
+			wantErr: false,
+		},
+		{
 			name: "crds with dynamic external references work",
 			resourceGraphDefinitionOpts: []generator.ResourceGraphDefinitionOption{
 				generator.WithSchema(
