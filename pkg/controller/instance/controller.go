@@ -43,6 +43,7 @@ import (
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/executor"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/registry"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/rgdadapter"
+	geruntime "github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
 	"github.com/kubernetes-sigs/kro/pkg/metadata"
 	"github.com/kubernetes-sigs/kro/pkg/metrics"
 	"github.com/kubernetes-sigs/kro/pkg/requeue"
@@ -329,11 +330,19 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (err error
 // built-in conditions report InstanceManaged=True, GraphResolved=True and
 // ResourcesReady=False with reason "ReconciliationSuspended", and no nodes are
 // applied or pruned. Status is persisted so the Reconcile defer emits the
-// condition-transition events/metrics.
+// condition-transition events/metrics. When the RGD declares author conditions,
+// only those go on the wire, re-projected against the current spec.
 func (c *Controller) reconcileSuspended(ctx context.Context, inst *unstructured.Unstructured) error {
+	log := c.log.WithValues(
+		"namespace", inst.GetNamespace(),
+		"name", inst.GetName(),
+		"path", "suspended",
+	)
+
 	// Keep the instance managed even while suspended so deletion still works.
 	patched, err := c.stampInstanceMetadata(ctx, inst)
 	if err != nil {
+		c.persistInstanceNotManaged(ctx, log, inst, err)
 		return err
 	}
 	if patched != nil {
@@ -347,16 +356,71 @@ func (c *Controller) reconcileSuspended(ctx context.Context, inst *unstructured.
 	mark.GraphResolved()
 	mark.ReconciliationSuspended("reconciliation suspended via %s annotation", v1alpha1.InstanceReconcileAnnotation)
 
-	// No nodes are reconciled, so the instance-level state is Active (there is
-	// nothing to mark not-ready beyond the suspend condition). Author conditions
-	// are carried forward from the wire since they cannot be re-evaluated while
-	// suspended.
-	ri := c.client.Dynamic().Resource(c.gvr)
-	var instanceClient dynamic.ResourceInterface = ri
-	if c.namespaced {
-		instanceClient = ri.Namespace(inst.GetNamespace())
+	// No nodes are reconciled, so the instance-level state is Active; only a
+	// degraded author-condition projection lowers it to Error, as on the
+	// normal path.
+	state := v1alpha1.InstanceStateActive
+	var authorConditions []any
+	if c.reconcileConfig.HasAuthorConditions {
+		// Conditions that read only `schema` resolve at the current generation;
+		// those referencing managed resources are data-pending (nothing is
+		// observed while suspended) and keep their previous value. Without a
+		// runtime the previous list is carried forward. No built-in is appended.
+		if rt, rgd, rtErr := c.activeRuntime(inst); rtErr != nil {
+			log.V(1).Info("cannot re-project author conditions while suspended; carrying the previous conditions forward", "error", rtErr)
+			prev, _ := wireStatus["conditions"].([]any)
+			authorConditions = conditionsToInterfaceSlice(decodeConditions(prev))
+		} else {
+			stamped, condErr := c.projectAuthorConditions(rt, rgd, inst, wireStatus)
+			if condErr != nil {
+				log.Error(condErr, "author conditions degraded while suspended; setting state=Error")
+				state = v1alpha1.InstanceStateError
+			}
+			authorConditions = conditionsToInterfaceSlice(stamped)
+		}
 	}
-	return c.persistNodeFreeStatus(ctx, instanceClient, inst, wireStatus, v1alpha1.InstanceStateActive)
+	return c.persistNodeFreeStatus(ctx, c.instanceClient(inst), inst, wireStatus, state, authorConditions)
+}
+
+// activeRuntime builds a Runtime for inst from the latest issued revision,
+// which must be Active, the same way reconcileViaGraphEngine does but without
+// marking conditions or counting metrics. Callers fall back on any error.
+func (c *Controller) activeRuntime(inst *unstructured.Unstructured) (*geruntime.Runtime, *v1alpha1.ResourceGraphDefinition, error) {
+	latest, ok := c.graphResolver.GetLatestRevision()
+	if !ok {
+		return nil, nil, fmt.Errorf("latest issued revision not available")
+	}
+	if latest.State != revisions.RevisionStateActive {
+		return nil, nil, fmt.Errorf("latest issued revision %d is not active (state=%s)", latest.Revision, latest.State)
+	}
+	if latest.RGDSpec == nil {
+		return nil, nil, fmt.Errorf("latest issued revision %d has no RGDSpec", latest.Revision)
+	}
+	if c.graphEngineCompiler == nil {
+		return nil, nil, fmt.Errorf("compiler not wired (WithGraphEngineCompiler not called)")
+	}
+	rgd := &v1alpha1.ResourceGraphDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: latest.OwnerKey,
+		},
+		Spec: *latest.RGDSpec,
+	}
+	rt, _, err := rgdadapter.BuildRuntimeForInstanceCached(rgd, inst, c.graphEngineCompiler, c.programCache, c.runtimeOptions()...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build runtime: %w", err)
+	}
+	return rt, rgd, nil
+}
+
+// persistInstanceNotManaged marks InstanceManaged=False/ManagementFailed (hence
+// Ready=False) after a stampInstanceMetadata failure and best-effort persists
+// it, so the instance does not error-loop with no .status at all. A persist
+// error is only logged; the caller still returns the stamp error.
+func (c *Controller) persistInstanceNotManaged(ctx context.Context, log logr.Logger, inst *unstructured.Unstructured, cause error) {
+	NewConditionsMarkerFor(inst).InstanceNotManaged("finalizer/labeling failed: %v", cause)
+	if err := c.updateConditionsStatus(ctx, inst); err != nil {
+		log.V(1).Info("failed to persist InstanceManaged=False after metadata stamp failure", "error", err)
+	}
 }
 
 // stampInstanceMetadata stamps the kro finalizer and instance-management labels

@@ -21,6 +21,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,6 +29,7 @@ import (
 
 	krov1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	ctrlinstance "github.com/kubernetes-sigs/kro/pkg/controller/instance"
+	"github.com/kubernetes-sigs/kro/pkg/controller/instance/applyset"
 	"github.com/kubernetes-sigs/kro/pkg/testutil/generator"
 )
 
@@ -270,6 +272,91 @@ var _ = Describe("Instance Conditions", func() {
 				}
 			}
 		}, 20*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+	})
+
+	It("surfaces InstanceManaged=False when the finalizer cannot be installed on a corrupt ApplySet inventory", func(ctx SpecContext) {
+		// stampInstanceMetadata refuses the finalizer when the ApplySet inventory
+		// is invalid; that refusal happens before any other status is written and
+		// must still reach the instance's own status.
+		rgd := generator.NewResourceGraphDefinition("test-instance-conditions-corrupt-inventory",
+			generator.WithSchema(
+				"TestInstanceCorruptInventory", "v1alpha1",
+				map[string]any{
+					"configData": "string",
+				},
+				nil,
+			),
+			generator.WithResource("configmap", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name": "${schema.metadata.name}",
+				},
+				"data": map[string]any{
+					"config": "${schema.spec.configData}",
+				},
+			}, nil, nil),
+		)
+		Expect(env.Client.Create(ctx, rgd)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			Expect(env.Client.Delete(ctx, rgd)).To(Succeed())
+		})
+		Eventually(func(g Gomega, ctx SpecContext) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: rgd.Name}, rgd)).To(Succeed())
+			g.Expect(rgd.Status.State).To(Equal(krov1alpha1.ResourceGraphDefinitionStateActive))
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		// The tooling annotation alone marks the object as an ApplySet parent;
+		// without the applyset.kubernetes.io/id label the inventory is invalid.
+		instance := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": fmt.Sprintf("%s/%s", krov1alpha1.KRODomainName, "v1alpha1"),
+				"kind":       "TestInstanceCorruptInventory",
+				"metadata": map[string]any{
+					"name":      "test-instance-corrupt-inventory",
+					"namespace": namespace,
+					"annotations": map[string]any{
+						applyset.ApplySetToolingAnnotation: applyset.ToolingID(),
+					},
+				},
+				"spec": map[string]any{
+					"configData": "test-data",
+				},
+			},
+		}
+		createInstanceWithCleanup(ctx, instance)
+
+		Eventually(func(g Gomega, ctx SpecContext) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{
+				Name:      "test-instance-corrupt-inventory",
+				Namespace: namespace,
+			}, instance)).To(Succeed())
+
+			managed := findInstanceConditionByType(instance, ctrlinstance.InstanceManaged)
+			g.Expect(managed).ToNot(BeNil(), "InstanceManaged must be written even though the reconcile failed before marking anything else")
+			g.Expect(managed["status"]).To(Equal("False"))
+			g.Expect(managed["reason"]).To(Equal("ManagementFailed"))
+			g.Expect(managed["message"]).To(ContainSubstring("cannot install finalizer with invalid applyset inventory"))
+			g.Expect(managed["message"]).To(ContainSubstring(applyset.ApplySetParentIDLabel))
+
+			ready := findInstanceConditionByType(instance, ctrlinstance.Ready)
+			g.Expect(ready).ToNot(BeNil())
+			g.Expect(ready["status"]).To(Equal("False"))
+
+			state, _, _ := unstructured.NestedString(instance.Object, "status", "state")
+			g.Expect(state).To(Equal(string(krov1alpha1.InstanceStateError)))
+
+			g.Expect(instance.GetFinalizers()).To(BeEmpty(), "the finalizer must not be installed on a corrupt inventory")
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		// Nothing was applied: the guard fires before the engine runs.
+		Consistently(func(g Gomega, ctx SpecContext) {
+			err := env.Client.Get(ctx, types.NamespacedName{
+				Name:      "test-instance-corrupt-inventory",
+				Namespace: namespace,
+			}, &corev1.ConfigMap{})
+			g.Expect(err).To(MatchError(errors.IsNotFound, "no child may be applied while the instance cannot be managed"))
+		}, 3*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
 	})
 
 })

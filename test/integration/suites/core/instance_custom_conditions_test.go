@@ -659,6 +659,165 @@ var _ = Describe("Instance Custom Conditions", func() {
 		}).WithContext(ctx).WithTimeout(10 * time.Second).WithPolling(time.Second).Should(Succeed())
 	})
 
+	It("re-projects schema-only author conditions while suspended and never leaks built-ins", func(ctx SpecContext) {
+		// While suspended, schema-only author conditions follow the spec at the
+		// new generation, resource-referencing ones keep their last value, and no
+		// built-in is injected; suspension is visible to authors only through
+		// runtime.condition(schema, 'ResourcesReady') (the Paused condition).
+		rgdName := "test-cc-suspended"
+		instanceKind := "TestCcSuspended"
+
+		rgd := generator.NewResourceGraphDefinition(rgdName,
+			generator.WithSchema(
+				instanceKind, "v1alpha1",
+				map[string]any{
+					"name":    "string",
+					"healthy": "boolean | default=true",
+				},
+				map[string]any{
+					"conditions": []any{
+						`${runtime.newCondition({type: 'AppReady', status: schema.spec.healthy ? 'True' : 'False',
+							reason: 'CheckedSpec', message: ''})}`,
+						`${runtime.newCondition({type: 'CmReady', status: configmap.data.foo == 'demo' ? 'True' : 'False',
+							reason: 'FromConfigMap', message: ''})}`,
+						`${runtime.newCondition({type: 'Paused',
+							status: runtime.condition(schema, 'ResourcesReady').reason == 'ReconciliationSuspended' ? 'True' : 'False',
+							reason: runtime.condition(schema, 'ResourcesReady').reason, message: ''})}`,
+					},
+				},
+			),
+			generator.WithResource("configmap", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": "${schema.spec.name}"},
+				"data":       map[string]any{"foo": "${schema.spec.name}"},
+			}, nil, nil),
+		)
+		Expect(env.Client.Create(ctx, rgd)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			Expect(env.Client.Delete(ctx, rgd)).To(Succeed())
+		})
+		Eventually(func(g Gomega) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: rgd.Name}, rgd)).To(Succeed())
+			g.Expect(rgd.Status.State).To(Equal(krov1alpha1.ResourceGraphDefinitionStateActive))
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		instance := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": fmt.Sprintf("%s/%s", krov1alpha1.KRODomainName, "v1alpha1"),
+			"kind":       instanceKind,
+			"metadata":   map[string]any{"name": "demo", "namespace": namespace},
+			"spec":       map[string]any{"name": "demo", "healthy": true},
+		}}
+		createInstanceWithCleanup(ctx, instance)
+
+		builtins := []string{
+			ctrlinstance.InstanceManaged, ctrlinstance.GraphResolved,
+			ctrlinstance.ResourcesReady, ctrlinstance.Ready,
+		}
+		expectNoBuiltins := func(g Gomega) {
+			for _, builtin := range builtins {
+				g.Expect(findInstanceConditionByType(instance, builtin)).To(BeNil(),
+					"kro's built-in %s must not leak onto the author-owned condition list", builtin)
+			}
+		}
+
+		// Converge at generation 1: every author condition is projected.
+		var generation1 int64
+		Eventually(func(g Gomega) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: "demo", Namespace: namespace}, instance)).To(Succeed())
+			generation1 = instance.GetGeneration()
+			for _, condType := range []string{"AppReady", "CmReady"} {
+				c := findInstanceConditionByType(instance, condType)
+				g.Expect(c).ToNot(BeNil(), "%s should be on the wire", condType)
+				g.Expect(c["status"]).To(Equal("True"), "%s should be True", condType)
+				g.Expect(c["observedGeneration"]).To(Equal(generation1))
+			}
+			paused := findInstanceConditionByType(instance, "Paused")
+			g.Expect(paused).ToNot(BeNil())
+			g.Expect(paused["status"]).To(Equal("False"))
+			expectNoBuiltins(g)
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		// Flip spec.healthy and suspend reconciliation in the SAME update.
+		Eventually(func(g Gomega) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: "demo", Namespace: namespace}, instance)).To(Succeed())
+			g.Expect(unstructured.SetNestedField(instance.Object, false, "spec", "healthy")).To(Succeed())
+			ann := instance.GetAnnotations()
+			if ann == nil {
+				ann = map[string]string{}
+			}
+			ann[krov1alpha1.InstanceReconcileAnnotation] = krov1alpha1.ReconcileSuspended
+			instance.SetAnnotations(ann)
+			g.Expect(env.Client.Update(ctx, instance)).To(Succeed())
+		}).WithContext(ctx).WithTimeout(20 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		var generation2 int64
+		Eventually(func(g Gomega) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: "demo", Namespace: namespace}, instance)).To(Succeed())
+			generation2 = instance.GetGeneration()
+			g.Expect(generation2).To(BeNumerically(">", generation1))
+
+			appReady := findInstanceConditionByType(instance, "AppReady")
+			g.Expect(appReady).ToNot(BeNil())
+			g.Expect(appReady["status"]).To(Equal("False"),
+				"a schema-only author condition must follow the spec change delivered with the suspend annotation")
+			g.Expect(appReady["observedGeneration"]).To(Equal(generation2),
+				"the re-projected condition must be stamped at the new generation")
+
+			paused := findInstanceConditionByType(instance, "Paused")
+			g.Expect(paused).ToNot(BeNil())
+			g.Expect(paused["status"]).To(Equal("True"))
+			g.Expect(paused["reason"]).To(Equal("ReconciliationSuspended"),
+				"runtime.condition(schema, 'ResourcesReady') is where authors see suspension")
+			g.Expect(paused["observedGeneration"]).To(Equal(generation2))
+
+			cmReady := findInstanceConditionByType(instance, "CmReady")
+			g.Expect(cmReady).ToNot(BeNil(), "a resource-referencing condition must not disappear while suspended")
+			g.Expect(cmReady["status"]).To(Equal("True"), "its last written value is preserved")
+			g.Expect(cmReady["observedGeneration"]).To(Equal(generation1),
+				"nothing is observed while suspended, so it is carried at its previous generation")
+
+			expectNoBuiltins(g)
+			state, _, _ := unstructured.NestedString(instance.Object, "status", "state")
+			g.Expect(state).To(Equal(string(krov1alpha1.InstanceStateActive)))
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		// Stable across later cycles.
+		Consistently(func(g Gomega) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: "demo", Namespace: namespace}, instance)).To(Succeed())
+			expectNoBuiltins(g)
+			g.Expect(findInstanceConditionByType(instance, "AppReady")["status"]).To(Equal("False"))
+			g.Expect(findInstanceConditionByType(instance, "CmReady")["observedGeneration"]).To(Equal(generation1))
+		}).WithContext(ctx).WithTimeout(5 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		// Resume (and flip the spec back) in one update: every author condition
+		// is re-projected at the new generation, still without built-ins.
+		Eventually(func(g Gomega) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: "demo", Namespace: namespace}, instance)).To(Succeed())
+			g.Expect(unstructured.SetNestedField(instance.Object, true, "spec", "healthy")).To(Succeed())
+			ann := instance.GetAnnotations()
+			delete(ann, krov1alpha1.InstanceReconcileAnnotation)
+			instance.SetAnnotations(ann)
+			g.Expect(env.Client.Update(ctx, instance)).To(Succeed())
+		}).WithContext(ctx).WithTimeout(20 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		Eventually(func(g Gomega) {
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: "demo", Namespace: namespace}, instance)).To(Succeed())
+			generation3 := instance.GetGeneration()
+			g.Expect(generation3).To(BeNumerically(">", generation2))
+			for _, condType := range []string{"AppReady", "CmReady"} {
+				c := findInstanceConditionByType(instance, condType)
+				g.Expect(c).ToNot(BeNil())
+				g.Expect(c["status"]).To(Equal("True"), "%s should be True again after resuming", condType)
+				g.Expect(c["observedGeneration"]).To(Equal(generation3), "%s should be re-projected after resuming", condType)
+			}
+			paused := findInstanceConditionByType(instance, "Paused")
+			g.Expect(paused).ToNot(BeNil())
+			g.Expect(paused["status"]).To(Equal("False"))
+			expectNoBuiltins(g)
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+	})
+
 	It("removes leftover author conditions after the conditions block is removed", func(ctx SpecContext) {
 		rgdName := "test-cc-block-removed"
 		instanceKind := "TestCcBlockRemoved"

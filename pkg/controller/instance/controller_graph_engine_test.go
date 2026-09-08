@@ -143,6 +143,34 @@ func testRGDSpecWithAuthorConditions(condExpr string) *v1alpha1.ResourceGraphDef
 	}
 }
 
+// testRGDSpecWithSchemaAuthorConditions declares `spec.healthy: boolean`, one
+// ConfigMap resource, and two author conditions: AppReady (reads only
+// schema.spec.healthy) and CmReady (reads the ConfigMap node, so data-pending
+// until it is observed).
+func testRGDSpecWithSchemaAuthorConditions() *v1alpha1.ResourceGraphDefinitionSpec {
+	statusBytes, _ := json.Marshal(map[string]any{
+		"conditions": []any{
+			"${runtime.newCondition({type: 'AppReady', status: schema.spec.healthy ? 'True' : 'False', reason: 'CheckedSpec', message: ''})}",
+			"${runtime.newCondition({type: 'CmReady', status: cm.data.key == 'val' ? 'True' : 'False', reason: 'FromConfigMap', message: ''})}",
+		},
+	})
+	return &v1alpha1.ResourceGraphDefinitionSpec{
+		Schema: &v1alpha1.Schema{
+			Kind:       "WebApp",
+			Group:      "kro.run",
+			APIVersion: "v1alpha1",
+			Spec:       apimachineryruntime.RawExtension{Raw: []byte(`{"healthy":"boolean"}`)},
+			Status:     apimachineryruntime.RawExtension{Raw: statusBytes},
+		},
+		Resources: []*v1alpha1.Resource{{
+			ID: "cm",
+			Template: apimachineryruntime.RawExtension{
+				Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"app-config","namespace":"default"},"data":{"key":"val"}}`),
+			},
+		}},
+	}
+}
+
 func newGraphEngineControllerUnderTest(
 	t *testing.T,
 	raw *dynamicfake.FakeDynamicClient,
@@ -754,20 +782,50 @@ func TestReconcileViaGraphEngine_CompilerGuards(t *testing.T) {
 // 8. reconcileViaGraphEngine: Stamp Metadata Errors
 // -----------------------------------------------------------------------------
 
+// assertInstanceNotManagedPersisted checks the status a stampInstanceMetadata
+// failure must leave on the wire: InstanceManaged=False/ManagementFailed
+// carrying the stamp error, Ready=False, and state=Error.
+func assertInstanceNotManagedPersisted(t *testing.T, stored *unstructured.Unstructured, wantCause string) {
+	t.Helper()
+
+	managed := conditionByType(t, stored, InstanceManaged)
+	assert.Equal(t, metav1.ConditionFalse, managed.Status)
+	require.NotNil(t, managed.Reason)
+	assert.Equal(t, "ManagementFailed", *managed.Reason)
+	require.NotNil(t, managed.Message)
+	assert.Contains(t, *managed.Message, "finalizer/labeling failed")
+	assert.Contains(t, *managed.Message, wantCause)
+
+	ready := conditionByType(t, stored, Ready)
+	assert.Equal(t, metav1.ConditionFalse, ready.Status)
+
+	status, _, _ := unstructured.NestedMap(stored.Object, "status")
+	require.NotNil(t, status)
+	assert.Equal(t, string(v1alpha1.InstanceStateError), status["state"])
+}
+
+// newInstanceWithCorruptInventory returns an instance carrying ApplySet
+// inventory metadata but no finalizer and no additional-namespaces annotation,
+// so stampInstanceMetadata's ValidateParentInventory guard refuses to install
+// the finalizer.
+func newInstanceWithCorruptInventory() *unstructured.Unstructured {
+	inst := newInstanceObject("demo", "default")
+	inst.SetLabels(map[string]string{
+		applyset.ApplySetParentIDLabel: applyset.ID(inst),
+	})
+	inst.SetAnnotations(map[string]string{
+		applyset.ApplySetToolingAnnotation: applyset.ToolingID(),
+		applyset.ApplySetGKsAnnotation:     "Deployment.apps",
+		// Missing ApplySetAdditionalNamespacesAnnotation -> ValidateParentInventory fails
+	})
+	return inst
+}
+
 func TestReconcileViaGraphEngine_StampMetadata(t *testing.T) {
 	comp := newTestRealCompiler(t)
 
-	t.Run("Corrupted partial ApplySet metadata causes stampInstanceMetadata to fail", func(t *testing.T) {
-		inst := newInstanceObject("demo", "default")
-		// Set partial ApplySet inventory metadata without required hash
-		inst.SetLabels(map[string]string{
-			applyset.ApplySetParentIDLabel: applyset.ID(inst),
-		})
-		inst.SetAnnotations(map[string]string{
-			applyset.ApplySetToolingAnnotation: applyset.ToolingID(),
-			applyset.ApplySetGKsAnnotation:     "Deployment.apps",
-			// Missing ApplySetInventoryHashAnnotation -> ValidateParentInventory fails
-		})
+	t.Run("Corrupted partial ApplySet metadata causes stampInstanceMetadata to fail and persists InstanceManaged=False", func(t *testing.T) {
+		inst := newInstanceWithCorruptInventory()
 
 		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
 		c, _ := newGraphEngineControllerUnderTest(t, raw, testEmptyRGDSpec(), revisions.RevisionStateActive, comp, nil)
@@ -776,9 +834,13 @@ func TestReconcileViaGraphEngine_StampMetadata(t *testing.T) {
 		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "cannot install finalizer with invalid applyset inventory")
+
+		stored := getStoredParentObject(t, raw)
+		assertInstanceNotManagedPersisted(t, stored, "cannot install finalizer with invalid applyset inventory")
+		assert.False(t, metadata.HasInstanceFinalizer(stored), "the finalizer must not be installed on a corrupt inventory")
 	})
 
-	t.Run("Dynamic client error during stampInstanceMetadata is returned", func(t *testing.T) {
+	t.Run("Dynamic client error during stampInstanceMetadata is returned and persists InstanceManaged=False", func(t *testing.T) {
 		inst := newInstanceObject("demo", "default")
 		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
 		raw.PrependReactor("patch", "webapps", func(action k8stesting.Action) (bool, apimachineryruntime.Object, error) {
@@ -790,7 +852,70 @@ func TestReconcileViaGraphEngine_StampMetadata(t *testing.T) {
 		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed stamping instance metadata")
+
+		// The status write goes through UpdateStatus, not the failing patch verb.
+		stored := getStoredParentObject(t, raw)
+		assertInstanceNotManagedPersisted(t, stored, "patch metadata failed")
 	})
+
+	t.Run("Status persist failure after stamp failure is tolerated and the stamp error is returned", func(t *testing.T) {
+		inst := newInstanceWithCorruptInventory()
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		raw.PrependReactor("update", "webapps", func(action k8stesting.Action) (bool, apimachineryruntime.Object, error) {
+			if action.GetSubresource() == "status" {
+				return true, nil, errors.New("update status failure")
+			}
+			return false, nil, nil
+		})
+
+		c, _ := newGraphEngineControllerUnderTest(t, raw, testEmptyRGDSpec(), revisions.RevisionStateActive, comp, nil)
+		watcher := &fakeInstanceWatcher{}
+		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot install finalizer with invalid applyset inventory",
+			"the original stamp error, not the status persist error, drives the requeue")
+	})
+
+	t.Run("Author-conditions mode writes state=Error and leaves the author list untouched", func(t *testing.T) {
+		// Without a runtime only state=Error lands, as on the other
+		// updateConditionsStatus early exits; built-ins must not leak.
+		inst := newInstanceWithCorruptInventory()
+		require.NoError(t, unstructured.SetNestedMap(inst.Object, map[string]any{
+			"state": string(v1alpha1.InstanceStateActive),
+			"conditions": []any{map[string]any{
+				"type":               "AppReady",
+				"status":             "True",
+				"lastTransitionTime": "2026-01-01T00:00:00Z",
+				"observedGeneration": int64(1),
+			}},
+		}, "status"))
+
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		c, _ := newGraphEngineControllerUnderTest(t, raw, testEmptyRGDSpec(), revisions.RevisionStateActive, comp, nil)
+		c.reconcileConfig.HasAuthorConditions = true
+
+		watcher := &fakeInstanceWatcher{}
+		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
+		require.Error(t, err)
+
+		stored := getStoredParentObject(t, raw)
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateError), status["state"])
+		types := conditionTypesOf(stored)
+		assert.Equal(t, []string{"AppReady"}, types, "built-ins must not leak into the author-owned condition list")
+	})
+}
+
+// conditionTypesOf returns the condition types on the object's wire status in
+// order.
+func conditionTypesOf(obj *unstructured.Unstructured) []string {
+	conds := conditionsFromInstance(obj)
+	out := make([]string, 0, len(conds))
+	for _, c := range conds {
+		out = append(out, string(c.Type))
+	}
+	return out
 }
 
 // -----------------------------------------------------------------------------
@@ -1853,8 +1978,9 @@ func TestReconcileViaGraphEngine_PatchContributions(t *testing.T) {
 		assert.Equal(t, string(v1alpha1.InstanceStateError), status["state"])
 	})
 
-	t.Run("Pre-apply applyset union failure causes delayed requeue", func(t *testing.T) {
+	t.Run("Pre-apply applyset union failure causes delayed requeue and persists ResourcesReady=False", func(t *testing.T) {
 		inst := newInstanceObject("demo", "default")
+		inst.SetGeneration(2)
 		metadata.SetInstanceFinalizer(inst)
 		inst.SetLabels(metadata.NewInstanceLabeler(inst, true).Labels())
 		// Set malformed inventory annotation to cause applier.Union to fail
@@ -1862,6 +1988,17 @@ func TestReconcileViaGraphEngine_PatchContributions(t *testing.T) {
 			applyset.ApplySetGKsAnnotation: "invalid.group.with.bad.chars!/Kind",
 		}
 		inst.SetAnnotations(anns)
+		// Stale gen-1 verdict that must be replaced at generation 2.
+		require.NoError(t, unstructured.SetNestedMap(inst.Object, map[string]any{
+			"state": string(v1alpha1.InstanceStateActive),
+			"conditions": []any{map[string]any{
+				"type":               Ready,
+				"status":             "True",
+				"reason":             "Ready",
+				"lastTransitionTime": "2026-01-01T00:00:00Z",
+				"observedGeneration": int64(1),
+			}},
+		}, "status"))
 		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
 		spec := testRGDSpecWithConfigMap("app-config", "")
 		fakeRuntimeCl := newFakeRuntimeClient(t)
@@ -1872,6 +2009,86 @@ func TestReconcileViaGraphEngine_PatchContributions(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, requeue.IsRequeueError(err))
 		assert.Contains(t, err.Error(), "pre-apply applyset union failed")
+
+		stored := getStoredParentObject(t, raw)
+		rr := conditionByType(t, stored, ResourcesReady)
+		assert.Equal(t, metav1.ConditionFalse, rr.Status)
+		require.NotNil(t, rr.Reason)
+		assert.Equal(t, "NotReady", *rr.Reason)
+		require.NotNil(t, rr.Message)
+		assert.Contains(t, *rr.Message, "pre-apply applyset inventory failed")
+		assert.Contains(t, *rr.Message, "pre-apply applyset union failed")
+		assert.Equal(t, int64(2), rr.ObservedGeneration)
+
+		ready := conditionByType(t, stored, Ready)
+		assert.Equal(t, metav1.ConditionFalse, ready.Status)
+		assert.Equal(t, int64(2), ready.ObservedGeneration)
+		assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, InstanceManaged).Status)
+		assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, GraphResolved).Status)
+
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateError), status["state"],
+			"a hard pre-apply failure is classified like a hard apply error")
+
+		cmList := &unstructured.UnstructuredList{}
+		cmList.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMapList"})
+		require.NoError(t, fakeRuntimeCl.List(context.Background(), cmList))
+		assert.Empty(t, cmList.Items, "no child may be applied when the pre-apply inventory failed")
+	})
+
+	t.Run("Pre-apply applyset union failure with author conditions projects them at the current generation", func(t *testing.T) {
+		inst := newInstanceObject("demo", "default")
+		inst.SetGeneration(2)
+		metadata.SetInstanceFinalizer(inst)
+		inst.SetLabels(metadata.NewInstanceLabeler(inst, true).Labels())
+		inst.SetAnnotations(map[string]string{
+			applyset.ApplySetGKsAnnotation: "invalid.group.with.bad.chars!/Kind",
+		})
+		require.NoError(t, unstructured.SetNestedField(inst.Object, false, "spec", "healthy"))
+		require.NoError(t, unstructured.SetNestedMap(inst.Object, map[string]any{
+			"state": string(v1alpha1.InstanceStateActive),
+			"conditions": []any{
+				map[string]any{
+					"type":               "AppReady",
+					"status":             "True",
+					"reason":             "CheckedSpec",
+					"lastTransitionTime": "2026-01-01T00:00:00Z",
+					"observedGeneration": int64(1),
+				},
+				map[string]any{
+					"type":               "CmReady",
+					"status":             "True",
+					"reason":             "FromConfigMap",
+					"lastTransitionTime": "2026-01-01T00:00:00Z",
+					"observedGeneration": int64(1),
+				},
+			},
+		}, "status"))
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		spec := testRGDSpecWithSchemaAuthorConditions()
+		fakeRuntimeCl := newFakeRuntimeClient(t)
+		c, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, comp, fakeRuntimeCl)
+		c.reconcileConfig.HasAuthorConditions = true
+
+		watcher := &fakeInstanceWatcher{}
+		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "pre-apply applyset union failed")
+
+		stored := getStoredParentObject(t, raw)
+		appReady := conditionByType(t, stored, "AppReady")
+		assert.Equal(t, metav1.ConditionFalse, appReady.Status, "schema-only condition follows spec.healthy=false")
+		assert.Equal(t, int64(2), appReady.ObservedGeneration)
+		cmReady := conditionByType(t, stored, "CmReady")
+		assert.Equal(t, metav1.ConditionTrue, cmReady.Status, "resource-referencing condition is data-pending and keeps its previous value")
+		assert.Equal(t, int64(1), cmReady.ObservedGeneration)
+		assert.ElementsMatch(t, []string{"AppReady", "CmReady"}, conditionTypesOf(stored),
+			"kro's built-ins must not leak into the author-owned condition list")
+
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateError), status["state"])
 	})
 
 	t.Run("candidateMetadata includes conditional nodes without poisoning IsIgnored", func(t *testing.T) {

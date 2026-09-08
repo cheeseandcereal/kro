@@ -406,3 +406,179 @@ func TestReconcile_FailedRevisionDoesNotDelayedRequeue(t *testing.T) {
 	require.NotNil(t, cond.Message)
 	assert.Contains(t, *cond.Message, "latest issued revision 1 failed")
 }
+
+// -----------------------------------------------------------------------------
+// reconcileSuspended
+// -----------------------------------------------------------------------------
+
+// newSuspendedInstance returns a managed instance at generation 2 carrying the
+// reconcile-suspended annotation and spec.healthy=false, whose wire status
+// still holds AppReady=True and CmReady=True from generation 1.
+func newSuspendedInstance(t *testing.T) *unstructured.Unstructured {
+	t.Helper()
+	inst := newInstanceObject("demo", "default")
+	inst.SetGeneration(2)
+	metadata.SetInstanceFinalizer(inst)
+	inst.SetLabels(metadata.NewInstanceLabeler(inst, true).Labels())
+	inst.SetAnnotations(map[string]string{
+		v1alpha1.InstanceReconcileAnnotation: v1alpha1.ReconcileSuspended,
+	})
+	require.NoError(t, unstructured.SetNestedField(inst.Object, false, "spec", "healthy"))
+	require.NoError(t, unstructured.SetNestedMap(inst.Object, map[string]any{
+		"state":    string(v1alpha1.InstanceStateActive),
+		"endpoint": "https://example.test",
+		"conditions": []any{
+			map[string]any{
+				"type":               "AppReady",
+				"status":             "True",
+				"reason":             "CheckedSpec",
+				"lastTransitionTime": "2026-01-01T00:00:00Z",
+				"observedGeneration": int64(1),
+			},
+			map[string]any{
+				"type":               "CmReady",
+				"status":             "True",
+				"reason":             "FromConfigMap",
+				"lastTransitionTime": "2026-01-01T00:00:00Z",
+				"observedGeneration": int64(1),
+			},
+		},
+	}, "status"))
+	return inst
+}
+
+// TestReconcileSuspended_AuthorConditions checks that a suspended instance gets
+// its author conditions re-projected against the current spec (schema-only
+// conditions at the current generation, resource-referencing ones kept at
+// their previous value) and that no built-in is injected into the author list.
+func TestReconcileSuspended_AuthorConditions(t *testing.T) {
+	comp := newTestRealCompiler(t)
+
+	t.Run("schema-only condition follows the new spec at the current generation, no built-in leaks", func(t *testing.T) {
+		inst := newSuspendedInstance(t)
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		controller, _ := newGraphEngineControllerUnderTest(t, raw, testRGDSpecWithSchemaAuthorConditions(), revisions.RevisionStateActive, comp, nil)
+		controller.reconcileConfig.HasAuthorConditions = true
+
+		require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+
+		stored := getStoredParentObject(t, raw)
+		appReady := conditionByType(t, stored, "AppReady")
+		assert.Equal(t, metav1.ConditionFalse, appReady.Status, "AppReady must follow spec.healthy=false")
+		assert.Equal(t, int64(2), appReady.ObservedGeneration, "AppReady must be stamped at the current generation")
+		require.NotNil(t, appReady.LastTransitionTime)
+		assert.NotEqual(t, "2026-01-01T00:00:00Z", appReady.LastTransitionTime.UTC().Format(time.RFC3339),
+			"lastTransitionTime must advance on a status flip")
+
+		cmReady := conditionByType(t, stored, "CmReady")
+		assert.Equal(t, metav1.ConditionTrue, cmReady.Status, "a resource-referencing condition is data-pending while suspended and keeps its previous value")
+		assert.Equal(t, int64(1), cmReady.ObservedGeneration)
+
+		assert.ElementsMatch(t, []string{"AppReady", "CmReady"}, conditionTypesOf(stored),
+			"only author conditions may be on the wire: ResourcesReady/ReconciliationSuspended must not leak")
+
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateActive), status["state"],
+			"state stays Active while suspended, as before the Graph engine")
+		assert.Equal(t, "https://example.test", status["endpoint"], "author status fields are carried forward")
+		assert.True(t, metadata.HasInstanceFinalizer(stored), "the instance stays managed while suspended")
+	})
+
+	t.Run("no active revision carries the previous author conditions forward without leaking built-ins", func(t *testing.T) {
+		inst := newSuspendedInstance(t)
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		// Empty revision registry: no runtime can be built.
+		controller, _ := newGraphEngineControllerUnderTest(t, raw, nil, "", comp, nil)
+		controller.reconcileConfig.HasAuthorConditions = true
+
+		require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+
+		stored := getStoredParentObject(t, raw)
+		appReady := conditionByType(t, stored, "AppReady")
+		assert.Equal(t, metav1.ConditionTrue, appReady.Status)
+		assert.Equal(t, int64(1), appReady.ObservedGeneration, "without a runtime the previous verdict is preserved verbatim")
+		assert.ElementsMatch(t, []string{"AppReady", "CmReady"}, conditionTypesOf(stored),
+			"the fallback must not inject kro's built-ins either")
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateActive), status["state"])
+	})
+
+	t.Run("degraded author projection sets state=Error, as on the normal path", func(t *testing.T) {
+		inst := newSuspendedInstance(t)
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		// Two expressions producing the same condition type: both copies are
+		// dropped and the projection reports ErrConditionProjectionDegraded.
+		spec := testEmptyRGDSpec()
+		spec.Schema.Status = apimachineryruntime.RawExtension{Raw: []byte(`{"conditions":[` +
+			`"${runtime.newCondition({type: 'Dup', status: 'True'})}",` +
+			`"${runtime.newCondition({type: 'Dup', status: 'False'})}"]}`)}
+		controller, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, comp, nil)
+		controller.reconcileConfig.HasAuthorConditions = true
+
+		require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+
+		stored := getStoredParentObject(t, raw)
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateError), status["state"])
+		assert.NotContains(t, conditionTypesOf(stored), ResourcesReady)
+	})
+
+	t.Run("without author conditions the built-ins report ReconciliationSuspended", func(t *testing.T) {
+		inst := newSuspendedInstance(t)
+		raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+		controller, _ := newGraphEngineControllerUnderTest(t, raw, testRGDSpecWithSchemaAuthorConditions(), revisions.RevisionStateActive, comp, nil)
+
+		require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+
+		stored := getStoredParentObject(t, raw)
+		rr := conditionByType(t, stored, ResourcesReady)
+		assert.Equal(t, metav1.ConditionFalse, rr.Status)
+		require.NotNil(t, rr.Reason)
+		assert.Equal(t, "ReconciliationSuspended", *rr.Reason)
+		assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, InstanceManaged).Status)
+		assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, GraphResolved).Status)
+		assert.Equal(t, metav1.ConditionFalse, conditionByType(t, stored, Ready).Status)
+		assert.Nil(t, findCondition(stored, "AppReady"), "leftover author conditions are dropped when the RGD declares none")
+		status, _, _ := unstructured.NestedMap(stored.Object, "status")
+		require.NotNil(t, status)
+		assert.Equal(t, string(v1alpha1.InstanceStateActive), status["state"])
+	})
+}
+
+// TestReconcileSuspended_StampMetadataFailurePersistsInstanceNotManaged is the
+// suspend-path twin of the graph-engine stamp-failure test: the corrupt
+// inventory must surface as InstanceManaged=False/ManagementFailed on the wire.
+func TestReconcileSuspended_StampMetadataFailurePersistsInstanceNotManaged(t *testing.T) {
+	comp := newTestRealCompiler(t)
+	inst := newInstanceWithCorruptInventory()
+	anns := inst.GetAnnotations()
+	anns[v1alpha1.InstanceReconcileAnnotation] = v1alpha1.ReconcileLegacyDisabled
+	inst.SetAnnotations(anns)
+
+	raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+	controller, _ := newGraphEngineControllerUnderTest(t, raw, testEmptyRGDSpec(), revisions.RevisionStateActive, comp, nil)
+
+	err := controller.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot install finalizer with invalid applyset inventory")
+
+	stored := getStoredParentObject(t, raw)
+	assertInstanceNotManagedPersisted(t, stored, "cannot install finalizer with invalid applyset inventory")
+	assert.False(t, metadata.HasInstanceFinalizer(stored))
+}
+
+// findCondition returns the condition of the given type from the object's wire
+// status, or nil when absent (unlike conditionByType, which fails the test).
+func findCondition(obj *unstructured.Unstructured, condType string) *v1alpha1.Condition {
+	for _, c := range conditionsFromInstance(obj) {
+		if string(c.Type) == condType {
+			return &c
+		}
+	}
+	return nil
+}

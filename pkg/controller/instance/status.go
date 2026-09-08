@@ -193,15 +193,16 @@ func (c *Controller) updateConditionsStatus(ctx context.Context, inst *unstructu
 // runtime. Status projections and author conditions that cannot be evaluated
 // during early deletion are preserved from the wire.
 func (c *Controller) updateDeletionStatus(dcx *DeletionContext) error {
-	return c.persistNodeFreeStatus(dcx.Ctx, dcx.InstanceClient(), dcx.Instance, dcx.WireStatus, dcx.State)
+	return c.persistNodeFreeStatus(dcx.Ctx, dcx.InstanceClient(), dcx.Instance, dcx.WireStatus, dcx.State, deletionConditions(dcx.Instance, dcx.WireStatus))
 }
 
 // persistNodeFreeStatus assembles and persists instance status for the two
 // engine-free paths (deletion and suspend). The caller must already have
 // stamped the built-in conditions onto inst via a ConditionsMarker. It carries
 // the wire status forward (minus conditions/state), applies the given
-// lifecycle state, preserves author conditions via deletionConditions when the
-// RGD owns the condition surface, and writes through the skip-identical
+// lifecycle state, replaces the built-in conditions with authorConditions when
+// the RGD owns the condition surface (deletion passes deletionConditions,
+// suspend the re-projected list), and writes through the skip-identical
 // persistStatus guard.
 func (c *Controller) persistNodeFreeStatus(
 	ctx context.Context,
@@ -209,6 +210,7 @@ func (c *Controller) persistNodeFreeStatus(
 	inst *unstructured.Unstructured,
 	wireStatus map[string]any,
 	state v1alpha1.InstanceState,
+	authorConditions []any,
 ) error {
 	previousState, _ := wireStatus["state"].(string)
 	status := initialStatus(inst, state)
@@ -218,7 +220,7 @@ func (c *Controller) persistNodeFreeStatus(
 		}
 	}
 	if c.reconcileConfig.HasAuthorConditions {
-		status["conditions"] = deletionConditions(inst, wireStatus)
+		status["conditions"] = authorConditions
 	}
 	return c.persistStatus(ctx, instanceClient, inst, wireStatus, status, previousState)
 }

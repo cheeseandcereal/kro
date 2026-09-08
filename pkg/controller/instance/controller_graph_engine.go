@@ -133,6 +133,7 @@ func (c *Controller) reconcileViaGraphEngine(
 
 	// Stamp the kro finalizer and management labels on the instance.
 	if patched, err := c.stampInstanceMetadata(ctx, inst); err != nil {
+		c.persistInstanceNotManaged(ctx, log, inst, err)
 		return err
 	} else if patched != nil {
 		inst.Object = patched.Object
@@ -156,11 +157,7 @@ func (c *Controller) reconcileViaGraphEngine(
 	}
 
 	// Build a per-reconcile Runtime.
-	var rtOpts []geruntime.Option
-	if c.reconcileConfig.MaxCollectionSize > 0 {
-		rtOpts = append(rtOpts, geruntime.WithMaxCollectionSize(c.reconcileConfig.MaxCollectionSize))
-	}
-	rt, _, err := rgdadapter.BuildRuntimeForInstanceCached(rgd, inst, c.graphEngineCompiler, c.programCache, rtOpts...)
+	rt, _, err := rgdadapter.BuildRuntimeForInstanceCached(rgd, inst, c.graphEngineCompiler, c.programCache, c.runtimeOptions()...)
 	if err != nil {
 		metrics.InstanceGraphResolutionFailuresTotal.WithLabelValues(gvrStr, "build_failed").Inc()
 		log.Error(err, "graph-engine: BuildRuntimeForInstance failed")
@@ -176,6 +173,14 @@ func (c *Controller) reconcileViaGraphEngine(
 	// but the parent has no inventory tracking them.
 	supersetMeta, applier, preErr := c.preApplyApplySetInventory(ctx, log, inst, rt)
 	if preErr != nil {
+		// Nothing was applied, but the stale prior verdict must not stay on the
+		// wire: persist ResourcesReady=False at the current generation with
+		// state=Error (the classification a hard apply error gets). A persist
+		// failure is only logged; the inventory error is the one to requeue on.
+		mark.ResourcesNotReady("pre-apply applyset inventory failed: %v", preErr)
+		if err := c.persistGraphEngineStatus(ctx, inst, wireStatus, rt, rgd, true); err != nil {
+			log.V(1).Info("graph-engine: failed to persist status after pre-apply inventory failure", "error", err)
+		}
 		return preErr
 	}
 
@@ -304,6 +309,16 @@ func (c *Controller) reconcileViaGraphEngine(
 // namespace/name; cluster-scoped instances key on name alone.
 func instanceKey(inst *unstructured.Unstructured) client.ObjectKey {
 	return client.ObjectKey{Namespace: inst.GetNamespace(), Name: inst.GetName()}
+}
+
+// runtimeOptions returns the per-reconcile Runtime options derived from the
+// reconcile config, shared by every path that builds a Runtime for an instance.
+func (c *Controller) runtimeOptions() []geruntime.Option {
+	var opts []geruntime.Option
+	if c.reconcileConfig.MaxCollectionSize > 0 {
+		opts = append(opts, geruntime.WithMaxCollectionSize(c.reconcileConfig.MaxCollectionSize))
+	}
+	return opts
 }
 
 // notReadyRequeue returns the soft not-ready requeue for key: a capped
@@ -906,13 +921,7 @@ func (c *Controller) persistGraphEngineStatus(
 	}
 
 	if c.reconcileConfig.HasAuthorConditions {
-		authored, incomplete, condErr := rgdadapter.ProjectInstanceConditions(rt, rgd, builtins, c.reconcileConfig.CELCostLimit)
-		prev, _ := wireStatus["conditions"].([]any)
-		previous := decodeConditions(prev)
-		stamped := stampAuthorConditions(authored, previous, inst.GetGeneration())
-		if incomplete {
-			stamped = mergeWithPrevious(stamped, previous)
-		}
+		stamped, condErr := c.projectAuthorConditions(rt, rgd, inst, wireStatus)
 		status["conditions"] = conditionsToInterfaceSlice(stamped)
 		if condErr != nil {
 			c.log.Error(condErr, "graph-engine: author conditions degraded; setting state=Error")
@@ -921,6 +930,28 @@ func (c *Controller) persistGraphEngineStatus(
 	}
 
 	return c.persistConditionsAndState(ctx, inst, wireStatus, status, previousState)
+}
+
+// projectAuthorConditions evaluates the RGD's author conditions against rt and
+// returns the wire-shaped list that replaces kro's built-ins in
+// author-conditions mode, stamped at the current generation; when the
+// projection is incomplete, previously persisted conditions of the missing
+// types are kept. A returned ErrConditionProjectionDegraded still comes with
+// the surviving conditions; the caller reflects it as state=Error.
+func (c *Controller) projectAuthorConditions(
+	rt *geruntime.Runtime,
+	rgd *v1alpha1.ResourceGraphDefinition,
+	inst *unstructured.Unstructured,
+	wireStatus map[string]any,
+) ([]v1alpha1.Condition, error) {
+	authored, incomplete, condErr := rgdadapter.ProjectInstanceConditions(rt, rgd, builtinConditions(inst), c.reconcileConfig.CELCostLimit)
+	prev, _ := wireStatus["conditions"].([]any)
+	previous := decodeConditions(prev)
+	stamped := stampAuthorConditions(authored, previous, inst.GetGeneration())
+	if incomplete {
+		stamped = mergeWithPrevious(stamped, previous)
+	}
+	return stamped, condErr
 }
 
 // isResourceDeleting reports whether err (an executor apply error) signals a
