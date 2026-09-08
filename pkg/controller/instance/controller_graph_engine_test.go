@@ -1835,12 +1835,18 @@ func TestReconcileViaGraphEngine_PatchContributions(t *testing.T) {
 		watcher := &fakeInstanceWatcher{}
 		err := c.reconcileViaGraphEngine(context.Background(), inst, watcher)
 		require.Error(t, err)
-		// The collision is now caught PRE-WRITE by the executor's identity-claim
-		// guard (before cm2's SSA write clobbers cm1), so the error is
-		// ErrDuplicateIdentity rather than the post-apply validateAppliedIdentities
-		// message. (Like any hard apply error it is still delayed-requeued so the
-		// instance retries; the state below reflects the degraded outcome.)
+		// The collision is caught by the executor's pre-walk identity pass (both
+		// names are static), so the error is ErrDuplicateIdentity rather than the
+		// post-apply validateAppliedIdentities message and neither node is applied.
+		// (Like any hard apply error it is still delayed-requeued so the instance
+		// retries; the state below reflects the degraded outcome.)
 		assert.Contains(t, err.Error(), "duplicate resource identity across nodes")
+
+		live := &unstructured.Unstructured{}
+		live.SetAPIVersion("v1")
+		live.SetKind("ConfigMap")
+		getErr := fakeRuntimeCl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "shared-cm"}, live)
+		assert.True(t, apierrors.IsNotFound(getErr), "shared-cm must not exist after a pre-walk duplicate rejection, got err=%v", getErr)
 
 		stored := getStoredParentObject(t, raw)
 		cond := conditionByType(t, stored, ResourcesReady)

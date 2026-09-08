@@ -318,11 +318,12 @@ func (n *Node) Resolve() ([]*unstructured.Unstructured, error) {
 		}
 		out = append(out, obj)
 	}
-	// For template-kind collections, defend against the case where
-	// identity-field expressions silently produce duplicate names — kro
-	// catches it at compile time via iterator-coverage analysis, but
-	// runtime values can still collide if def-sourced values overlap.
-	if n.spec.Kind == compiler.NodeKindTemplate && n.IsCollection() {
+	// For template and patch collections, defend against the case where
+	// identity-field expressions silently produce duplicate identities — kro
+	// catches the structural case at compile time via iterator-coverage
+	// analysis, but overlapping axis values can still collide (a patch would
+	// then land on one target twice under one field manager).
+	if (n.spec.Kind == compiler.NodeKindTemplate || n.spec.Kind == compiler.NodeKindPatch) && n.IsCollection() {
 		if err := validateUniqueIdentities(out); err != nil {
 			metrics.NodeEvalErrorsTotal.Inc()
 			return nil, fmt.Errorf("node %q: %w", n.spec.ID, err)

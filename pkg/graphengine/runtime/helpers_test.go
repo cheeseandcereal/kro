@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/compiler"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/testutil/generator"
 )
@@ -374,26 +375,51 @@ func TestIsIgnored_Memoized(t *testing.T) {
 }
 
 // TestResolve_DuplicateIdentities pins the post-expansion uniqueness guard:
-// a collection whose identity-field expressions collapse to the same name
-// across instances is rejected rather than handed to SSA.
+// a template or patch collection whose identity-field expressions collapse to
+// the same identity across rows is rejected rather than handed to SSA.
 func TestResolve_DuplicateIdentities(t *testing.T) {
 	t.Parallel()
-	g := generator.NewGraph("g",
-		// Two identical iterator values render the same metadata.name, so
-		// the rendered objects share an identity.
-		generator.WithDef("src", map[string]any{"names": []any{"dup", "dup"}}),
-		generator.WithTemplate("p", map[string]any{
-			"apiVersion": "v1", "kind": "ConfigMap",
-			"metadata": map[string]any{"name": "${'cm-' + n}"},
-			"data":     map[string]any{"k": "v"},
-		}, generator.ForEachDim("n", "${src.names}")),
-	)
-	prog := compileGraph(t, g)
-	rt := New(prog, g)
-	setFirst(rt, "src")
+	cases := []struct {
+		name string
+		node generator.GraphOption
+	}{
+		{
+			name: "template collection",
+			node: generator.WithTemplate("p", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${'cm-' + n}"},
+				"data":     map[string]any{"k": "v"},
+			}, generator.ForEachDim("n", "${src.names}")),
+		},
+		{
+			name: "patch collection",
+			node: func(g *expv1alpha1.Graph) {
+				generator.WithPatchManifest("p", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "${'cm-' + n}"},
+					"data":     map[string]any{"k": "v"},
+				})(g)
+				g.Spec.Nodes[len(g.Spec.Nodes)-1].ForEach = []expv1alpha1.ForEachDimension{{"n": "${src.names}"}}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := generator.NewGraph("g",
+				// Two identical iterator values render the same metadata.name, so
+				// the rendered objects share an identity.
+				generator.WithDef("src", map[string]any{"names": []any{"dup", "dup"}}),
+				tc.node,
+			)
+			prog := compileGraph(t, g)
+			rt := New(prog, g)
+			setFirst(rt, "src")
 
-	_, err := rt.Node("p").Resolve()
-	assert.ErrorContains(t, err, "duplicate identity")
+			_, err := rt.Node("p").Resolve()
+			assert.ErrorContains(t, err, "duplicate identity in collection")
+		})
+	}
 }
 
 // TestComputeIgnored_DepErrorPropagates pins the contagious-error branch:

@@ -497,7 +497,7 @@ func TestCompile(t *testing.T) {
 			wantErr: "cluster-scoped but template sets metadata.namespace",
 		},
 		{
-			name: "forEach without iterator use in metadata.name is rejected",
+			name: "forEach without iterator use in any identity field is rejected",
 			graph: generator.NewGraph("g",
 				generator.WithDef("src", map[string]any{"names": []any{"a", "b"}}),
 				generator.WithTemplate("p", map[string]any{
@@ -506,7 +506,7 @@ func TestCompile(t *testing.T) {
 					"spec":     map[string]any{"containers": []any{map[string]any{"name": "c", "image": "nginx"}}},
 				}, generator.ForEachDim("name", "${src.names}")),
 			),
-			wantErr: "every forEach iterator must appear in metadata.name",
+			wantErr: "every forEach iterator must appear in an identity field (apiVersion, kind, metadata.name, or metadata.namespace",
 		},
 		{
 			name: "template missing metadata is rejected",
@@ -1087,7 +1087,77 @@ func TestCompile_DynamicGVK(t *testing.T) {
 		)
 		_, err := newTestCompiler(t).Compile(g)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "forEach iterator")
+		assert.Contains(t, err.Error(), "every forEach iterator must appear in an identity field (apiVersion, kind, metadata.name, or metadata.namespace")
+		assert.Contains(t, err.Error(), "missing: [n]")
+	})
+
+	// Runtime identity is GVK+namespace+name, so an iterator that varies
+	// apiVersion or kind renders distinct objects even with a fixed name.
+	t.Run("forEach iterator appearing only in kind is accepted (heterogeneous-kind collection)", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithNamespace("default"),
+			generator.WithDef("cfg", map[string]any{"kinds": []any{"ConfigMap", "Secret"}}),
+			generator.WithTemplate("res", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "${k}",
+				"metadata":   map[string]any{"name": "fixed"},
+			}, generator.ForEachDim("k", "${cfg.kinds}")),
+		)
+		prog, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err, "an iterator in kind yields one identity per kind")
+		require.NotNil(t, prog.Nodes["res"])
+		assert.True(t, prog.Nodes["res"].DynamicGVK)
+		assert.True(t, prog.Nodes["res"].IsCollection())
+	})
+
+	t.Run("forEach iterator appearing only in apiVersion is accepted", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithNamespace("default"),
+			generator.WithDef("cfg", map[string]any{"groups": []any{"example.com/v1", "other.example.com/v1"}}),
+			generator.WithTemplate("res", map[string]any{
+				"apiVersion": "${gv}",
+				"kind":       "Widget",
+				"metadata":   map[string]any{"name": "fixed"},
+			}, generator.ForEachDim("gv", "${cfg.groups}")),
+		)
+		_, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err, "an iterator in apiVersion yields one identity per group/version")
+	})
+
+	// A dynamic-GVK node's REST scope is unknown at compile time, so an iterator
+	// that appears only in metadata.namespace must be accepted.
+	t.Run("forEach iterator appearing only in metadata.namespace is accepted on a dynamic-GVK node", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithNamespace("default"),
+			generator.WithDef("cfg", map[string]any{"kind": "ConfigMap", "namespaces": []any{"a", "b"}}),
+			generator.WithTemplate("res", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "${cfg.kind}",
+				"metadata":   map[string]any{"name": "fixed", "namespace": "${ns}"},
+			}, generator.ForEachDim("ns", "${cfg.namespaces}")),
+		)
+		_, err := newTestCompiler(t).Compile(g)
+		require.NoError(t, err, "scope is unknown at compile time for a dynamic-GVK node, so namespace counts as identity")
+	})
+
+	t.Run("forEach iterator appearing in none of apiVersion/kind/name/namespace is rejected on a dynamic-GVK node", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithNamespace("default"),
+			generator.WithDef("cfg", map[string]any{"kind": "ConfigMap", "names": []any{"a", "b"}}),
+			generator.WithTemplate("res", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "${cfg.kind}",
+				"metadata":   map[string]any{"name": "fixed", "labels": map[string]any{"item": "${n}"}},
+			}, generator.ForEachDim("n", "${cfg.names}")),
+		)
+		_, err := newTestCompiler(t).Compile(g)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "every forEach iterator must appear in an identity field")
+		assert.Contains(t, err.Error(), "missing: [n]")
 	})
 }
 

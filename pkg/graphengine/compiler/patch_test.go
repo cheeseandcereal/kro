@@ -97,7 +97,8 @@ func TestCompilePatch_ForEachRequiresIteratorInName(t *testing.T) {
 
 	_, err := newTestCompiler(t).Compile(g)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "every forEach iterator must appear in metadata.name")
+	assert.Contains(t, err.Error(), "every forEach iterator must appear in an identity field")
+	assert.Contains(t, err.Error(), "missing: [n]")
 }
 
 // TestCompilePatch_ForEachFansOut verifies a patch node CAN carry forEach when

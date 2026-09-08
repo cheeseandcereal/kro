@@ -115,9 +115,10 @@ func validateKindCompatibility(n *expv1alpha1.Node) error {
 		// fans the same contribution out across every rendered target (e.g. a
 		// status writeback to each claimant CR). Name-required and endpoint
 		// derivation are enforced later against the unmarshalled payload
-		// (derivePatchEndpoint); iterator→identity coverage (each rendered patch
-		// must resolve to a distinct name) is enforced in analyzeVariables so a
-		// forEach patch can't silently patch one target N times.
+		// (derivePatchEndpoint); iterator→identity coverage is enforced in
+		// analyzeVariables, and overlapping axis values are rejected after
+		// expansion by the runtime (validateUniqueIdentities), so a forEach patch
+		// can't silently patch one target N times.
 		return nil
 	}
 	if len(n.ForEach) == 0 {

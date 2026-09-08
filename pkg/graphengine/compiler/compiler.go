@@ -520,15 +520,18 @@ func emitSchemaDependencies(p *Program) {
 	}
 }
 
-// isIdentityFieldPath reports whether path identifies a resource's
-// identity field. metadata.name is identity for every resource;
-// metadata.namespace is identity only for namespaced resources.
-func isIdentityFieldPath(path string, namespaced bool) bool {
+// isIdentityFieldPath reports whether path is one of the fields that make up a
+// rendered object's runtime identity (GVK + namespace + name, the key the
+// runtime's uniqueness check dedupes on): apiVersion, kind and metadata.name
+// always; metadata.namespace for namespaced targets and for dynamic-GVK nodes,
+// whose REST scope is unknown at compile time (buildDynamicNode never sets
+// Namespaced) — the runtime check is the backstop if the target is cluster-scoped.
+func isIdentityFieldPath(path string, namespaced, dynamicGVK bool) bool {
 	switch path {
-	case "metadata.name":
+	case "apiVersion", "kind", "metadata.name":
 		return true
 	case "metadata.namespace":
-		return namespaced
+		return namespaced || dynamicGVK
 	}
 	return false
 }
@@ -654,7 +657,7 @@ func (ctx *CompilationContext) analyzeVariables(n *Node, inspector *ast.Inspecto
 		for _, d := range analysis.nodeDeps {
 			addDependency(n, d)
 		}
-		if isIdentityFieldPath(v.Path, n.Namespaced) {
+		if isIdentityFieldPath(v.Path, n.Namespaced, n.DynamicGVK) {
 			if analysis.inspection != nil && analysis.inspection.UsesOmit() {
 				return nil, fmt.Errorf("variable at %q: omit() cannot be used in resource identity fields", v.Path)
 			}
@@ -676,7 +679,7 @@ func (ctx *CompilationContext) analyzeVariables(n *Node, inspector *ast.Inspecto
 		}
 		if len(missing) > 0 {
 			return nil, fmt.Errorf(
-				"every forEach iterator must appear in metadata.name (or metadata.namespace for namespaced resources) to produce unique identities, missing: %v",
+				"every forEach iterator must appear in an identity field (apiVersion, kind, metadata.name, or metadata.namespace for namespaced (or dynamic-GVK) resources) to produce unique identities, missing: %v",
 				missing,
 			)
 		}

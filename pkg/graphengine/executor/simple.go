@@ -99,17 +99,11 @@ type Simple struct {
 	// the node-path annotation — derives from this via qualifiedPath /
 	// nodeIDToken so all three agree by construction.
 	nodePrefix string
-	// identityClaims records which node has claimed each rendered object
-	// identity (GVK+namespace+name) during a single Apply walk, so a SECOND
-	// node rendering the same identity is refused BEFORE its SSA write instead
-	// of clobbering the first node's object (and, for the standalone-Graph
-	// path, before two same-Graph template managers force-reclaim each other's
-	// fields forever while the Graph reports Ready). It is created per top-level
-	// Apply and shared across subgraph child walks (applySubgraph copies the
-	// executor by value, carrying this pointer) so a collision between template
-	// nodes in different frames targeting one cluster object is caught too.
-	// Nil outside an Apply walk; the post-apply validateAppliedIdentities check
-	// remains as a backstop.
+	// identityClaims records which node owns each rendered object identity
+	// (GVK+namespace+name) during one Apply: reserved pre-walk (reserveIdentities)
+	// and claimed per item before each SSA write (prepareItem), so two nodes
+	// rendering one object never both write it. Created per top-level Apply and
+	// shared with subgraph child walks (applySubgraph copies the executor by value).
 	identityClaims *identityClaimSet
 	// OnToleratedRejection, when non-nil, is invoked for each collection item
 	// whose UPDATE was rejected on an already-existing object and tolerated
@@ -122,37 +116,69 @@ type Simple struct {
 	OnToleratedRejection func(ToleratedRejection)
 }
 
-// identityClaimSet is the per-Apply set of claimed object identities, guarded by
-// a mutex because collection items apply in parallel.
+// identityClaimSet is the per-Apply set of reserved/claimed object identities,
+// guarded by a mutex because collection items apply in parallel.
 type identityClaimSet struct {
-	mu    sync.Mutex
-	owner map[string]string // identity key -> qualified node ID that claimed it
+	mu     sync.Mutex
+	claims map[string]identityClaim // identity key -> owning node + phase
 }
 
-// claim records that qualifiedNodeID intends to write the object identified by
-// identityKey. It returns a non-nil error when that identity was ALREADY claimed
-// this walk — the caller turns that into a hard error before any write. Every
-// claim is fresh: the claim set is created once per top-level Apply (see Apply),
-// and a single walk visits each node exactly once, so a legitimate write never
-// re-claims an identity. A second claim therefore always means two rows collide
-// on one final object — whether from two different nodes, or from a SINGLE
-// collection node whose forEach produced two rows that resolve to the same
-// identity (e.g. namespaces "" and "default" defaulting to the same object).
-// Both are rejected: concurrent writes to one object let a nondeterministic
-// last-writer win while the node still reports success.
+// identityClaim is the frame-qualified path of the node owning an identity and
+// whether that node's walk has already claimed it (a pre-walk reservation
+// leaves claimed false; the owner's per-item claim flips it exactly once).
+type identityClaim struct {
+	owner   string
+	claimed bool
+}
+
+// duplicateError renders the hard ErrDuplicateIdentity naming the node that
+// holds identityKey and the node that tried to take it.
+func duplicateError(identityKey, owner, claimant string) error {
+	if owner == claimant {
+		return fmt.Errorf("%w: node %q renders %s more than once",
+			ErrDuplicateIdentity, claimant, identityKey)
+	}
+	return fmt.Errorf("%w: nodes %q and %q both render %s",
+		ErrDuplicateIdentity, owner, claimant, identityKey)
+}
+
+// reserve records, before the walk, that qualifiedNodeID intends to write
+// identityKey. Any prior entry — another node's or this node's own — is a
+// duplicate; nothing has been written yet, so the Apply fails with nothing applied.
+func (c *identityClaimSet) reserve(identityKey, qualifiedNodeID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.claims[identityKey]; ok {
+		return duplicateError(identityKey, existing.owner, qualifiedNodeID)
+	}
+	c.claims[identityKey] = identityClaim{owner: qualifiedNodeID}
+	return nil
+}
+
+// claim records, immediately before an SSA write, that qualifiedNodeID is about
+// to write identityKey. A reservation by the same node is consumed exactly once;
+// any other prior entry (another node, or a second row of this node) is a duplicate.
 func (c *identityClaimSet) claim(identityKey, qualifiedNodeID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if owner, ok := c.owner[identityKey]; ok {
-		if owner == qualifiedNodeID {
-			return fmt.Errorf("%w: node %q renders %s more than once",
-				ErrDuplicateIdentity, qualifiedNodeID, identityKey)
-		}
-		return fmt.Errorf("%w: nodes %q and %q both render %s",
-			ErrDuplicateIdentity, owner, qualifiedNodeID, identityKey)
+	existing, ok := c.claims[identityKey]
+	if !ok {
+		c.claims[identityKey] = identityClaim{owner: qualifiedNodeID, claimed: true}
+		return nil
 	}
-	c.owner[identityKey] = qualifiedNodeID
+	if existing.owner != qualifiedNodeID || existing.claimed {
+		return duplicateError(identityKey, existing.owner, qualifiedNodeID)
+	}
+	existing.claimed = true
+	c.claims[identityKey] = existing
 	return nil
+}
+
+// identityKeyOf is the claim-set key "<group/version>/<Kind>/<namespace>/<name>"
+// shared by reserve and claim; obj must already be namespace-defaulted.
+func identityKeyOf(obj *unstructured.Unstructured) string {
+	gvk := obj.GroupVersionKind()
+	return fmt.Sprintf("%s/%s/%s/%s", gvk.GroupVersion().String(), gvk.Kind, obj.GetNamespace(), obj.GetName())
 }
 
 // NewSimple constructs a Simple executor bound to the given client.
@@ -235,6 +261,10 @@ var _ Interface = (*Simple)(nil)
 // its own dependents cascade-block via the readiness map. Gating is opt-in
 // via GateReadiness; when it is off every reachable node is applied
 // regardless of upstream readiness.
+//
+// Before the walk, reserveIdentities rejects two nodes rendering the same
+// object with a hard ErrDuplicateIdentity before anything in this frame is
+// written; the per-item claim inside the walk covers nodes it could not resolve.
 func (s *Simple) Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.Watcher) (ApplyResult, error) {
 	// Establish the per-Apply identity-claim set at the top-level walk. A
 	// subgraph child walk (applySubgraph copies the executor by value) inherits
@@ -243,8 +273,15 @@ func (s *Simple) Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.W
 	// Apply creates it.
 	if s.identityClaims == nil {
 		child := *s
-		child.identityClaims = &identityClaimSet{owner: map[string]string{}}
+		child.identityClaims = &identityClaimSet{claims: map[string]identityClaim{}}
 		return child.Apply(ctx, rt, w)
+	}
+
+	// A collision among the nodes resolvable now is a permanent graph
+	// misconfiguration: fail the whole frame before any write. Runs per frame,
+	// so a child-frame collision aborts before any child write too.
+	if err := s.reserveIdentities(rt); err != nil {
+		return ApplyResult{}, err
 	}
 
 	var result ApplyResult
@@ -363,6 +400,59 @@ func (s *Simple) Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.W
 		return result, errors.Join(hardErrs...)
 	}
 	return result, firstSoft
+}
+
+// reserveIdentities renders every template node that is resolvable before the
+// walk, namespace-defaults each object as prepareItem will, and reserves its
+// identity; a collision is a hard ErrDuplicateIdentity before any write. Only
+// templates whose hard dependencies are, transitively, Def nodes are considered:
+// the runtime seeds soft-dependency targets with an empty object, so an optional
+// access like ${a.?data.k.orValue("x")} resolves against the placeholder to an
+// identity the walk never renders, and reserving it would false-positive. Nodes
+// skipped here (data-pending, unmappable, ignored) are claimed per item in the walk.
+func (s *Simple) reserveIdentities(rt *runtime.Runtime) error {
+	// pure: Def nodes whose hard deps are transitively Defs; rt.Nodes() is
+	// topological, so a dependency is decided before its dependents.
+	pure := make(map[string]bool, len(rt.Nodes()))
+	for _, n := range rt.Nodes() {
+		depsPure := true
+		for _, depID := range n.Spec().HardDepIDs() {
+			if !pure[depID] {
+				depsPure = false
+				break
+			}
+		}
+		if n.Kind() == compiler.NodeKindDef && depsPure {
+			pure[n.ID()] = true
+		}
+		if n.Kind() != compiler.NodeKindTemplate || !depsPure {
+			continue
+		}
+		if ignored, err := n.IsIgnored(); err != nil || ignored {
+			continue
+		}
+		desired, err := n.Resolve()
+		if err != nil {
+			continue
+		}
+		// Unmappable objects (e.g. dynamic-GVK CRD not installed) are not
+		// applied by the walk either; let it surface the condition.
+		mappings, err := s.buildMappings(n, desired)
+		if err != nil {
+			continue
+		}
+		owner := s.qualifiedPath(n.ID())
+		for i, obj := range desired {
+			s.defaultNamespace(rt, mappings[i].namespaced, obj)
+			if mappings[i].namespaced && obj.GetNamespace() == "" {
+				continue // prepareItem rejects this item as a hard error
+			}
+			if err := s.identityClaims.reserve(identityKeyOf(obj), owner); err != nil {
+				return fmt.Errorf("apply %q: %w", n.ID(), err)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Simple) applyNodeByKind(
@@ -653,16 +743,12 @@ func (s *Simple) prepareItem(rt *runtime.Runtime, n *runtime.Node, obj *unstruct
 		return fmt.Errorf("node %q: namespaced resource %s/%s must set metadata.namespace when the instance is cluster-scoped", n.ID(), obj.GetKind(), obj.GetName())
 	}
 	// Pre-write duplicate-identity guard: claim this object's identity BEFORE
-	// the SSA write. If another node already claimed it this walk, refuse now so
+	// the SSA write. If another node already holds it this walk, refuse now so
 	// the second node cannot clobber the first's object (RGD path) or force-
-	// reclaim its fields forever (standalone-Graph path). The identity key
-	// matches validateAppliedIdentities (apiVersion/kind/namespace/name); the
-	// owner is the frame-qualified node path so a legitimate re-claim by the same
-	// node is allowed while a cross-node collision is a hard error.
+	// reclaim its fields forever (standalone-Graph path). A reservation this
+	// node made in reserveIdentities is consumed here, not mistaken for a collision.
 	if s.identityClaims != nil {
-		gvk := obj.GroupVersionKind()
-		identityKey := fmt.Sprintf("%s/%s/%s/%s", gvk.GroupVersion().String(), gvk.Kind, obj.GetNamespace(), obj.GetName())
-		if err := s.identityClaims.claim(identityKey, s.qualifiedPath(n.ID())); err != nil {
+		if err := s.identityClaims.claim(identityKeyOf(obj), s.qualifiedPath(n.ID())); err != nil {
 			return err
 		}
 	}

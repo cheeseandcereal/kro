@@ -43,10 +43,11 @@ func identityKey(obj *unstructured.Unstructured) string {
 }
 
 // validateUniqueIdentities returns an error if any two objects in objs
-// share the same identityKey. Called after forEach expansion to catch
-// the case where the user's identity-field expressions don't actually
-// produce distinct names — otherwise SSA would reject the duplicates
-// with a confusing field-manager error.
+// share the same identityKey. Called after forEach expansion of a template
+// or patch collection to catch the case where the user's identity-field
+// expressions don't actually produce distinct identities — otherwise SSA
+// would reject duplicate templates with a confusing field-manager error,
+// and a duplicate patch would silently land on one target twice.
 func validateUniqueIdentities(objs []*unstructured.Unstructured) error {
 	seen := make(map[string]struct{}, len(objs))
 	for _, obj := range objs {
