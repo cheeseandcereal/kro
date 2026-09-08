@@ -374,24 +374,15 @@ func (ctx *CompilationContext) compileFrame(apiNodes []expv1alpha1.Node, isRoot 
 
 	// Def nodes contribute inferred schemas to celSchemas (set in buildNode),
 	// so the typed env knows `${naming.prefix}` down to its field type.
-	//
-	// Three kinds of identifier are declared dyn rather than typed: dynamic-
-	// GVK templates and subgraph nodes (local, no published schema), plus all
-	// captured ancestor IDs (the cross-frame seam). Within-frame typed
-	// references stay fully checked; the rest type-check permissively.
-	dynIDs := make([]string, 0, len(ancestors)+len(nodes))
-	dynIDs = append(dynIDs, ancestors...)
-	for id, n := range nodes {
-		if n.Kind == NodeKindPatch {
-			continue
-		}
-		if _, ok := celSchemas[id]; !ok {
-			dynIDs = append(dynIDs, id)
-		}
-	}
+	// Schemaless identifiers (dynamic-GVK nodes, subgraph nodes, captured
+	// ancestors) are declared dyn or list(dyn); see schemalessIdentifiers.
+	// Within-frame typed references stay fully checked; the rest type-check
+	// permissively.
+	dynIDs, dynListIDs := schemalessIdentifiers(nodes, celSchemas, ancestors)
 	typedEnv, typeProvider, err := krocel.TypedEnvironmentWithIDsAndProvider(
 		celSchemas,
 		dynIDs,
+		krocel.WithListVariables(dynListIDs),
 		krocel.WithRuntimeLibrary(false),
 	)
 	if err != nil {
@@ -426,6 +417,28 @@ func (ctx *CompilationContext) compileFrame(apiNodes []expv1alpha1.Node, isRoot 
 	emitSchemaDependencies(prog)
 	captured = dedupe(captured)
 	return prog, captured, nil
+}
+
+// schemalessIdentifiers partitions the identifiers with no celSchemas entry:
+// collections are declared list(dyn) (the []any the executor publishes, so forEach
+// and comprehensions type-check); ancestors and other nodes dyn. Patches are skipped.
+func schemalessIdentifiers(nodes map[string]*Node, celSchemas map[string]*spec.Schema, ancestors []string) (dynIDs, dynListIDs []string) {
+	dynIDs = make([]string, 0, len(ancestors)+len(nodes))
+	dynIDs = append(dynIDs, ancestors...)
+	for id, n := range nodes {
+		if n.Kind == NodeKindPatch {
+			continue
+		}
+		if _, typed := celSchemas[id]; typed {
+			continue
+		}
+		if n.IsCollection() {
+			dynListIDs = append(dynListIDs, id)
+			continue
+		}
+		dynIDs = append(dynIDs, id)
+	}
+	return dynIDs, dynListIDs
 }
 
 // buildSubgraphNode compiles a nested Graph node. The child compiles in a

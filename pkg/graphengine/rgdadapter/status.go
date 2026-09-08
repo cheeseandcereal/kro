@@ -296,10 +296,9 @@ func unmarshalStatusRaw(rgd *v1alpha1.ResourceGraphDefinition) (map[string]any, 
 // than a compile-time undeclared-reference error.
 //
 // Collection nodes (forEach templates, selector externalRefs) are declared
-// as list(dyn) rather than the scalar `any` type, so status
-// expressions that range over them — filter / map / sortBy — type-check
-// (CEL rejects `any` as a comprehension range; it must be list, map, or
-// dyn). Scalar nodes stay `any`, matching the schemaless projection contract.
+// as list(dyn) so status expressions that range over them — filter / map /
+// sortBy — type-check against a list. Scalar nodes are declared dyn,
+// matching the schemaless projection contract.
 func buildStatusEnvForNodes(rt *runtime.Runtime, includeRuntime bool) (*cel.Env, error) {
 	nodes := rt.Nodes()
 	scalarIDs := make([]string, 0, len(nodes))

@@ -36,7 +36,7 @@ type EnvOption func(*envOptions)
 // envOptions holds all the configuration for the CEL environment.
 type envOptions struct {
 	// resourceIDs will be converted to CEL variable declarations
-	// of type 'any'.
+	// of type 'dyn'.
 	resourceIDs []string
 	// typedResources maps resource names to their OpenAPI schemas.
 	// These will be converted to typed CEL variables with field-level
@@ -72,7 +72,10 @@ func WithRuntimeLibrary(enabled bool) EnvOption {
 	}
 }
 
-// WithResourceIDs adds resource ids that will be declared as CEL variables.
+// WithResourceIDs adds resource ids that will be declared as untyped (`dyn`)
+// CEL variables. They must be `dyn`, not `any`: the checker treats both as
+// wildcards for assignability and field access, but rejects `any` as a
+// comprehension range, so `x.map(...)` over an `any` identifier fails to compile.
 func WithResourceIDs(ids []string) EnvOption {
 	return func(opts *envOptions) {
 		opts.resourceIDs = append(opts.resourceIDs, ids...)
@@ -98,9 +101,9 @@ func WithTypedResources(schemas map[string]*spec.Schema) EnvOption {
 	}
 }
 
-// WithListVariables adds list-typed variable declarations to the CEL environment.
-// Used for collection resources so they support list operations/macros like all()
-// exists(), filter(), and map() etc...
+// WithListVariables adds list(dyn) variable declarations to the CEL environment.
+// Used for collection resources without an element schema so they support list
+// operations/macros like all(), exists(), filter(), and map().
 func WithListVariables(names []string) EnvOption {
 	return func(opts *envOptions) {
 		for _, name := range names {
@@ -270,7 +273,7 @@ func defaultEnvironment(options ...EnvOption) (*cel.Env, *DeclTypeProvider, erro
 	}
 
 	for _, name := range opts.resourceIDs {
-		declarations = append(declarations, cel.Variable(name, cel.AnyType))
+		declarations = append(declarations, cel.Variable(name, cel.DynType))
 	}
 
 	env, err := base.Extend(declarations...)
@@ -300,7 +303,8 @@ func TypedEnvironmentWithProvider(schemas map[string]*spec.Schema, options ...En
 // TypedEnvironmentWithIDsAndProvider builds the typed CEL environment with
 // the supplied typed resources, additionally declaring the given identifiers
 // as untyped (dyn) variables. Useful when some identifiers carry no schema
-// but must still resolve at type-check time.
+// but must still resolve at type-check time. Schemaless collections should be
+// passed via WithListVariables instead so they type as list(dyn).
 func TypedEnvironmentWithIDsAndProvider(schemas map[string]*spec.Schema, dynIDs []string, options ...EnvOption) (*cel.Env, *DeclTypeProvider, error) {
 	opts := append([]EnvOption{WithTypedResources(schemas), WithResourceIDs(dynIDs)}, options...)
 	return defaultEnvironment(opts...)

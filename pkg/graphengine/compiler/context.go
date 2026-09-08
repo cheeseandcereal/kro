@@ -435,14 +435,14 @@ func validatePatchPayload(payload map[string]any) error {
 	return nil
 }
 
-// buildDynamicNode compiles a Template or Patch whose apiVersion or kind is
-// a CEL expression. There is no compile-time GVK, so we skip schema
+// buildDynamicNode compiles a Template, Ref, or Patch whose apiVersion or kind
+// is a CEL expression. There is no compile-time GVK, so we skip schema
 // resolution and REST mapping, parse the payload schemaless, and mark the
 // node dynamic. metadata is still required (payloads are authored) and
 // apiVersion/kind must be non-empty strings, but the version segment isn't
 // validated — it isn't a literal version yet. The node publishes no schema
-// (nil), so downstream references see it as dyn until the executor pins the
-// GVK.
+// (nil), so downstream references see it as dyn (list(dyn) for a collection)
+// until the executor pins the GVK.
 func (ctx *CompilationContext) buildDynamicNode(
 	n *expv1alpha1.Node,
 	order int,
