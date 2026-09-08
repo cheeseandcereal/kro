@@ -65,6 +65,10 @@ type ReconcileConfig struct {
 	// MaxCollectionSize is the maximum number of instances a single
 	// forEach collection expansion may generate.
 	MaxCollectionSize int
+	// MaxCollectionDimensionSize caps the forEach axes per collection; wired
+	// from --rgd-max-collection-dimension-size so the runtime admits what RGD
+	// validation admitted. 0 keeps the runtime default.
+	MaxCollectionDimensionSize int
 	// ApplyConcurrency bounds the number of concurrent SSA apply operations
 	// executed in parallel for collection nodes. 0 means use default (20).
 	ApplyConcurrency int

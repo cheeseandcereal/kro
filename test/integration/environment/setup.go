@@ -299,8 +299,10 @@ func (e *Environment) grantImpersonatedServiceAccounts() error {
 func (e *Environment) setupController() error {
 	var err error
 	rgdConfig := graph.Config{
-		MaxCollectionSize:          1000,
-		MaxCollectionDimensionSize: 10,
+		MaxCollectionSize: 1000,
+		// One above the runtime default so an 11-axis spec proves the RGD-level
+		// cap reaches the instance runtime.
+		MaxCollectionDimensionSize: 11,
 	}
 	maxGraphRevisions := e.ControllerConfig.MaxGraphRevisions
 	if maxGraphRevisions <= 0 {
@@ -437,16 +439,17 @@ func (e *Environment) setupController() error {
 		})
 
 		graphReconciler := &ctrlgraph.Reconciler{
-			Client:                  e.CtrlManager.GetClient(),
-			Compiler:                geCmp,
-			Registry:                reg,
-			Executor:                exec,
-			Router:                  router,
-			SchemaWatcher:           sw,
-			MaxConcurrentReconciles: 40,
-			MaxCollectionSize:       1000,
-			Impersonation:           impersonation,
-			RequireImpersonation:    true,
+			Client:                     e.CtrlManager.GetClient(),
+			Compiler:                   geCmp,
+			Registry:                   reg,
+			Executor:                   exec,
+			Router:                     router,
+			SchemaWatcher:              sw,
+			MaxConcurrentReconciles:    40,
+			MaxCollectionSize:          rgdConfig.MaxCollectionSize,
+			MaxCollectionDimensionSize: rgdConfig.MaxCollectionDimensionSize,
+			Impersonation:              impersonation,
+			RequireImpersonation:       true,
 		}
 		if err := graphReconciler.SetupWithManager(e.CtrlManager); err != nil {
 			return fmt.Errorf("setting up graph reconciler: %w", err)

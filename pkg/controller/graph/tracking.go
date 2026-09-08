@@ -228,10 +228,11 @@ func seedDefNodes(rt *krotruntime.Runtime) {
 
 // childRuntime builds the child runtime for a subgraph (NodeKindGraph) node the
 // SAME way the executor's applySubgraph does: seed the child scope from the
-// parent runtime's scope and carry MaxCollectionSize. Returns nil when the node
-// carries no compiled child program (a malformed subgraph the executor would
-// itself reject), so callers simply skip it — its identities are uncertain and
-// its post-apply entries, if any, record it.
+// parent runtime's scope and carry both collection caps (MaxCollectionSize and
+// MaxCollectionDimensions). Returns nil when the node carries no compiled child
+// program (a malformed subgraph the executor would itself reject), so callers
+// simply skip it — its identities are uncertain and its post-apply entries, if
+// any, record it.
 func childRuntime(rt *krotruntime.Runtime, n *krotruntime.Node) *krotruntime.Runtime {
 	sub := n.Spec().SubProgram
 	if sub == nil {
@@ -240,6 +241,7 @@ func childRuntime(rt *krotruntime.Runtime, n *krotruntime.Node) *krotruntime.Run
 	return krotruntime.New(sub, rt.Graph(),
 		krotruntime.WithSeedScope(rt.Scope()),
 		krotruntime.WithMaxCollectionSize(rt.MaxCollectionSize()),
+		krotruntime.WithMaxCollectionDimensions(rt.MaxCollectionDimensions()),
 	)
 }
 

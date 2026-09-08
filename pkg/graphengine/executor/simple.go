@@ -1385,6 +1385,7 @@ func (s *Simple) applySubgraph(ctx context.Context, rt *runtime.Runtime, w watch
 	childRT := runtime.New(sub, rt.Graph(),
 		runtime.WithSeedScope(rt.Scope()),
 		runtime.WithMaxCollectionSize(rt.MaxCollectionSize()),
+		runtime.WithMaxCollectionDimensions(rt.MaxCollectionDimensions()),
 	)
 
 	prefix := n.ID() + "/"
@@ -1853,6 +1854,11 @@ const patchFieldManagerPrefix = "kro-graphengine.patch."
 // subgraphs that reuse a local id distinct; embedding graphSeg lets the
 // conflict classifier recognize two managers of the same Graph as our own
 // (vs a peer). nodeID is the node's fully-qualified path (e.g. "subA/res").
+//
+// graphSeg distinguishes Graphs only on the standalone Graph path. On the
+// RGD/instance path the adapter's Graph has no UID (rgdadapter.stampGraphMeta
+// sets only name/namespace), so graphSeg is the constant sha256("")[:12] for
+// every instance and must not be read as an instance identity.
 //
 // Exported as PatchFieldManager so the graph controller's contribution
 // write-ahead projects the SAME field-manager identity the executor will apply

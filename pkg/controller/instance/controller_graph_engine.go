@@ -33,12 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apiserver/pkg/cel/openapi"
 	"k8s.io/client-go/dynamic"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kubernetes-sigs/kro/api/v1alpha1"
-	celunstructured "github.com/kubernetes-sigs/kro/pkg/cel/unstructured"
 	controllergraph "github.com/kubernetes-sigs/kro/pkg/controller/graph"
 	"github.com/kubernetes-sigs/kro/pkg/controller/instance/applyset"
 	"github.com/kubernetes-sigs/kro/pkg/dynamiccontroller"
@@ -160,6 +158,7 @@ func (c *Controller) reconcileViaGraphEngine(
 	if c.reconcileConfig.MaxCollectionSize > 0 {
 		rtOpts = append(rtOpts, geruntime.WithMaxCollectionSize(c.reconcileConfig.MaxCollectionSize))
 	}
+	rtOpts = append(rtOpts, geruntime.WithMaxCollectionDimensions(c.reconcileConfig.MaxCollectionDimensionSize))
 	rt, _, err := rgdadapter.BuildRuntimeForInstanceCached(rgd, inst, c.graphEngineCompiler, c.programCache, rtOpts...)
 	if err != nil {
 		metrics.InstanceGraphResolutionFailuresTotal.WithLabelValues(gvrStr, "build_failed").Inc()
@@ -383,10 +382,12 @@ func (c *Controller) requeueUntilRGDSpecPopulated(ctx context.Context, inst *uns
 //
 // The inventory is written as the UNION of the newly-applied group-kinds/
 // namespaces and the prior parent "memory" (the values already recorded in the
-// instance's ApplySet annotations).  Mirroring applyset.Project, this union
-// guarantees the inventory never shrinks on a not-ready/degraded cycle — which
-// is what keeps the deletion path from finding zero managed resources and
-// orphaning children when a dependent is transiently withheld.
+// instance's ApplySet annotations), the same grow-only union the pre-apply
+// projection performs (candidateMetadata + applyset.Union; applyset.Project is
+// deletion-only). Growing rather than replacing guarantees the inventory never
+// shrinks on a not-ready/degraded cycle — which is what keeps the deletion path
+// from finding zero managed resources and orphaning children when a dependent
+// is transiently withheld.
 //
 // Pruning is gated on fullyResolved (!hardErr && no Unresolved nodes):
 // we must never prune while anything is unresolved, or we would delete
@@ -558,11 +559,6 @@ func (c *Controller) candidateMetadata(rt *geruntime.Runtime, inst *unstructured
 					rt.Set(n.ID(), list)
 				} else {
 					rt.Set(n.ID(), desired[0].Object)
-				}
-				if rt.Program() != nil {
-					if sc, ok := rt.Program().NodeSchemas[n.ID()]; ok && sc != nil {
-						rt.Scope()[n.ID()] = celunstructured.UnstructuredToVal(desired[0].Object, &openapi.Schema{Schema: sc})
-					}
 				}
 			}
 		}

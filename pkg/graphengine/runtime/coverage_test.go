@@ -66,7 +66,7 @@ func TestCartesianProductOverflowRejected(t *testing.T) {
 	for i := range dims {
 		dims[i] = evaluatedDimension{name: "a", values: axis}
 	}
-	rows, err := cartesianProduct(dims, 0)
+	rows, err := cartesianProduct(dims, 0, DefaultMaxCollectionDimensions)
 	require.Error(t, err, "overflow must be rejected even when cap disabled")
 	assert.Contains(t, err.Error(), "overflows")
 	assert.Nil(t, rows)
@@ -84,7 +84,7 @@ func TestCartesianProductDimensionCap(t *testing.T) {
 	for i := range dims10 {
 		dims10[i] = evaluatedDimension{name: fmt.Sprintf("d%d", i), values: []any{1}}
 	}
-	rows, err := cartesianProduct(dims10, 0)
+	rows, err := cartesianProduct(dims10, 0, DefaultMaxCollectionDimensions)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
 
@@ -93,9 +93,67 @@ func TestCartesianProductDimensionCap(t *testing.T) {
 	for i := range dims11 {
 		dims11[i] = evaluatedDimension{name: fmt.Sprintf("d%d", i), values: []any{1}}
 	}
-	_, err = cartesianProduct(dims11, 0)
+	_, err = cartesianProduct(dims11, 0, DefaultMaxCollectionDimensions)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), fmt.Sprintf("collection has %d forEach dimensions, exceeds the maximum of %d", len(dims11), DefaultMaxCollectionDimensions))
+}
+
+// TestRuntimeMaxCollectionDimensionsOption pins WithMaxCollectionDimensions:
+// custom values apply, <= 0 keeps the default.
+func TestRuntimeMaxCollectionDimensionsOption(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []Option
+		want int
+	}{
+		{name: "default-cap", opts: nil, want: DefaultMaxCollectionDimensions},
+		{name: "custom-cap", opts: []Option{WithMaxCollectionDimensions(12)}, want: 12},
+		{name: "zero-keeps-default", opts: []Option{WithMaxCollectionDimensions(0)}, want: DefaultMaxCollectionDimensions},
+		{name: "negative-keeps-default", opts: []Option{WithMaxCollectionDimensions(-1)}, want: DefaultMaxCollectionDimensions},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := generator.NewGraph("g",
+				generator.WithNamespace("default"),
+				generator.WithDef("seed", map[string]any{"k": "v"}),
+			)
+			prog := compileGraph(t, g)
+			rt := New(prog, g, tc.opts...)
+			assert.Equal(t, tc.want, rt.MaxCollectionDimensions())
+		})
+	}
+}
+
+// TestNodeExpandHonoursConfiguredDimensionCap pins that expansion uses the
+// Runtime's configured axis cap, not the package default.
+func TestNodeExpandHonoursConfiguredDimensionCap(t *testing.T) {
+	g := generator.NewGraph("g",
+		generator.WithDef("src", map[string]any{
+			"a": []any{"1"}, "b": []any{"2"}, "c": []any{"3"},
+		}),
+		generator.WithTemplate("cm", map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{"name": "${x + y + z}"},
+			"data":     map[string]any{"k": "v"},
+		},
+			generator.ForEachDim("x", "${src.a}"),
+			generator.ForEachDim("y", "${src.b}"),
+			generator.ForEachDim("z", "${src.c}"),
+		),
+	)
+	prog := compileGraph(t, g)
+
+	tooLow := New(prog, g, WithMaxCollectionDimensions(2))
+	setFirst(tooLow, "src")
+	_, err := tooLow.Node("cm").Resolve()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "collection has 3 forEach dimensions, exceeds the maximum of 2")
+
+	ok := New(prog, g, WithMaxCollectionDimensions(3))
+	setFirst(ok, "src")
+	out, err := ok.Node("cm").Resolve()
+	require.NoError(t, err)
+	assert.Len(t, out, 1)
 }
 
 // TestCartesianProductHonoursCap regression-pins the post-multiply cap
@@ -105,7 +163,7 @@ func TestCartesianProductHonoursCap(t *testing.T) {
 		{name: "a", values: []any{1, 2, 3}},
 		{name: "b", values: []any{1, 2, 3}},
 	}
-	_, err := cartesianProduct(dims, 5)
+	_, err := cartesianProduct(dims, 5, DefaultMaxCollectionDimensions)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds")
 }

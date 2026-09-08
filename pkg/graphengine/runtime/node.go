@@ -166,7 +166,7 @@ func (n *Node) computeIgnored() (bool, error) {
 			}
 			return false, fmt.Errorf("node %q: includeWhen %q: %w", n.spec.ID, expr.UserExpression(), err)
 		}
-		b, ok := v.(bool)
+		b, ok := conditionResult(v)
 		if !ok {
 			return false, fmt.Errorf("node %q: includeWhen %q returned %T, want bool", n.spec.ID, expr.UserExpression(), v)
 		}
@@ -176,6 +176,22 @@ func (n *Node) computeIgnored() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// conditionResult coerces an evaluated includeWhen/readyWhen value to a bool.
+// nil (a CEL null or an empty optional) and sentinels.Omit (an empty optional
+// under CELOmitFunction) read as false, so `${cm.?immutable}` on an absent
+// field means not-included / not-ready rather than a hard error; ok is false
+// for any other non-bool value.
+func conditionResult(v any) (result bool, ok bool) {
+	switch b := v.(type) {
+	case bool:
+		return b, true
+	case nil, sentinels.Omit:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // CheckReadiness evaluates readyWhen against the node's observed state.
@@ -227,7 +243,7 @@ func (n *Node) CheckReadiness() error {
 			}
 			return fmt.Errorf("node %q: readyWhen %q: %w", n.spec.ID, expr.UserExpression(), err)
 		}
-		b, ok := v.(bool)
+		b, ok := conditionResult(v)
 		if !ok {
 			return fmt.Errorf("node %q: readyWhen %q returned %T, want bool", n.spec.ID, expr.UserExpression(), v)
 		}
@@ -276,7 +292,7 @@ func (n *Node) checkCollectionReadiness() error {
 				}
 				return fmt.Errorf("node %q: readyWhen %q (item %d): %w", n.spec.ID, expr.UserExpression(), i, err)
 			}
-			b, ok := v.(bool)
+			b, ok := conditionResult(v)
 			if !ok {
 				return fmt.Errorf("node %q: readyWhen %q (item %d) returned %T, want bool", n.spec.ID, expr.UserExpression(), i, v)
 			}
@@ -433,7 +449,7 @@ func (n *Node) expand() ([]map[string]any, error) {
 		}
 		dims = append(dims, evaluatedDimension{name: axis.Name, values: items})
 	}
-	rows, err := cartesianProduct(dims, n.rt.maxCollectionSize)
+	rows, err := cartesianProduct(dims, n.rt.maxCollectionSize, n.rt.maxCollectionDimensions)
 	if err != nil {
 		return nil, err
 	}

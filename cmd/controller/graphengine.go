@@ -50,6 +50,7 @@ func setupGraphController(
 	logger logr.Logger,
 	concurrentReconciles int,
 	maxCollectionSize int,
+	maxCollectionDimensionSize int,
 	applyConcurrency int,
 	controllerServiceAccount string,
 ) error {
@@ -103,17 +104,18 @@ func setupGraphController(
 	})
 
 	reconciler := &ctrlgraph.Reconciler{
-		Client:                   mgr.GetClient(),
-		Compiler:                 cmp,
-		Registry:                 reg,
-		Executor:                 exec,
-		Router:                   router,
-		SchemaWatcher:            sw,
-		MaxConcurrentReconciles:  concurrentReconciles,
-		MaxCollectionSize:        maxCollectionSize,
-		Impersonation:            impersonation,
-		RequireImpersonation:     true,
-		ControllerServiceAccount: controllerServiceAccount,
+		Client:                     mgr.GetClient(),
+		Compiler:                   cmp,
+		Registry:                   reg,
+		Executor:                   exec,
+		Router:                     router,
+		SchemaWatcher:              sw,
+		MaxConcurrentReconciles:    concurrentReconciles,
+		MaxCollectionSize:          maxCollectionSize,
+		MaxCollectionDimensionSize: maxCollectionDimensionSize,
+		Impersonation:              impersonation,
+		RequireImpersonation:       true,
+		ControllerServiceAccount:   controllerServiceAccount,
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup graph reconciler: %w", err)

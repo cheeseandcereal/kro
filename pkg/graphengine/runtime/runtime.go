@@ -61,6 +61,11 @@ type Runtime struct {
 	// the overflow safeguard in cartesianProduct still active).
 	maxCollectionSize int
 
+	// maxCollectionDimensions caps the number of forEach axes a collection
+	// node may expand. Per Runtime so it can follow the RGD-level
+	// --rgd-max-collection-dimension-size; always > 0.
+	maxCollectionDimensions int
+
 	// nodeObjectOverrides replaces a literal Def node's compiled payload with
 	// a per-Runtime value at render time. This is what lets one compiled
 	// Program be shared across every instance of a revision: the `schema`
@@ -79,6 +84,17 @@ type Option func(*Runtime)
 // Use 0 to disable the cap entirely.
 func WithMaxCollectionSize(n int) Option {
 	return func(r *Runtime) { r.maxCollectionSize = n }
+}
+
+// WithMaxCollectionDimensions overrides the default cap on forEach axes per
+// collection node (DefaultMaxCollectionDimensions). n <= 0 keeps the default;
+// unlike the size cap there is no unlimited mode.
+func WithMaxCollectionDimensions(n int) Option {
+	return func(r *Runtime) {
+		if n > 0 {
+			r.maxCollectionDimensions = n
+		}
+	}
 }
 
 // WithNodeObjectOverride replaces the literal payload of the named Def node
@@ -112,6 +128,10 @@ func WithSeedScope(seed map[string]any) Option {
 // MaxCollectionSize returns this Runtime's forEach expansion cap.
 func (r *Runtime) MaxCollectionSize() int { return r.maxCollectionSize }
 
+// MaxCollectionDimensions returns this Runtime's cap on forEach axes per
+// collection node.
+func (r *Runtime) MaxCollectionDimensions() int { return r.maxCollectionDimensions }
+
 // New constructs a Runtime around the supplied Program and source Graph.
 // Dependency pointers are wired so each Node can walk its transitive
 // upstream set without touching the Program directly.
@@ -128,11 +148,12 @@ func New(prog *compiler.Program, g *expv1alpha1.Graph, opts ...Option) *Runtime 
 	}
 
 	rt := &Runtime{
-		program:           prog,
-		graph:             g,
-		scope:             make(map[string]any, nodeCount),
-		byID:              make(map[string]*Node, nodeCount),
-		maxCollectionSize: DefaultMaxCollectionSize,
+		program:                 prog,
+		graph:                   g,
+		scope:                   make(map[string]any, nodeCount),
+		byID:                    make(map[string]*Node, nodeCount),
+		maxCollectionSize:       DefaultMaxCollectionSize,
+		maxCollectionDimensions: DefaultMaxCollectionDimensions,
 	}
 	for _, opt := range opts {
 		opt(rt)
@@ -283,20 +304,30 @@ func (r *Runtime) Scope() map[string]any { return r.scope }
 // it via CEL expressions like ${id.field}. Values with known OpenAPI schemas
 // on Template and Ref nodes are wrapped via UnstructuredToVal so CEL format
 // annotations (such as format: "byte") are respected at runtime.
+//
+// Def nodes are not wrapped: their schema is inferred (compiler.inferDefSchema)
+// and marks CEL-fragment fields x-kubernetes-int-or-string, which
+// UnstructuredToVal rejects for bool/map/list values. A Def carrying an
+// objectOverride is wrapped anyway: its schema is declared by the caller
+// (compiler.WithNodeSchemaOverride) and the RGD adapter seeds it already
+// wrapped in that schema, so republishing must keep the typing (e.g.
+// schema.metadata.creationTimestamp stays a timestamp).
 func (r *Runtime) Set(id string, value any) {
 	var sc *spec.Schema
-	isTemplateOrRef := false
+	wrap := false
 	if r.program != nil {
 		sc = r.program.NodeSchemas[id]
 	}
 	if node, ok := r.byID[id]; ok {
-		isTemplateOrRef = node.Kind() == compiler.NodeKindTemplate || node.Kind() == compiler.NodeKindRef
+		wrap = node.Kind() == compiler.NodeKindTemplate ||
+			node.Kind() == compiler.NodeKindRef ||
+			node.objectOverride != nil
 	}
-	r.scope[id] = wrapValueForScope(value, sc, isTemplateOrRef)
+	r.scope[id] = wrapValueForScope(value, sc, wrap)
 }
 
-func wrapValueForScope(val any, sc *spec.Schema, isTemplateOrRef bool) any {
-	if !isTemplateOrRef || sc == nil || val == nil {
+func wrapValueForScope(val any, sc *spec.Schema, wrap bool) any {
+	if !wrap || sc == nil || val == nil {
 		return val
 	}
 	switch v := val.(type) {

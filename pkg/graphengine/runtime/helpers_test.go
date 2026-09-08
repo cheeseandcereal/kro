@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/kubernetes-sigs/kro/pkg/cel/sentinels"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/compiler"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/testutil/generator"
 )
@@ -268,7 +269,7 @@ func TestCartesianProduct_EmptyDimensions(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := cartesianProduct(tc.dims, DefaultMaxCollectionSize)
+			got, err := cartesianProduct(tc.dims, DefaultMaxCollectionSize, DefaultMaxCollectionDimensions)
 			assert.NoError(t, err)
 			if tc.wantNil {
 				assert.Nil(t, got)
@@ -469,4 +470,31 @@ func TestWithSeedScope(t *testing.T) {
 	rt.Set("captured", "overwritten")
 	assert.Equal(t, map[string]any{"name": "from-parent"}, parentScope["captured"],
 		"seed is copied; child mutation must not leak back to the source")
+}
+
+// TestConditionResult pins that both shapes of an empty optional — nil
+// (CELOmitFunction off) and sentinels.Omit (on) — read as false, and that any
+// other non-bool is still rejected.
+func TestConditionResult(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		in     any
+		want   bool
+		wantOK bool
+	}{
+		{name: "true", in: true, want: true, wantOK: true},
+		{name: "false", in: false, want: false, wantOK: true},
+		{name: "nil (empty optional, gate off)", in: nil, want: false, wantOK: true},
+		{name: "omit sentinel (empty optional, gate on)", in: sentinels.Omit{}, want: false, wantOK: true},
+		{name: "string is not a bool", in: "true", wantOK: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := conditionResult(tc.in)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

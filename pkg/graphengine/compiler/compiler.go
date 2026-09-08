@@ -198,8 +198,8 @@ func WithSoftDependencies(nodeID string) CompileOption {
 // WithDataPendingTolerant marks a node so that a field whose expression is
 // data-pending is omitted from the rendered object rather than failing the
 // whole node. The node still applies its remaining resolved fields. Used with
-// WithSoftDependencies for the author-status writeback node so status fields
-// appear progressively, mirroring ProjectInstanceStatus's per-field skip.
+// WithSoftDependencies for the RGD adapter's synthesized author-status patch
+// node (rgdadapter.StatusPatchNodeID) so status fields appear progressively.
 func WithDataPendingTolerant(nodeID string) CompileOption {
 	return func(o *compileOptions) {
 		if o.dataPendingTolerant == nil {

@@ -105,8 +105,7 @@ const StatusPatchNodeID = "instance"
 // status so their ${...} CEL is compiled and type-checked like any patch
 // manifest. BuildRuntimeForInstance marks this node soft-deps +
 // per-field-tolerant so it never gates on the resources it reads and omits
-// unresolved fields (mirroring ProjectInstanceStatus's per-field progressive
-// projection).
+// unresolved fields, so author status projects progressively.
 func authorStatusPatchNode(rgd *v1alpha1.ResourceGraphDefinition) (v1alpha1.Node, bool, error) {
 	if rgd.Spec.Schema == nil {
 		return v1alpha1.Node{}, false, nil

@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
@@ -856,6 +857,59 @@ func TestReconcileViaGraphEngine_Success(t *testing.T) {
 
 		stored := getStoredParentObject(t, raw)
 		assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, ResourcesReady).Status)
+	})
+
+	// ReconcileConfig.MaxCollectionDimensionSize must reach the per-reconcile
+	// runtime: a 3-axis collection is rejected under a cap of 2 and applied under 3.
+	t.Run("MaxCollectionDimensionSize is enforced by the instance runtime", func(t *testing.T) {
+		threeAxisSpec := func() *v1alpha1.ResourceGraphDefinitionSpec {
+			return &v1alpha1.ResourceGraphDefinitionSpec{
+				Schema: &v1alpha1.Schema{
+					Kind:       "WebApp",
+					Group:      "kro.run",
+					APIVersion: "v1alpha1",
+				},
+				Resources: []*v1alpha1.Resource{{
+					ID: "cms",
+					ForEach: []v1alpha1.ForEachDimension{
+						{"x": `${["a"]}`},
+						{"y": `${["b"]}`},
+						{"z": `${["c"]}`},
+					},
+					Template: apimachineryruntime.RawExtension{
+						Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"${x + '-' + y + '-' + z}","namespace":"default"},"data":{"key":"val"}}`),
+					},
+				}},
+			}
+		}
+
+		t.Run("cap below the declared axes fails the instance", func(t *testing.T) {
+			inst := newInstanceObject("demo", "default")
+			raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+			fakeRuntimeCl := newFakeRuntimeClient(t)
+			c, _ := newGraphEngineControllerUnderTest(t, raw, threeAxisSpec(), revisions.RevisionStateActive, comp, fakeRuntimeCl)
+			c.reconcileConfig.MaxCollectionDimensionSize = 2
+
+			err := c.reconcileViaGraphEngine(context.Background(), inst, &fakeInstanceWatcher{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "collection has 3 forEach dimensions, exceeds the maximum of 2")
+		})
+
+		t.Run("cap at the declared axes applies the collection", func(t *testing.T) {
+			inst := newInstanceObject("demo", "default")
+			raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+			fakeRuntimeCl := newFakeRuntimeClient(t)
+			c, _ := newGraphEngineControllerUnderTest(t, raw, threeAxisSpec(), revisions.RevisionStateActive, comp, fakeRuntimeCl)
+			c.reconcileConfig.MaxCollectionDimensionSize = 3
+
+			err := c.reconcileViaGraphEngine(context.Background(), inst, &fakeInstanceWatcher{})
+			require.NoError(t, err)
+
+			stored := getStoredParentObject(t, raw)
+			assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, ResourcesReady).Status)
+			var cm corev1.ConfigMap
+			require.NoError(t, fakeRuntimeCl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "a-b-c"}, &cm))
+		})
 	})
 
 	t.Run("NewController sets ApplyConcurrency on executor", func(t *testing.T) {

@@ -36,6 +36,7 @@ func TestValidateNodeID(t *testing.T) {
 		{name: "camelCase", id: "myConfig"},
 		{name: "upper", id: "Pod"},
 		{name: "with digits", id: "vpc1"},
+		{name: "graphengine not reserved", id: "graphengine"},
 		{name: "empty", id: "", wantErr: "required"},
 		{name: "starts with digit", id: "1vpc", wantErr: "must match"},
 		{name: "hyphen rejected", id: "vpc-1", wantErr: "must match"},

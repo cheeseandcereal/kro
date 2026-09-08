@@ -40,12 +40,14 @@ var (
 	// for itself — graph-level vocabulary that must not collide with user
 	// node IDs. Keep this list to names we actually reference (or plan to
 	// reference imminently); over-reservation breaks user graphs without
-	// telling them why.
+	// telling them why. It must stay a subset of graph.kroReservedKeyWords
+	// (TestReservedNodeIDsSynchronizedWithGraph), so a name added here alone
+	// ends up reserved for every existing RGD too.
 	reservedNodeIDs = sets.New(
 		// Kubernetes manifest top-level fields and common subsections.
 		"apiVersion", "kind", "metadata", "namespace", "spec", "status",
-		// Project namespace.
-		"graph", "graphengine", "kro",
+		// Project namespace ("graphengine" is a legitimate user id, not reserved).
+		"graph", "kro",
 		// CEL / runtime identifiers we wire in.
 		"each", "item", "items", "object", "self", "this", "context",
 	).Union(celReservedSymbols)

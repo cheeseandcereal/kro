@@ -328,3 +328,57 @@ func TestBuildRuntimeForInstanceCached_FallsBack(t *testing.T) {
 		require.NotNil(t, rt)
 	})
 }
+
+// TestBuildRuntimeForInstanceCached_SchemaKeepsDeclaredTypingAfterPublish
+// pins that `schema` keeps its declared-schema CEL typing after the executor
+// republishes it through Runtime.Set: metadata.creationTimestamp is
+// format: date-time, so getFullYear() only resolves while the value is typed.
+func TestBuildRuntimeForInstanceCached_SchemaKeepsDeclaredTypingAfterPublish(t *testing.T) {
+	rgd := &v1alpha1.ResourceGraphDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "yearapp"},
+		Spec: v1alpha1.ResourceGraphDefinitionSpec{
+			Schema: &v1alpha1.Schema{
+				APIVersion: "v1alpha1",
+				Kind:       "YearApp",
+				Spec:       runtime.RawExtension{Raw: []byte(`{"value":"string"}`)},
+			},
+			Resources: []*v1alpha1.Resource{{
+				ID: "cm",
+				Template: rawResource(map[string]any{
+					"apiVersion": "v1",
+					"kind":       "ConfigMap",
+					"metadata":   map[string]any{"name": "cm", "namespace": "default"},
+					"data":       map[string]any{"year": "${string(schema.metadata.creationTimestamp.getFullYear())}"},
+				}),
+			}},
+		},
+	}
+	inst := webInstance("a", "default", "x")
+	inst.Object["kind"] = "YearApp"
+	inst.Object["metadata"].(map[string]any)["creationTimestamp"] = "2024-05-06T07:08:09Z"
+
+	rt, _, err := BuildRuntimeForInstanceCached(rgd, inst, newTestCompiler(t), registry.New())
+	require.NoError(t, err)
+
+	resolveYear := func() string {
+		t.Helper()
+		cmObjs, err := rt.Node("cm").Resolve()
+		require.NoError(t, err)
+		require.Len(t, cmObjs, 1)
+		return nestedString(t, cmObjs[0].Object, "data", "year")
+	}
+
+	assert.Equal(t, "2024", resolveYear(), "seeded schema value must carry declared-schema typing")
+
+	// Publish the schema node as the executor does (SetObserved + publishScope).
+	schemaNode := rt.Node(SchemaNodeID)
+	schemaObjs, err := schemaNode.Resolve()
+	require.NoError(t, err)
+	require.Len(t, schemaObjs, 1)
+	schemaNode.SetObserved(schemaObjs, schemaObjs)
+	rt.Set(SchemaNodeID, schemaObjs[0].Object)
+
+	_, isRawMap := rt.Scope()[SchemaNodeID].(map[string]any)
+	assert.False(t, isRawMap, "publishing the overridden schema node must not downgrade it to a raw map")
+	assert.Equal(t, "2024", resolveYear(), "published schema value must keep declared-schema typing")
+}

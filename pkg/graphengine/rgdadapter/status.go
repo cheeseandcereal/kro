@@ -96,7 +96,7 @@ func ProjectInstanceConditions(
 	}
 
 	// Build a CEL env WITH library.Runtime() so runtime.newCondition compiles.
-	// All node IDs are declared (see ProjectInstanceStatus) so a condition
+	// All node IDs are declared (see buildStatusEnvForNodes) so a condition
 	// referencing an unpublished node is a skippable data-pending error.
 	env, err := buildStatusEnvForNodes(rt, true)
 	if err != nil {
@@ -320,9 +320,6 @@ func buildStatusEnvForNodes(rt *runtime.Runtime, includeRuntime bool) (*cel.Env,
 	}
 	return krocel.DefaultEnvironment(opts...)
 }
-
-// getAtPath removed with ProjectInstanceStatus (author status is now written
-// by the synthesized status-patch node); see git history.
 
 // compileCEL parses, type-checks, and programs a plain CEL expression (no
 // ${…} wrapper) against env, wrapping each stage's error with expr context.

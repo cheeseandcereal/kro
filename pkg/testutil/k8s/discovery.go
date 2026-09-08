@@ -466,6 +466,8 @@ func NewFakeResolver() (*FakeResolver, *fake.FakeDiscovery) {
 							},
 						},
 					},
+					// Typed bool so tests can write optional<bool> conditions (`${cm.?immutable}`).
+					"immutable": {SchemaProps: spec.SchemaProps{Type: []string{"boolean"}}},
 				},
 			},
 		},

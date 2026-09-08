@@ -102,14 +102,17 @@ func BuildRuntimeForInstance(
 		return nil, nil, fmt.Errorf("rgdadapter: compile: %w", err)
 	}
 
-	// Step 5: construct the runtime.
+	// Step 5: construct the runtime. As in BuildRuntimeForInstanceCached, the
+	// objectOverride keeps the typed `schema` seed through runtime.New and
+	// makes Runtime.Set republish it wrapped in the declared schema.
 	schemaData, err := instanceSchemaValue(instance)
 	if err != nil {
 		return nil, nil, fmt.Errorf("rgdadapter: schema value: %w", err)
 	}
 	var rtOpts []runtime.Option
 	if seedOpt := instanceSeedScopeOption(rgd, schemaData); seedOpt != nil {
-		rtOpts = append(rtOpts, seedOpt)
+		rtOpts = append(rtOpts, seedOpt,
+			runtime.WithNodeObjectOverride(SchemaNodeID, &unstructured.Unstructured{Object: schemaData}))
 	}
 	rtOpts = append(rtOpts, opts...)
 	rt := runtime.New(prog, g, rtOpts...)
@@ -268,10 +271,10 @@ func instanceSeedScopeOption(rgd *v1alpha1.ResourceGraphDefinition, schemaData m
 //   - its type is taken from the RGD's declared SimpleSchema (override), not
 //     inferred from the current instance value, so a fresh instance missing
 //     fields must still compile;
-//   - a synthesized author-status writeback node is marked soft-deps (never
-//     gates on the resources it reads) and per-field data-pending-tolerant so
-//     status projects progressively and non-gating, mirroring
-//     ProjectInstanceStatus.
+//   - the synthesized author-status patch node (authorStatusPatchNode,
+//     StatusPatchNodeID) is marked soft-deps (never gates on the resources it
+//     reads) and per-field data-pending-tolerant so author status projects
+//     progressively and non-gating.
 func schemaCompileOpts(rgd *v1alpha1.ResourceGraphDefinition, g *v1alpha1.Graph) ([]compiler.CompileOption, error) {
 	opts := []compiler.CompileOption{compiler.WithLiteralNode(SchemaNodeID)}
 	if rgd.Spec.Schema != nil {

@@ -138,6 +138,39 @@ func TestNode_IsIgnored(t *testing.T) {
 			assertID: "guarded",
 			wantErr:  ErrDataPending.Error(),
 		},
+		{
+			// An empty optional (`cm.?immutable` with no immutable field) reads
+			// as false: the node is ignored rather than hard-erroring on nil.
+			name: "includeWhen optional<bool> that is empty → ignored",
+			graph: generator.NewGraph("g",
+				generator.WithTemplate("cm", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "cm"},
+					"data":     map[string]any{"k": "v"},
+				}),
+				generator.WithDef("guarded", map[string]any{"x": "y"}),
+				generator.WithIncludeWhen("${cm.?immutable}"),
+			),
+			populate: func(rt *Runtime) { setFirst(rt, "cm") },
+			assertID: "guarded",
+			want:     true,
+		},
+		{
+			name: "includeWhen optional<bool> that is present → honoured",
+			graph: generator.NewGraph("g",
+				generator.WithTemplate("cm", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata":  map[string]any{"name": "cm"},
+					"immutable": true,
+					"data":      map[string]any{"k": "v"},
+				}),
+				generator.WithDef("guarded", map[string]any{"x": "y"}),
+				generator.WithIncludeWhen("${cm.?immutable}"),
+			),
+			populate: func(rt *Runtime) { setFirst(rt, "cm") },
+			assertID: "guarded",
+			want:     false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,6 +302,66 @@ func TestNode_CheckReadiness(t *testing.T) {
 			},
 			assertID: "svc",
 			wantErr:  "want bool",
+		},
+		{
+			// An empty optional (`cm.?immutable` with no immutable field) means
+			// not ready, not a hard error.
+			name: "readyWhen optional<bool> that is empty → waiting",
+			graph: generator.NewGraph("g",
+				generator.WithTemplate("cm", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "cm"},
+					"data":     map[string]any{"k": "v"},
+				}),
+				generator.WithReadyWhen("${cm.?immutable}"),
+			),
+			populate: func(rt *Runtime) {
+				objs, _ := rt.Node("cm").Resolve()
+				rt.Set("cm", objs[0].Object)
+				rt.Node("cm").SetObserved(objs, objs)
+			},
+			assertID:    "cm",
+			wantWaiting: true,
+		},
+		{
+			name: "readyWhen optional<bool> that is present → ready",
+			graph: generator.NewGraph("g",
+				generator.WithTemplate("cm", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata":  map[string]any{"name": "cm"},
+					"immutable": true,
+					"data":      map[string]any{"k": "v"},
+				}),
+				generator.WithReadyWhen("${cm.?immutable}"),
+			),
+			populate: func(rt *Runtime) {
+				objs, _ := rt.Node("cm").Resolve()
+				rt.Set("cm", objs[0].Object)
+				rt.Node("cm").SetObserved(objs, objs)
+			},
+			assertID: "cm",
+			wantNil:  true,
+		},
+		{
+			// Per-item evaluation with `each`: an empty optional on any item
+			// means the collection is not ready.
+			name: "collection readyWhen optional<bool> that is empty → waiting",
+			graph: generator.NewGraph("g",
+				generator.WithDef("src", map[string]any{"names": []any{"a", "b"}}),
+				generator.WithTemplate("cms", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "${'cm-' + n}"},
+					"data":     map[string]any{"k": "v"},
+				}, generator.ForEachDim("n", "${src.names}")),
+				generator.WithReadyWhen("${each.?immutable}"),
+			),
+			populate: func(rt *Runtime) {
+				setFirst(rt, "src")
+				objs, _ := rt.Node("cms").Resolve()
+				rt.Node("cms").SetObserved(objs, objs)
+			},
+			assertID:    "cms",
+			wantWaiting: true,
 		},
 	}
 	for _, tc := range cases {

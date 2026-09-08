@@ -72,6 +72,9 @@ type Reconciler struct {
 	SchemaWatcher           *schemawatcher.SchemaWatcher
 	MaxConcurrentReconciles int
 	MaxCollectionSize       int
+	// MaxCollectionDimensionSize caps the forEach axes per collection node
+	// (0 = runtime default); wired from --rgd-max-collection-dimension-size.
+	MaxCollectionDimensionSize int
 
 	// Impersonation, when set, resolves a per-Graph executor that applies the
 	// Graph's resources while impersonating a ServiceAccount in the Graph's
@@ -325,6 +328,7 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	if r.MaxCollectionSize > 0 {
 		rtOpts = append(rtOpts, krotruntime.WithMaxCollectionSize(r.MaxCollectionSize))
 	}
+	rtOpts = append(rtOpts, krotruntime.WithMaxCollectionDimensions(r.MaxCollectionDimensionSize))
 	rt := krotruntime.New(prog, g, rtOpts...)
 	watcher := r.watcherFor(key)
 	previous := g.Status.ManagedResources

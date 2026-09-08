@@ -417,30 +417,31 @@ func TestCompile(t *testing.T) {
 			wantErr: "references its own id",
 		},
 		{
-			// Finding 4: an optional<bool> condition becomes a runtime error
-			// when empty (optional.none()); reject it at compile time with a
-			// hint to collapse it to a concrete bool.
-			name: "readyWhen returning optional<bool> is rejected",
+			// optional<bool> is accepted (the runtime reads an empty optional as
+			// false); `${cm.?immutable}` is optional_type(bool) because
+			// ConfigMap.immutable is a typed bool field.
+			name: "readyWhen returning optional<bool> is accepted",
 			graph: generator.NewGraph("g",
 				generator.WithTemplate("cm", configMap("source")),
-				// optional.of(true) is optional_type(bool) with no collapse.
-				generator.WithReadyWhen("${optional.of(true)}"),
+				generator.WithReadyWhen("${cm.?immutable}"),
 			),
-			wantErr: "optional<bool>",
+			after: func(t *testing.T, prog *Program, _ *expv1alpha1.Graph) {
+				require.Len(t, prog.Nodes["cm"].ReadyWhen, 1)
+			},
 		},
 		{
-			// Finding 4: same rejection for includeWhen.
-			name: "includeWhen returning optional<bool> is rejected",
+			name: "includeWhen returning optional<bool> is accepted",
 			graph: generator.NewGraph("g",
 				generator.WithTemplate("cm", configMap("source")),
 				generator.WithDef("guarded", map[string]any{"k": "v"}),
 				generator.WithIncludeWhen("${optional.of(true)}"),
 			),
-			wantErr: "orValue(false)",
+			after: func(t *testing.T, prog *Program, _ *expv1alpha1.Graph) {
+				require.Len(t, prog.Nodes["guarded"].IncludeWhen, 1)
+			},
 		},
 		{
-			// Finding 4: the .orValue(false) escape hatch collapses to a
-			// concrete bool and still compiles.
+			// The .orValue(false) collapse to a concrete bool still compiles.
 			name: "readyWhen optional collapsed with orValue is accepted",
 			graph: generator.NewGraph("g",
 				generator.WithTemplate("cm", configMap("source")),
@@ -451,16 +452,13 @@ func TestCompile(t *testing.T) {
 			},
 		},
 		{
-			name: "readyWhen returning optional<bool> is accepted (via ?-accessor or optional macros)",
+			// optional<non-bool> is still a type error.
+			name: "readyWhen returning optional<string> is rejected",
 			graph: generator.NewGraph("g",
 				generator.WithTemplate("cm", configMap("source")),
-				// optional.of(true) returns optional_type(bool), exercising
-				// the IsBoolOrOptionalBool branch.
-				generator.WithReadyWhen("${optional.of(true).orValue(true)}"),
+				generator.WithReadyWhen("${cm.metadata.?name}"),
 			),
-			after: func(t *testing.T, prog *Program, _ *expv1alpha1.Graph) {
-				require.Len(t, prog.Nodes["cm"].ReadyWhen, 1)
-			},
+			wantErr: "must return bool",
 		},
 		{
 			name: "readyWhen that references another node is rejected",

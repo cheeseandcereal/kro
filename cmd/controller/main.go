@@ -369,6 +369,7 @@ func main() {
 			rootLogger,
 			graphConcurrentReconciles,
 			rgdMaxCollectionSize,
+			rgdMaxCollectionDimensionSize,
 			applyConcurrency,
 			controllerSA,
 		); err != nil {

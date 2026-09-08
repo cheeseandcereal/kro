@@ -27,8 +27,8 @@ import (
 // objects per reconcile — a runaway. This cap keeps the expansion bounded.
 const DefaultMaxCollectionSize = 1000
 
-// DefaultMaxCollectionDimensions is the maximum number of forEach axes
-// a collection node may declare.
+// DefaultMaxCollectionDimensions is the default maximum number of forEach
+// axes a collection node may declare (see WithMaxCollectionDimensions).
 const DefaultMaxCollectionDimensions = 10
 
 // identityKey returns the GVK + namespace + name string used to dedup
@@ -125,16 +125,16 @@ type evaluatedDimension struct {
 }
 
 // cartesianProduct computes the cartesian product of multiple axes and
-// caps the total combination count at maxSize. Each output row maps
-// every iterator name to one value from its source list. Any zero-length
-// source short-circuits the whole expansion to empty (the SQL outer-join
-// semantics).
-func cartesianProduct(dims []evaluatedDimension, maxSize int) ([]map[string]any, error) {
+// caps the total combination count at maxSize and the number of axes at
+// maxDims. Each output row maps every iterator name to one value from its
+// source list. Any zero-length source short-circuits the whole expansion to
+// empty (the SQL outer-join semantics).
+func cartesianProduct(dims []evaluatedDimension, maxSize, maxDims int) ([]map[string]any, error) {
 	if len(dims) == 0 {
 		return []map[string]any{{}}, nil
 	}
-	if len(dims) > DefaultMaxCollectionDimensions {
-		return nil, fmt.Errorf("collection has %d forEach dimensions, exceeds the maximum of %d", len(dims), DefaultMaxCollectionDimensions)
+	if len(dims) > maxDims {
+		return nil, fmt.Errorf("collection has %d forEach dimensions, exceeds the maximum of %d", len(dims), maxDims)
 	}
 	total := 1
 	for _, d := range dims {
