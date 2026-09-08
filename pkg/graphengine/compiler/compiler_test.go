@@ -1218,6 +1218,62 @@ func TestCompile_WithSelfWatchExempt(t *testing.T) {
 	assert.False(t, prog.Nodes["cm"].SelfWatchExempt, "other nodes must not be exempted")
 }
 
+// TestCompile_WithStatusReplace verifies the flag that makes the executor
+// replace a status patch target's status via Update (instead of forced SSA) is
+// threaded onto the named node only, including into child frames.
+func TestCompile_WithStatusReplace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sets the flag on the named node only", func(t *testing.T) {
+		t.Parallel()
+		g := generator.NewGraph("g",
+			generator.WithTemplate("pod", map[string]any{
+				"apiVersion": "v1", "kind": "Pod",
+				"metadata": map[string]any{"name": "target"},
+			}),
+			generator.WithPatch("writeback", "v1", "Pod", "target", map[string]any{
+				"status": map[string]any{"phase": "Running"},
+			}),
+			generator.WithPatch("other", "v1", "Pod", "target", map[string]any{
+				"status": map[string]any{"hostIP": "10.0.0.1"},
+			}),
+		)
+		prog, err := newTestCompiler(t).CompileWithOptions(g, WithStatusReplace("writeback"))
+		require.NoError(t, err)
+		require.NotNil(t, prog.Nodes["writeback"])
+		assert.True(t, prog.Nodes["writeback"].StatusReplace, "WithStatusReplace must set StatusReplace on the node")
+		assert.Equal(t, "status", prog.Nodes["writeback"].Subresource)
+		assert.False(t, prog.Nodes["other"].StatusReplace, "a sibling status patch keeps the default (forced SSA)")
+		assert.False(t, prog.Nodes["pod"].StatusReplace, "template nodes are never status-replace")
+	})
+
+	t.Run("propagates to child frames like SelfWatchExempt", func(t *testing.T) {
+		t.Parallel()
+		child := generator.NewGraph("child",
+			generator.WithPatch("p", "v1", "Pod", "target", map[string]any{
+				"status": map[string]any{"phase": "Running"},
+			}),
+		)
+		g := generator.NewGraph("g",
+			generator.WithTemplate("pod", map[string]any{
+				"apiVersion": "v1", "kind": "Pod",
+				"metadata": map[string]any{"name": "target"},
+			}),
+			generator.WithSubgraph("sub", child),
+		)
+		prog, err := newTestCompiler(t).CompileWithOptions(g,
+			WithStatusReplace("p"), WithSelfWatchExempt("p"))
+		require.NoError(t, err)
+		sub := prog.Nodes["sub"]
+		require.NotNil(t, sub)
+		require.NotNil(t, sub.SubProgram)
+		nested := sub.SubProgram.Nodes["p"]
+		require.NotNil(t, nested)
+		assert.True(t, nested.StatusReplace, "the option map must flow into the child frame")
+		assert.True(t, nested.SelfWatchExempt, "same propagation as the existing per-node affordances")
+	})
+}
+
 func TestCompile_WithCostLimit(t *testing.T) {
 	t.Parallel()
 

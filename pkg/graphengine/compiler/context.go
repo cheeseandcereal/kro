@@ -89,6 +89,7 @@ type CompilationContext struct {
 	softDepNodes        map[string]struct{}
 	dataPendingTolerant map[string]struct{}
 	selfWatchExempt     map[string]struct{}
+	statusReplace       map[string]struct{}
 
 	costLimit uint64
 }
@@ -126,6 +127,7 @@ func (ctx *CompilationContext) child() *CompilationContext {
 		softDepNodes:        ctx.softDepNodes,
 		dataPendingTolerant: ctx.dataPendingTolerant,
 		selfWatchExempt:     ctx.selfWatchExempt,
+		statusReplace:       ctx.statusReplace,
 		costLimit:           ctx.costLimit,
 	}
 }

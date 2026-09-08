@@ -769,13 +769,13 @@ func TestPatch_NonConflictErrorIsHardButWalkContinues(t *testing.T) {
 	assert.Equal(t, "v", data["k"])
 }
 
-func compileAndBuildEnv(t *testing.T, cfg *rest.Config, g *expv1alpha1.Graph) *krotruntime.Runtime {
+func compileAndBuildEnv(t *testing.T, cfg *rest.Config, g *expv1alpha1.Graph, opts ...compiler.CompileOption) *krotruntime.Runtime {
 	t.Helper()
 	httpClient, err := rest.HTTPClientFor(cfg)
 	require.NoError(t, err)
 	cmp, err := compiler.NewCompiler(cfg, httpClient)
 	require.NoError(t, err)
-	p, err := cmp.Compile(g)
+	p, err := cmp.CompileWithOptions(g, opts...)
 	require.NoError(t, err)
 	return krotruntime.New(p, g)
 }

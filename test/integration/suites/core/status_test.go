@@ -15,7 +15,10 @@
 package core_test
 
 import (
+	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	krov1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/testutil/generator"
@@ -326,6 +330,149 @@ var _ = Describe("Status", func() {
 			g.Expect(field1).To(Equal("one"))
 			g.Expect(hasField2).To(BeFalse(), "field2 should disappear when cm2 is disabled")
 			g.Expect(hasField3).To(BeFalse(), "field3 should disappear when cm2 is disabled")
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+	})
+
+	// Author status fields are written by replacing the status via Update under
+	// the "kro" manager (the identity pre-graph-engine releases left on every
+	// instance), so an omitted field is removed even when another manager
+	// still owns it — SSA could never do that. The foreign SSA co-owner below
+	// stands in for that pre-upgrade entry.
+	It("owns author status fields under kro/Update and removes a stale field a co-owner still holds", func(ctx SpecContext) {
+		rgd := generator.NewResourceGraphDefinition("test-status-legacy-owner",
+			generator.WithSchema(
+				"StatusLegacyOwner", "v1alpha1",
+				map[string]any{
+					"includeCm": "boolean",
+				},
+				map[string]any{
+					"field1": "${cm1.data.value}",
+				},
+			),
+			generator.WithResource("cm1", map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name": "legacy-owner-cm1",
+				},
+				"data": map[string]any{
+					"value": "one",
+				},
+			}, nil, []string{"${schema.spec.includeCm}"}),
+		)
+		Expect(env.Client.Create(ctx, rgd)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			Expect(env.Client.Delete(ctx, rgd)).To(Succeed())
+		})
+		waitForRGDActive(ctx, rgd.Name)
+
+		instanceName := "test-legacy-owner"
+		instance := newInstance("StatusLegacyOwner", instanceName, namespace, map[string]any{
+			"includeCm": true,
+		})
+		Expect(env.Client.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			_ = env.Client.Delete(ctx, instance)
+		})
+
+		// statusOwners maps "<manager>/<operation>" to the sorted .status keys
+		// that managedFields entry owns.
+		statusOwners := func(obj *unstructured.Unstructured) map[string][]string {
+			owners := map[string][]string{}
+			for _, mf := range obj.GetManagedFields() {
+				if mf.Subresource != "status" || mf.FieldsV1 == nil {
+					continue
+				}
+				var fields map[string]any
+				if err := json.Unmarshal(mf.FieldsV1.Raw, &fields); err != nil {
+					continue
+				}
+				statusFields, _ := fields["f:status"].(map[string]any)
+				keys := []string{}
+				for k := range statusFields {
+					if k != "." {
+						keys = append(keys, strings.TrimPrefix(k, "f:"))
+					}
+				}
+				sort.Strings(keys)
+				owners[mf.Manager+"/"+string(mf.Operation)] = keys
+			}
+			return owners
+		}
+		getInstance := func(g Gomega, ctx SpecContext) *unstructured.Unstructured {
+			got := &unstructured.Unstructured{}
+			got.SetAPIVersion(instance.GetAPIVersion())
+			got.SetKind(instance.GetKind())
+			g.Expect(env.Client.Get(ctx, types.NamespacedName{Name: instanceName, Namespace: namespace}, got)).To(Succeed())
+			return got
+		}
+		setIncludeCm := func(ctx SpecContext, include bool) {
+			Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				current := getInstance(Default, ctx)
+				current.Object["spec"].(map[string]any)["includeCm"] = include
+				return env.Client.Update(ctx, current)
+			})).To(Succeed())
+		}
+
+		// 1. Converge: field1 is owned by {kro, Update, status}, conditions +
+		//    state by the controller's SSA manager, nothing by a patch manager.
+		Eventually(func(g Gomega, ctx SpecContext) {
+			got := getInstance(g, ctx)
+			field1, _, _ := unstructured.NestedString(got.Object, "status", "field1")
+			g.Expect(field1).To(Equal("one"), "instance conditions: %s", instanceConditions(got))
+			state, _, _ := unstructured.NestedString(got.Object, "status", "state")
+			g.Expect(state).To(Equal("ACTIVE"))
+
+			owners := statusOwners(got)
+			g.Expect(owners["kro/Update"]).To(ContainElement("field1"),
+				"author status fields must be owned by manager kro / operation Update; owners: %v", owners)
+			g.Expect(owners["kro-instance-status/Apply"]).To(ConsistOf("conditions", "state"),
+				"conditions and state stay with the controller's SSA manager; owners: %v", owners)
+			for key := range owners {
+				g.Expect(key).ToNot(HavePrefix("kro-graphengine.patch."),
+					"no per-node SSA patch manager may own the instance status; owners: %v", owners)
+			}
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		// 2. Add a foreign co-owner of field1 with the same value (no conflict,
+		//    so it is simply recorded as a second owner that never drops it).
+		coOwner := &unstructured.Unstructured{}
+		coOwner.SetAPIVersion(instance.GetAPIVersion())
+		coOwner.SetKind(instance.GetKind())
+		coOwner.SetNamespace(namespace)
+		coOwner.SetName(instanceName)
+		coOwner.Object["status"] = map[string]any{"field1": "one"}
+		Expect(env.Client.Status().Patch(ctx, coOwner, client.Apply,
+			client.FieldOwner("legacy-co-owner"), client.ForceOwnership)).To(Succeed())
+		Eventually(func(g Gomega, ctx SpecContext) {
+			owners := statusOwners(getInstance(g, ctx))
+			g.Expect(owners["legacy-co-owner/Apply"]).To(ConsistOf("field1"))
+			g.Expect(owners["kro/Update"]).To(ContainElement("field1"), "same value: both managers co-own field1")
+		}, 10*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		// 3. Make field1 unresolvable: it must disappear despite the co-owner.
+		setIncludeCm(ctx, false)
+		Eventually(func(g Gomega, ctx SpecContext) {
+			got := getInstance(g, ctx)
+			status, _, _ := unstructured.NestedMap(got.Object, "status")
+			_, hasField1 := status["field1"]
+			g.Expect(hasField1).To(BeFalse(),
+				"field1 must be removed even though another manager still owned it; status: %v", status)
+			owners := statusOwners(got)
+			g.Expect(owners).ToNot(HaveKey("legacy-co-owner/Apply"),
+				"removing the field prunes it from every owner, so the co-owner's entry is gone; owners: %v", owners)
+			g.Expect(owners["kro-instance-status/Apply"]).To(ConsistOf("conditions", "state"),
+				"controller-owned fields are untouched by the replace; owners: %v", owners)
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		// 4. It comes back under kro/Update once the expression resolves.
+		setIncludeCm(ctx, true)
+		Eventually(func(g Gomega, ctx SpecContext) {
+			got := getInstance(g, ctx)
+			field1, found, _ := unstructured.NestedString(got.Object, "status", "field1")
+			g.Expect(found).To(BeTrue(), "instance conditions: %s", instanceConditions(got))
+			g.Expect(field1).To(Equal("one"))
+			g.Expect(statusOwners(got)["kro/Update"]).To(ContainElement("field1"))
 		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
 	})
 })

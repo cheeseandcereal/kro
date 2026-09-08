@@ -15,9 +15,11 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -35,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -1639,8 +1642,9 @@ func (s *Simple) ssaApply(ctx context.Context, obj *unstructured.Unstructured, f
 // (ErrNotReady) so dependents gate and the reconcile retries once the target
 // appears. The contribution is server-side applied under a per-node field
 // manager without ForceOwnership, so it claims only the fields it sets; a
-// status-subresource patch is routed through the status endpoint. Returns the
-// recorded Contribution so the reconciler can release it on prune.
+// status-subresource patch is routed through the status endpoint (a
+// StatusReplace node replaces the status instead, see replaceStatus). Returns
+// the recorded Contribution so the reconciler can release it on prune.
 func (s *Simple) applyPatch(ctx context.Context, rt *runtime.Runtime, w watchrouter.Watcher, n *runtime.Node, desired []*unstructured.Unstructured) ([]Contribution, error) {
 	// A patch node may be a singleton (one target) or a forEach collection (the
 	// same contribution fanned out across every rendered target, e.g. a status
@@ -1735,7 +1739,15 @@ func (s *Simple) applyPatchOne(ctx context.Context, rt *runtime.Runtime, w watch
 
 	fieldManager := patchFieldManager(rt.Graph().GetUID(), s.qualifiedPath(n.ID()))
 	subresource := n.Subresource()
-	if err := s.contributeApply(ctx, obj, fieldManager, subresource); err != nil {
+	if n.StatusReplace() && subresource == "status" {
+		if err := s.replaceStatus(ctx, obj, current); err != nil {
+			if apierrors.IsConflict(err) {
+				return Contribution{}, fmt.Errorf("status replace conflict on %s %q: %w (%w)",
+					obj.GetKind(), client.ObjectKeyFromObject(obj), err, ErrNotReady)
+			}
+			return Contribution{}, err
+		}
+	} else if err := s.contributeApply(ctx, obj, fieldManager, subresource); err != nil {
 		if apierrors.IsConflict(err) {
 			return Contribution{}, fmt.Errorf("patch field conflict on %s %q: %w (%w)",
 				obj.GetKind(), client.ObjectKeyFromObject(obj), err, ErrNotReady)
@@ -1743,6 +1755,9 @@ func (s *Simple) applyPatchOne(ctx context.Context, rt *runtime.Runtime, w watch
 		return Contribution{}, err
 	}
 
+	// A StatusReplace node records the same per-node patch manager as the SSA
+	// path: a different ledger entry would make DiffContributions Release the
+	// old one against the instance's own status.
 	gvk := obj.GroupVersionKind()
 	return Contribution{
 		APIVersion:   gvk.GroupVersion().String(),
@@ -1753,6 +1768,12 @@ func (s *Simple) applyPatchOne(ctx context.Context, rt *runtime.Runtime, w watch
 		FieldManager: fieldManager,
 	}, nil
 }
+
+// legacyStatusFieldManager is the manager replaceStatus writes under. It must
+// stay "kro": pre-graph-engine releases wrote instance status via UpdateStatus
+// with no explicit manager, which the API server records as {kro, Update,
+// status} (user-agent prefix), and the Update must continue that entry.
+const legacyStatusFieldManager = "kro"
 
 // contributeApply server-side applies obj under fieldManager. A status patch
 // forces ownership so status writeback reclaims fields from a legacy Update
@@ -1788,6 +1809,80 @@ func (s *Simple) contributeApply(ctx context.Context, obj *unstructured.Unstruct
 		return s.ssaApply(ctx, obj, fieldManager, true)
 	}
 	return err
+}
+
+// replaceStatus writes a StatusReplace node's rendered status by replacing the
+// target's status via Update under legacyStatusFieldManager, carrying the live
+// conditions/state over unchanged. Update is used instead of forced SSA because
+// SSA cannot remove a field another manager still owns, and pre-graph-engine
+// releases left author fields owned by {kro, Update, status}; an Update under
+// that same manager continues the entry and prunes an omitted field from every
+// owner. An identical status issues no write; a 409 re-reads before retrying.
+func (s *Simple) replaceStatus(ctx context.Context, obj, current *unstructured.Unstructured) error {
+	rendered, _ := obj.Object["status"].(map[string]any)
+	live := current
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if live == nil {
+			fresh, err := s.getLive(ctx, obj)
+			if err != nil {
+				return err
+			}
+			if fresh == nil {
+				return fmt.Errorf("status replace target %s %q not found: %w",
+					obj.GetKind(), client.ObjectKeyFromObject(obj), ErrNotReady)
+			}
+			live = fresh
+		}
+		liveStatus, _ := live.Object["status"].(map[string]any)
+		next := replacementStatus(rendered, liveStatus)
+		if statusJSONEqual(liveStatus, next) {
+			return nil
+		}
+		updated := live.DeepCopy()
+		updated.Object["status"] = next
+		err := s.Client.Status().Update(ctx, updated, client.FieldOwner(legacyStatusFieldManager))
+		if apierrors.IsConflict(err) {
+			live = nil
+		}
+		return err
+	})
+}
+
+// replacementStatus returns the rendered author fields plus the live
+// controller-owned conditions and state, in a fresh map so the rendered
+// (desired) object is not mutated.
+func replacementStatus(rendered, live map[string]any) map[string]any {
+	next := make(map[string]any, len(rendered)+2)
+	for k, v := range rendered {
+		next[k] = v
+	}
+	for _, key := range []string{"conditions", "state"} {
+		if v, ok := live[key]; ok {
+			next[key] = v
+		}
+	}
+	return next
+}
+
+// statusJSONEqual compares canonical JSON encodings (nil and empty are equal)
+// because the live status holds whole numbers as int64 while CEL yields
+// float64; a marshal error falls through to a write.
+func statusJSONEqual(a, b map[string]any) bool {
+	if a == nil {
+		a = map[string]any{}
+	}
+	if b == nil {
+		b = map[string]any{}
+	}
+	aJSON, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	bJSON, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(aJSON, bJSON)
 }
 
 // Release relinquishes the fields each contribution's field manager owns by

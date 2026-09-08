@@ -113,6 +113,11 @@ type Node struct {
 	// reconciliation, so the self-watch is redundant.
 	SelfWatchExempt bool
 
+	// StatusReplace makes the executor replace the target's status via Update
+	// under the legacy "kro" manager instead of forced SSA (WithStatusReplace;
+	// the RGD adapter's author-status node only).
+	StatusReplace bool
+
 	// Object is the parsed payload as an unstructured object:
 	//   Template: the user-authored manifest
 	//   Ref:            the ExternalRef projected as {apiVersion, kind, metadata}

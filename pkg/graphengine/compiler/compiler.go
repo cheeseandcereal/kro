@@ -151,6 +151,7 @@ type compileOptions struct {
 	softDepNodes        map[string]struct{}
 	dataPendingTolerant map[string]struct{}
 	selfWatchExempt     map[string]struct{}
+	statusReplace       map[string]struct{}
 }
 
 // WithLiteralNode marks a node (such as a Def node) as pure literal data,
@@ -226,6 +227,18 @@ func WithSelfWatchExempt(nodeID string) CompileOption {
 	}
 }
 
+// WithStatusReplace marks a status-subresource patch node so the executor
+// replaces the target's status via Update under the legacy "kro" manager
+// instead of forced SSA. Set by the RGD adapter on the author-status node only.
+func WithStatusReplace(nodeID string) CompileOption {
+	return func(o *compileOptions) {
+		if o.statusReplace == nil {
+			o.statusReplace = make(map[string]struct{})
+		}
+		o.statusReplace[nodeID] = struct{}{}
+	}
+}
+
 // Compile validates the Graph, parses every node's CEL expressions against
 // the target schemas, builds the dependency DAG, and returns the compiled
 // Program. Nested subgraphs are compiled recursively, each in its own lexical
@@ -250,11 +263,27 @@ func (c *Compiler) CompileWithOptions(g *expv1alpha1.Graph, opts ...CompileOptio
 	ctx.softDepNodes = co.softDepNodes
 	ctx.dataPendingTolerant = co.dataPendingTolerant
 	ctx.selfWatchExempt = co.selfWatchExempt
+	ctx.statusReplace = co.statusReplace
 	prog, _, err := ctx.compileFrame(graph.Spec.Nodes, true)
 	if err != nil {
 		return nil, err
 	}
 	return prog, nil
+}
+
+// applyNodeAffordances stamps the per-node compile-option flags onto a freshly
+// built node. The option maps are keyed by local node ID and shared with child
+// frames.
+func (ctx *CompilationContext) applyNodeAffordances(built *Node) {
+	if _, ok := ctx.dataPendingTolerant[built.ID]; ok {
+		built.TolerateDataPending = true
+	}
+	if _, ok := ctx.selfWatchExempt[built.ID]; ok {
+		built.SelfWatchExempt = true
+	}
+	if _, ok := ctx.statusReplace[built.ID]; ok {
+		built.StatusReplace = true
+	}
 }
 
 // compileFrame compiles one lexical frame — the top-level Graph (isRoot) or a
@@ -301,12 +330,7 @@ func (ctx *CompilationContext) compileFrame(apiNodes []expv1alpha1.Node, isRoot 
 		if err != nil {
 			return nil, nil, fmt.Errorf("build node %q: %w", apiNode.ID, err)
 		}
-		if _, ok := ctx.dataPendingTolerant[built.ID]; ok {
-			built.TolerateDataPending = true
-		}
-		if _, ok := ctx.selfWatchExempt[built.ID]; ok {
-			built.SelfWatchExempt = true
-		}
+		ctx.applyNodeAffordances(built)
 		nodes[built.ID] = built
 		if sch != nil {
 			nodeSchemas[built.ID] = sch
