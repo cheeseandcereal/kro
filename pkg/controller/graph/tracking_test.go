@@ -438,3 +438,33 @@ func TestContributionsAPIRoundTrip(t *testing.T) {
 		assert.Equal(t, in, fromAPIContributions(api), "round-trip must be lossless")
 	})
 }
+
+// TestCheckInventoryCaps: exactly the cap fits, one more does not, the error
+// names the field, count and cap, and managedResources is reported first.
+func TestCheckInventoryCaps(t *testing.T) {
+	t.Parallel()
+	limit := expv1alpha1.GraphInventoryMaxItems
+
+	require.NoError(t, checkInventoryCaps(0, 0))
+	require.NoError(t, checkInventoryCaps(limit, limit), "exactly the cap must be accepted")
+
+	err := checkInventoryCaps(limit+1, 0)
+	require.Error(t, err)
+	var tooLarge *inventoryTooLargeError
+	require.ErrorAs(t, err, &tooLarge)
+	assert.Equal(t, "managedResources", tooLarge.field)
+	assert.Equal(t, limit+1, tooLarge.count)
+	assert.Contains(t, err.Error(), "status.managedResources")
+	assert.Contains(t, err.Error(), "5001")
+	assert.Contains(t, err.Error(), "5000")
+
+	err = checkInventoryCaps(0, limit+7)
+	require.ErrorAs(t, err, &tooLarge)
+	assert.Equal(t, "contributions", tooLarge.field)
+	assert.Equal(t, limit+7, tooLarge.count)
+	assert.Contains(t, err.Error(), "status.contributions")
+
+	err = checkInventoryCaps(limit+1, limit+1)
+	require.ErrorAs(t, err, &tooLarge)
+	assert.Equal(t, "managedResources", tooLarge.field, "managed resources are reported first")
+}

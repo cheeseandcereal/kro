@@ -231,10 +231,13 @@ spec:
                   of the Graph's namespace, confining resource access to that namespace by
                   default.
 
+                  An explicit empty string is equivalent to omitting the field (templating
+                  tools such as Helm and Kustomize render an unset value as "").
+
                   The kro controller ServiceAccount must be granted the "impersonate" verb
                   on serviceaccounts for this to take effect.
                 maxLength: 253
-                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                 type: string
             required:
             - nodes
@@ -311,6 +314,9 @@ spec:
                   Persisted on the status subresource (not a metadata annotation) so it is
                   RBAC-separable: a principal with only spec/metadata edit rights cannot
                   forge the release inventory.
+
+                  MaxItems bounds the ledger for the same reason ManagedResources is bounded;
+                  the value must equal GraphInventoryMaxItems.
                 items:
                   description: |-
                     Contribution is a lightweight record of a patch node's field-manager
@@ -353,6 +359,7 @@ spec:
                   - kind
                   - name
                   type: object
+                maxItems: 5000
                 type: array
               managedResources:
                 description: |-
@@ -363,14 +370,9 @@ spec:
                   prune, it reflects the currently-applied set; on errors, it preserves
                   the union of previously-known and newly-applied resources.
 
-                  MaxItems bounds the inventory so a runaway forEach expansion cannot push
-                  the Graph object past etcd's object-size limit (~1.5Mi) — which would fail
-                  the status write and, because teardown reads this list, jeopardize cleanup.
-                  The practical limiter is the per-node forEach cap
-                  (runtime.DefaultMaxCollectionSize, default 1000); this ceiling is set well
-                  above any realistic aggregate (each entry is a few short strings + a UID,
-                  so 5000 entries stays comfortably under the etcd limit even during the
-                  write-ahead phase, which transiently holds previous ∪ next).
+                  MaxItems keeps the Graph object within etcd's request-size limit; the value
+                  must equal GraphInventoryMaxItems. The cap counts entries, so unusually long
+                  names can still make a full list too large to write.
                 items:
                   description: |-
                     ManagedResource is a lightweight pointer to a cluster resource the Graph

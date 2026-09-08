@@ -254,8 +254,10 @@ func childRuntime(rt *krotruntime.Runtime, n *krotruntime.Node) *krotruntime.Run
 // write-ahead entry would never correlate with the later Release. Both derive it
 // from the shared executor.PatchFieldManager(graphUID, qualifiedNodeID), so they
 // cannot drift — which is why subgraphs are recursed here (to reproduce the
-// executor's prefix-qualified path). Intentionally lossy: unresolvable, ignored,
-// or dynamic-GVK-no-namespace patch nodes are skipped.
+// executor's prefix-qualified path). A forEach patch node projects one entry per
+// target, as the executor records one Contribution per target. Intentionally
+// lossy: unresolvable, ignored, or dynamic-GVK-no-namespace patch nodes are
+// skipped.
 func intendedContributions(rt *krotruntime.Runtime) []executor.Contribution {
 	if rt == nil {
 		return nil
@@ -299,38 +301,43 @@ func projectContributions(
 			continue
 		}
 		desired, err := n.Resolve()
-		if err != nil || len(desired) != 1 {
+		if err != nil {
 			continue
 		}
-		obj := desired[0]
-		gvk := obj.GroupVersionKind()
-		if gvk.Kind == "" || obj.GetName() == "" {
-			continue
+		// One entry per rendered target (a forEach patch fans out over all of
+		// them), all under the node's single field manager; contribKeyOf includes
+		// the target identity, so the rows stay distinct.
+		fieldManager := executor.PatchFieldManager(graphUID, prefix+n.ID())
+		for _, obj := range desired {
+			gvk := obj.GroupVersionKind()
+			if gvk.Kind == "" || obj.GetName() == "" {
+				continue
+			}
+			ns := obj.GetNamespace()
+			if ns == "" && n.Namespaced() {
+				ns = rt.Graph().GetNamespace()
+			}
+			// Same dynamic-GVK-no-namespace ambiguity as intendedManagedResources:
+			// the scope isn't known until apply resolves it from the RESTMapper, so a
+			// ns="" entry would never correlate. Skip it.
+			if ns == "" && n.DynamicGVK() {
+				continue
+			}
+			c := executor.Contribution{
+				APIVersion:   gvk.GroupVersion().String(),
+				Kind:         gvk.Kind,
+				Namespace:    ns,
+				Name:         obj.GetName(),
+				Subresource:  n.Subresource(),
+				FieldManager: fieldManager,
+			}
+			k := contribKeyOf(c)
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			*out = append(*out, c)
 		}
-		ns := obj.GetNamespace()
-		if ns == "" && n.Namespaced() {
-			ns = rt.Graph().GetNamespace()
-		}
-		// Same dynamic-GVK-no-namespace ambiguity as intendedManagedResources:
-		// the scope isn't known until apply resolves it from the RESTMapper, so a
-		// ns="" entry would never correlate. Skip it.
-		if ns == "" && n.DynamicGVK() {
-			continue
-		}
-		c := executor.Contribution{
-			APIVersion:   gvk.GroupVersion().String(),
-			Kind:         gvk.Kind,
-			Namespace:    ns,
-			Name:         obj.GetName(),
-			Subresource:  n.Subresource(),
-			FieldManager: executor.PatchFieldManager(graphUID, prefix+n.ID()),
-		}
-		k := contribKeyOf(c)
-		if _, dup := seen[k]; dup {
-			continue
-		}
-		seen[k] = struct{}{}
-		*out = append(*out, c)
 	}
 }
 
@@ -371,6 +378,58 @@ func unionManagedResources(
 		add(r)
 	}
 	return out
+}
+
+// adoptUIDs returns a copy of base with UIDs taken from matching applied entries,
+// never adding an identity. An over-cap cycle keeps its inventory at the
+// write-ahead union but must still record UIDs: Delete skips UID-free entries.
+func adoptUIDs(base, applied []expv1alpha1.ManagedResource) []expv1alpha1.ManagedResource {
+	if len(base) == 0 {
+		return base
+	}
+	uids := make(map[resourceKey]string, len(applied))
+	for _, r := range applied {
+		if r.UID != "" {
+			uids[keyOf(r)] = r.UID
+		}
+	}
+	out := make([]expv1alpha1.ManagedResource, len(base))
+	copy(out, base)
+	for i := range out {
+		if uid, ok := uids[keyOf(out[i])]; ok {
+			out[i].UID = uid
+		}
+	}
+	return out
+}
+
+// inventoryTooLargeError reports a status inventory over the CRD's MaxItems cap.
+// A distinct type so reconcileGraph can surface it as InventoryTooLarge.
+type inventoryTooLargeError struct {
+	field string // "managedResources" or "contributions"
+	count int
+}
+
+func (e *inventoryTooLargeError) Error() string {
+	return fmt.Sprintf(
+		"status.%s would hold %d entries, exceeding the cap of %d; the count includes "+
+			"entries still tracked from the previous spec (the inventory never shrinks before "+
+			"apply), so shrink or remove nodes before renaming them, reduce the forEach fan-out, "+
+			"or split the Graph",
+		e.field, e.count, expv1alpha1.GraphInventoryMaxItems)
+}
+
+// checkInventoryCaps returns an inventoryTooLargeError when either count exceeds
+// expv1alpha1.GraphInventoryMaxItems. Run before any status write (so the cap
+// surfaces as a condition, not an apiserver rejection) and before Apply.
+func checkInventoryCaps(managed, contributions int) error {
+	if managed > expv1alpha1.GraphInventoryMaxItems {
+		return &inventoryTooLargeError{field: "managedResources", count: managed}
+	}
+	if contributions > expv1alpha1.GraphInventoryMaxItems {
+		return &inventoryTooLargeError{field: "contributions", count: contributions}
+	}
+	return nil
 }
 
 // contribKey is the identity tuple for a patch contribution. The field

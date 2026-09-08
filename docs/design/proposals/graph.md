@@ -402,6 +402,9 @@ A Graph object exposes three standard conditions managed by the controller:
   - Status `False` with reason `WaitingForReadiness` when apply succeeded but `readyWhen` expressions evaluate false.
   - Status `False` with reason `DataPending` when a node's CEL expression references data the cluster has not surfaced yet (e.g. pending status fields).
   - Status `False` with reason `ApplyFailed` when the executor encounters a hard error applying resources.
+  - Status `False` with reason `WriteAheadFailed` when the pre-apply inventory write was refused; nothing was applied.
+  - Status `False` with reason `StatusWriteFailed` when the apply was clean but the post-apply contribution ledger could not be persisted.
+  - Status `False` with reason `InventoryTooLarge` when a status inventory would exceed the CRD's `maxItems` cap (5000); the controller fails closed.
 - **`Ready`** (`kro.run/v1alpha1` `GraphConditionTypeReady`): Root aggregate condition rolled up from `Accepted` and `ResourcesConverged`.
   - Status `True` when both `Accepted` and `ResourcesConverged` are `True`.
   - Status `False` when either condition is `False`.
@@ -415,6 +418,9 @@ A Graph object exposes three standard conditions managed by the controller:
 | `ResourcesConverged` | False   | `WaitingForReadiness`| Applied, but readyWhen conditions not yet met|
 | `ResourcesConverged` | False   | `DataPending`        | Waiting for upstream cluster data in scope   |
 | `ResourcesConverged` | False   | `ApplyFailed`        | Hard failure during resource apply           |
+| `ResourcesConverged` | False   | `WriteAheadFailed`   | Pre-apply inventory write refused; nothing applied |
+| `ResourcesConverged` | False   | `StatusWriteFailed`  | Post-apply contribution ledger write refused |
+| `ResourcesConverged` | False   | `InventoryTooLarge`  | Inventory exceeds the status `maxItems` cap; failed closed |
 | `Ready`              | True    | `Ready`              | All dependent conditions True (graph ready)  |
 | `Ready`              | False   | _(from dependent)_   | Spec invalid or apply failed                 |
 | `Ready`              | Unknown | _(from dependent)_   | Still reconciling or waiting on readiness    |
@@ -436,8 +442,8 @@ ServiceAccount resolved in the Graph's **own namespace**
 
 - `spec.serviceAccountName`, when set, selects which ServiceAccount in the Graph's namespace to
   impersonate.
-- When unset, kro impersonates that namespace's `default` ServiceAccount, confining resource access
-  to the namespace by default.
+- When unset (omitted or an explicit `""`), kro impersonates that namespace's `default`
+  ServiceAccount, confining resource access to the namespace by default.
 - The ServiceAccount is **always** resolved in the Graph's own namespace, so a Graph can never
   escalate beyond the RBAC granted to a ServiceAccount a caller in that namespace could already use.
   A Graph author cannot name a ServiceAccount in another namespace.

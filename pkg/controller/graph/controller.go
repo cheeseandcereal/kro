@@ -197,6 +197,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 // no-op: Release GETs the target first and treats absent as already-released).
 // Each side only writes when its union grows, so a steady state does not rewrite
 // status every cycle.
+//
+// Both inventories are checked against the MaxItems cap before anything is
+// written or applied, and a refused write leaves g.Status.ManagedResources at
+// what the server holds, so the caller's condition write is not refused too.
 func (r *Reconciler) writeAheadIntent(
 	ctx context.Context,
 	g *expv1alpha1.Graph,
@@ -205,14 +209,24 @@ func (r *Reconciler) writeAheadIntent(
 	priorContribs []executor.Contribution,
 ) ([]expv1alpha1.ManagedResource, error) {
 	intent := unionManagedResources(previous, intendedManagedResources(rt))
+	intentContribs := UnionContributions(priorContribs, intendedContributions(rt))
+
+	// Fail closed: a Graph whose inventory cannot be persisted must not be
+	// applied — an untracked resource is one teardown can never delete.
+	if err := checkInventoryCaps(len(intent), len(intentContribs)); err != nil {
+		return nil, err
+	}
+
 	if len(intent) > len(previous) {
 		g.Status.ManagedResources = intent
 		if err := r.persistManagedResources(ctx, g); err != nil {
+			// The server still holds previous; do not let updateStatus re-send
+			// the list that was just refused.
+			g.Status.ManagedResources = previous
 			return nil, fmt.Errorf("write-ahead managed-resource intent: %w", err)
 		}
 	}
 
-	intentContribs := UnionContributions(priorContribs, intendedContributions(rt))
 	if len(intentContribs) > len(priorContribs) {
 		if err := r.persistContributions(ctx, g, intentContribs); err != nil {
 			return nil, fmt.Errorf("write-ahead patch-contribution intent: %w", err)
@@ -346,6 +360,15 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	// the inventory from shrinking below the pre-apply superset.
 	intent, err := r.writeAheadIntent(ctx, g, rt, previous, priorContribs)
 	if err != nil {
+		// Nothing was applied; say why, or a fresh Graph is left with no status
+		// at all (writeAheadIntent left the inventory at what the server holds,
+		// so this condition write is not refused for the same reason).
+		var tooLarge *inventoryTooLargeError
+		if errors.As(err, &tooLarge) {
+			marker.ResourcesInventoryTooLarge("refusing to apply: " + err.Error())
+		} else {
+			marker.ResourcesWriteAheadFailed(err.Error())
+		}
 		return err
 	}
 
@@ -407,6 +430,24 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	superset := func() []expv1alpha1.ManagedResource {
 		return unionManagedResources(unionManagedResources(previous, result.Applied), intent)
 	}
+
+	// The ledger the write-ahead persisted plus what the executor observed. The
+	// error branches must persist this, not prior ∪ observed: a soft not-ready
+	// cycle observes fewer rows than intended, and shrinking the ledger back each
+	// cycle is a second status write per reconcile that re-enqueues the Graph.
+	ledgerUnion := UnionContributions(fromAPIContributions(g.Status.Contributions), result.Contributions)
+
+	// Post-apply cap check: the executor can apply identities the projection could
+	// not see (a forEach axis fed by upstream status, a dynamic GVK). Everything
+	// persisted below is a subset of superset() or ledgerUnion. Fail closed: keep
+	// the write-ahead union (with observed UIDs, so it stays deletable) and skip
+	// prune/release, whose bookkeeping could not be recorded either.
+	if err := checkInventoryCaps(len(superset()), len(ledgerUnion)); err != nil {
+		marker.ResourcesInventoryTooLarge("applied resources exceed the trackable inventory: " + err.Error())
+		g.Status.ManagedResources = adoptUIDs(intent, result.Applied)
+		return joinHardApplyErr(err, applyErr, hardErr)
+	}
+
 	if !hardErr {
 		if len(pruneCandidates) > 0 {
 			if err := ex.Delete(ctx, pruneCandidates); err != nil {
@@ -458,7 +499,7 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	if applyErr != nil {
 		// Soft or hard failure — keep the union so a future reconcile can
 		// release contributions we couldn't observe cleanly this cycle.
-		if err := r.persistContributions(ctx, g, UnionContributions(priorContribs, result.Contributions)); err != nil {
+		if err := r.persistContributions(ctx, g, ledgerUnion); err != nil {
 			return errors.Join(fmt.Errorf("apply: %w", applyErr), err)
 		}
 		if !errors.Is(applyErr, executor.ErrNotReady) {
@@ -480,16 +521,30 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 			// Ready=True with the error only in the log (symmetric with the
 			// prune-failure branch).
 			marker.ResourcesReleaseFailed(err.Error())
-			if perr := r.persistContributions(ctx, g, UnionContributions(priorContribs, result.Contributions)); perr != nil {
+			if perr := r.persistContributions(ctx, g, ledgerUnion); perr != nil {
 				return errors.Join(fmt.Errorf("release contributions: %w", err), perr)
 			}
 			return fmt.Errorf("release contributions: %w", err)
 		}
 	}
 	if err := r.persistContributions(ctx, g, result.Contributions); err != nil {
-		return err
+		// Apply was clean but the release ledger did not land: the contributed
+		// fields have nothing recorded to release them from, so the Graph has not
+		// converged (symmetric with the prune- and release-failure branches).
+		marker.ResourcesInventoryPersistFailed(err.Error())
+		return fmt.Errorf("persist contributions: %w", err)
 	}
 	return nil
+}
+
+// joinHardApplyErr keeps a hard apply error visible alongside the cap error. A
+// soft ErrNotReady is not joined: it would reclassify the cycle as a benign
+// requeue and hide the cap refusal.
+func joinHardApplyErr(capErr, applyErr error, hard bool) error {
+	if hard {
+		return errors.Join(capErr, applyErr)
+	}
+	return capErr
 }
 
 // persistContributions writes the patch-contribution release inventory onto
@@ -702,6 +757,10 @@ func (r *Reconciler) setUnmanaged(ctx context.Context, g *expv1alpha1.Graph) err
 //
 // The DeepEqual short-circuit avoids no-op writes, which keeps the
 // generation churn down and prevents needless re-reconciles.
+//
+// Conditions and ManagedResources travel in one patch, so reconcileGraph keeps
+// g.Status.ManagedResources under the MaxItems cap on every return path — a
+// refused inventory would take the conditions down with it.
 func (r *Reconciler) updateStatus(ctx context.Context, g *expv1alpha1.Graph) error {
 	logger := log.FromContext(ctx)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -889,4 +948,25 @@ func (m *ConditionsMarker) ResourcesReleaseFailed(msg string) {
 // to why deletion is blocked; recording it lets an operator see the cause.
 func (m *ConditionsMarker) ResourcesDeleteFailed(msg string) {
 	m.cs.SetFalse(ResourcesConverged, "DeleteFailed", msg)
+}
+
+// ResourcesWriteAheadFailed marks ResourcesConverged=False with reason
+// "WriteAheadFailed" when the pre-apply inventory write was refused, so the
+// executor was not run this cycle.
+func (m *ConditionsMarker) ResourcesWriteAheadFailed(msg string) {
+	m.cs.SetFalse(ResourcesConverged, "WriteAheadFailed", msg)
+}
+
+// ResourcesInventoryPersistFailed marks ResourcesConverged=False with reason
+// "StatusWriteFailed" when the apply was clean but the post-apply contribution
+// ledger could not be persisted, leaving contributed fields with no release entry.
+func (m *ConditionsMarker) ResourcesInventoryPersistFailed(msg string) {
+	m.cs.SetFalse(ResourcesConverged, "StatusWriteFailed", msg)
+}
+
+// ResourcesInventoryTooLarge marks ResourcesConverged=False with reason
+// "InventoryTooLarge" when a status inventory would exceed the CRD's MaxItems
+// cap; the reconciler fails closed rather than let the apiserver refuse the write.
+func (m *ConditionsMarker) ResourcesInventoryTooLarge(msg string) {
+	m.cs.SetFalse(ResourcesConverged, "InventoryTooLarge", msg)
 }

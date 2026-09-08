@@ -51,6 +51,7 @@ import (
 type fakeExecutor struct {
 	applyErr     error
 	applyResult  executor.ApplyResult
+	applyCalls   int // counts Apply invocations so fail-closed paths can assert none happened
 	deleteErr    error
 	deleteCalls  [][]expv1alpha1.ManagedResource // captures every Delete invocation in order
 	releaseErr   error
@@ -58,6 +59,7 @@ type fakeExecutor struct {
 }
 
 func (f *fakeExecutor) Apply(context.Context, *krotruntime.Runtime, watchrouter.Watcher) (executor.ApplyResult, error) {
+	f.applyCalls++
 	return f.applyResult, f.applyErr
 }
 func (f *fakeExecutor) Delete(_ context.Context, resources []expv1alpha1.ManagedResource) error {

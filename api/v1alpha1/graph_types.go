@@ -51,14 +51,23 @@ type GraphSpec struct {
 	// of the Graph's namespace, confining resource access to that namespace by
 	// default.
 	//
+	// An explicit empty string is equivalent to omitting the field (templating
+	// tools such as Helm and Kustomize render an unset value as "").
+	//
 	// The kro controller ServiceAccount must be granted the "impersonate" verb
 	// on serviceaccounts for this to take effect.
 	//
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +kubebuilder:validation:MaxLength=253
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 }
+
+// GraphInventoryMaxItems is the MaxItems cap on GraphStatus.ManagedResources and
+// GraphStatus.Contributions. The controller checks inventories against it before
+// a status write so an oversized inventory becomes a condition, not a rejection.
+// Markers cannot reference constants: keep the two MaxItems=5000 markers equal.
+const GraphInventoryMaxItems = 5000
 
 // GraphStatus defines the observed state of a Graph.
 type GraphStatus struct {
@@ -73,14 +82,9 @@ type GraphStatus struct {
 	// prune, it reflects the currently-applied set; on errors, it preserves
 	// the union of previously-known and newly-applied resources.
 	//
-	// MaxItems bounds the inventory so a runaway forEach expansion cannot push
-	// the Graph object past etcd's object-size limit (~1.5Mi) — which would fail
-	// the status write and, because teardown reads this list, jeopardize cleanup.
-	// The practical limiter is the per-node forEach cap
-	// (runtime.DefaultMaxCollectionSize, default 1000); this ceiling is set well
-	// above any realistic aggregate (each entry is a few short strings + a UID,
-	// so 5000 entries stays comfortably under the etcd limit even during the
-	// write-ahead phase, which transiently holds previous ∪ next).
+	// MaxItems keeps the Graph object within etcd's request-size limit; the value
+	// must equal GraphInventoryMaxItems. The cap counts entries, so unusually long
+	// names can still make a full list too large to write.
 	//
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MaxItems=5000
@@ -111,7 +115,11 @@ type GraphStatus struct {
 	// RBAC-separable: a principal with only spec/metadata edit rights cannot
 	// forge the release inventory.
 	//
+	// MaxItems bounds the ledger for the same reason ManagedResources is bounded;
+	// the value must equal GraphInventoryMaxItems.
+	//
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=5000
 	Contributions []Contribution `json:"contributions,omitempty"`
 }
 

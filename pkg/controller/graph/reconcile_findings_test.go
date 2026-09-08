@@ -15,6 +15,7 @@
 package graph
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,9 +23,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	memory "k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/restmapper"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -33,7 +39,9 @@ import (
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/executor"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/registry"
 	krotruntime "github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
+	"github.com/kubernetes-sigs/kro/pkg/graphengine/testutil/generator"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/watchrouter"
+	testk8s "github.com/kubernetes-sigs/kro/pkg/testutil/k8s"
 )
 
 // templateProgram builds a minimal compiled Program with a single static
@@ -74,23 +82,25 @@ func emptyNodeProgram(nodeID string) *compiler.Program {
 	}
 }
 
-// applyObservingExecutor records the ManagedResources PERSISTED on the API
-// server at the moment Apply is entered, by reading them back through a
-// captured client. This is what lets a test assert the pre-apply write-ahead
-// (Finding A) landed on the server before any resource was applied.
+// applyObservingExecutor records the ManagedResources and Contributions
+// persisted on the API server at the moment Apply is entered, so a test can
+// assert the write-ahead landed before any resource was applied.
 type applyObservingExecutor struct {
 	fakeExecutor
 	cl  client.Client
 	key types.NamespacedName
 	// persistedAtApply is the server-side inventory observed when Apply ran.
 	persistedAtApply []expv1alpha1.ManagedResource
-	observed         bool
+	// contribsAtApply is the server-side ledger observed when Apply ran.
+	contribsAtApply []expv1alpha1.Contribution
+	observed        bool
 }
 
 func (e *applyObservingExecutor) Apply(ctx context.Context, rt *krotruntime.Runtime, w watchrouter.Watcher) (executor.ApplyResult, error) {
 	got := &expv1alpha1.Graph{}
 	if err := e.cl.Get(ctx, e.key, got); err == nil {
 		e.persistedAtApply = got.Status.ManagedResources
+		e.contribsAtApply = got.Status.Contributions
 		e.observed = true
 	}
 	return e.fakeExecutor.Apply(ctx, rt, w)
@@ -595,4 +605,483 @@ func TestReconcile_ErrorPathKeepsIntentSuperset(t *testing.T) {
 		"intent superset must survive a soft-error cycle in persisted status")
 	assert.Equal(t, "Widget", got.Status.ManagedResources[0].Kind)
 	assert.Equal(t, "w", got.Status.ManagedResources[0].Name)
+}
+
+// statusPatchGate wraps a client and refuses every Status().Patch whose merge
+// body touches the named status field, letting all other status writes through
+// (an apiserver that rejects one inventory write but accepts the conditions).
+type statusPatchGate struct {
+	client.Client
+	field    string
+	err      error
+	rejected int // number of status patches refused
+}
+
+func (c *statusPatchGate) Status() client.StatusWriter {
+	return &gatedStatusWriter{StatusWriter: c.Client.Status(), gate: c}
+}
+
+type gatedStatusWriter struct {
+	client.StatusWriter
+	gate *statusPatchGate
+}
+
+func (w *gatedStatusWriter) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
+	data, err := p.Data(obj)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(data, []byte(`"`+w.gate.field+`"`)) {
+		w.gate.rejected++
+		return w.gate.err
+	}
+	return w.StatusWriter.Patch(ctx, obj, p, opts...)
+}
+
+// manyManagedResources fabricates n distinct, UID-bearing ManagedResource entries.
+func manyManagedResources(nodeID string, n int) []expv1alpha1.ManagedResource {
+	out := make([]expv1alpha1.ManagedResource, 0, n)
+	for i := range n {
+		out = append(out, expv1alpha1.ManagedResource{
+			NodeID:     nodeID,
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+			Namespace:  "default",
+			Name:       fmt.Sprintf("cm-%d", i),
+			UID:        fmt.Sprintf("uid-%d", i),
+		})
+	}
+	return out
+}
+
+// manyContributions fabricates n distinct ledger rows under one field manager.
+func manyContributions(fieldManager string, n int) []executor.Contribution {
+	out := make([]executor.Contribution, 0, n)
+	for i := range n {
+		out = append(out, executor.Contribution{
+			APIVersion:   "v1",
+			Kind:         "ConfigMap",
+			Namespace:    "default",
+			Name:         fmt.Sprintf("target-%d", i),
+			FieldManager: fieldManager,
+		})
+	}
+	return out
+}
+
+// requireConverged asserts the ResourcesConverged condition on g has the given
+// status and reason, and that the Ready root followed it.
+func requireConverged(t *testing.T, g *expv1alpha1.Graph, status metav1.ConditionStatus, reason string) *expv1alpha1.Condition {
+	t.Helper()
+	rc := findCondition(g.Status.Conditions, ResourcesConverged)
+	require.NotNil(t, rc, "ResourcesConverged must be present")
+	assert.Equal(t, status, rc.Status)
+	require.NotNil(t, rc.Reason)
+	assert.Equal(t, reason, *rc.Reason)
+	ready := findCondition(g.Status.Conditions, Ready)
+	require.NotNil(t, ready, "Ready must be present")
+	assert.Equal(t, status, ready.Status, "Ready must follow ResourcesConverged")
+	return rc
+}
+
+// compileGraph compiles g with the real compiler bound to the fake schema
+// resolver, so projection tests exercise the compiled forEach/CEL machinery.
+func compileGraph(t *testing.T, g *expv1alpha1.Graph) *compiler.Program {
+	t.Helper()
+	r, disco := testk8s.NewFakeResolver()
+	rm := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(disco))
+	p, err := compiler.NewCompilerWithDependencies(r, rm).Compile(g)
+	require.NoError(t, err)
+	return p
+}
+
+// forEachPatchGraph builds a Graph whose forEach patch node "p" contributes data
+// to the ConfigMap named by each element of a Def node's list.
+func forEachPatchGraph(ns string, names []any) *expv1alpha1.Graph {
+	g := generator.NewGraph("g",
+		generator.WithNamespace(ns),
+		generator.WithDef("src", map[string]any{"names": names}),
+		generator.WithPatchManifest("p", map[string]any{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata":   map[string]any{"name": "${n}"},
+			"data":       map[string]any{"patched": "yes"},
+		}),
+	)
+	g.Spec.Nodes[len(g.Spec.Nodes)-1].ForEach = []expv1alpha1.ForEachDimension{{"n": "${src.names}"}}
+	return g
+}
+
+// TestReconcile_ForEachPatchWriteAheadPersistsEveryTarget: for a forEach patch
+// node the server-side ledger must hold one row per target before Apply runs.
+func TestReconcile_ForEachPatchWriteAheadPersistsEveryTarget(t *testing.T) {
+	t.Parallel()
+	key := types.NamespacedName{Namespace: "default", Name: "g"}
+
+	spec := forEachPatchGraph("default", []any{"claim-a", "claim-b", "claim-c"})
+	g := graph("g", withFinalizer, func(g *expv1alpha1.Graph) {
+		g.SetUID("uid-foreach-reconcile")
+		g.Spec = spec.Spec
+	})
+	cl := newClient(t, g)
+
+	obs := &applyObservingExecutor{cl: cl, key: key}
+	fc := &fakeCompiler{program: compileGraph(t, g)}
+	r := &Reconciler{Client: cl, Compiler: fc, Registry: registry.New(), Executor: obs}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	require.NoError(t, err)
+	require.True(t, obs.observed, "Apply must have been called")
+
+	require.Len(t, obs.contribsAtApply, 3,
+		"the write-ahead ledger must hold one row per forEach target BEFORE Apply runs")
+	wantFM := executor.PatchFieldManager("uid-foreach-reconcile", "p")
+	names := make([]string, 0, 3)
+	for _, c := range obs.contribsAtApply {
+		names = append(names, c.Name)
+		assert.Equal(t, wantFM, c.FieldManager, "every row carries the executor's per-node field manager")
+		assert.Equal(t, "default", c.Namespace)
+	}
+	assert.ElementsMatch(t, []string{"claim-a", "claim-b", "claim-c"}, names)
+	assert.Empty(t, obs.persistedAtApply, "a patch node owns nothing; no managed-resource intent")
+}
+
+// ledgerWriteRecorder wraps a client and records the row count carried by every
+// Status().Patch that touches status.contributions, so a test can assert the
+// write pattern, not just the final ledger (every status write re-enqueues).
+type ledgerWriteRecorder struct {
+	client.Client
+	writes []int
+}
+
+func (c *ledgerWriteRecorder) Status() client.StatusWriter {
+	return &recordingStatusWriter{StatusWriter: c.Client.Status(), rec: c}
+}
+
+type recordingStatusWriter struct {
+	client.StatusWriter
+	rec *ledgerWriteRecorder
+}
+
+func (w *recordingStatusWriter) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
+	data, err := p.Data(obj)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(data, []byte(`"contributions"`)) {
+		n := -1
+		if g, ok := obj.(*expv1alpha1.Graph); ok {
+			n = len(g.Status.Contributions)
+		}
+		w.rec.writes = append(w.rec.writes, n)
+	}
+	return w.StatusWriter.Patch(ctx, obj, p, opts...)
+}
+
+// TestReconcile_SoftPathKeepsWriteAheadLedger: a patch node whose target does
+// not exist yet (ErrNotReady, fewer rows observed than projected) must persist
+// exactly one ledger write per Graph — the write-ahead — and never shrink it;
+// writing it back down each cycle re-enqueues the Graph in a hot loop.
+func TestReconcile_SoftPathKeepsWriteAheadLedger(t *testing.T) {
+	t.Parallel()
+	key := types.NamespacedName{Namespace: "default", Name: "g"}
+	fm := executor.PatchFieldManager("uid-soft-ledger", "p")
+	contrib := func(name string) executor.Contribution {
+		return executor.Contribution{APIVersion: "v1", Kind: "ConfigMap", Namespace: "default", Name: name, FieldManager: fm}
+	}
+
+	cases := []struct {
+		name      string
+		program   func(t *testing.T, g *expv1alpha1.Graph) *compiler.Program
+		observed  []executor.Contribution // what the executor reports alongside ErrNotReady
+		wantRows  int                     // write-ahead rows == steady-state ledger size
+		wantNames []string
+	}{
+		{
+			// Three targets, none present yet.
+			name: "forEach patch over absent targets",
+			program: func(t *testing.T, g *expv1alpha1.Graph) *compiler.Program {
+				g.Spec = forEachPatchGraph("default", []any{"claim-a", "claim-b", "claim-c"}).Spec
+				return compileGraph(t, g)
+			},
+			wantRows:  3,
+			wantNames: []string{"claim-a", "claim-b", "claim-c"},
+		},
+		{
+			name: "singleton patch over an absent target",
+			program: func(*testing.T, *expv1alpha1.Graph) *compiler.Program {
+				return patchProgram("p", "v1", "ConfigMap", "default", "target")
+			},
+			wantRows:  1,
+			wantNames: []string{"target"},
+		},
+		{
+			// Two of three targets exist; the third row stays as a write-ahead ghost.
+			name: "forEach patch with a subset of targets present",
+			program: func(t *testing.T, g *expv1alpha1.Graph) *compiler.Program {
+				g.Spec = forEachPatchGraph("default", []any{"claim-a", "claim-b", "claim-c"}).Spec
+				return compileGraph(t, g)
+			},
+			observed:  []executor.Contribution{contrib("claim-a"), contrib("claim-b")},
+			wantRows:  3,
+			wantNames: []string{"claim-a", "claim-b", "claim-c"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := graph("g", withFinalizer, func(g *expv1alpha1.Graph) { g.SetUID("uid-soft-ledger") })
+			prog := tc.program(t, g)
+			cl := newClient(t, g)
+			rec := &ledgerWriteRecorder{Client: cl}
+			exec := &fakeExecutor{
+				applyErr:    fmt.Errorf("apply %q: patch target not found: %w", "p", executor.ErrNotReady),
+				applyResult: executor.ApplyResult{Contributions: tc.observed},
+			}
+			r := &Reconciler{Client: rec, Compiler: &fakeCompiler{program: prog}, Registry: registry.New(), Executor: exec}
+
+			// First cycle: one write-ahead write, and no write back down.
+			res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+			require.NoError(t, err, "a not-ready target is a soft requeue")
+			assert.Positive(t, res.RequeueAfter)
+			assert.Equal(t, []int{tc.wantRows}, rec.writes,
+				"exactly one ledger write (the write-ahead) per cycle; a second, smaller write is the N->0 drop")
+
+			got := &expv1alpha1.Graph{}
+			require.NoError(t, cl.Get(context.Background(), key, got))
+			require.Len(t, got.Status.Contributions, tc.wantRows, "the soft path must not shrink the ledger below the write-ahead")
+			names := make([]string, 0, len(got.Status.Contributions))
+			for _, c := range got.Status.Contributions {
+				names = append(names, c.Name)
+				assert.Equal(t, fm, c.FieldManager)
+			}
+			assert.ElementsMatch(t, tc.wantNames, names)
+
+			// Second cycle: the server already holds the intent; nothing to write.
+			_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+			require.NoError(t, err)
+			assert.Equal(t, []int{tc.wantRows}, rec.writes, "a steady-state soft cycle must issue no ledger write at all")
+			require.NoError(t, cl.Get(context.Background(), key, got))
+			assert.Len(t, got.Status.Contributions, tc.wantRows)
+		})
+	}
+}
+
+// TestReconcile_ContributionPersistFailureFlipsConverged: a refused post-apply
+// ledger write after a clean apply must flip ResourcesConverged to
+// False/StatusWriteFailed and be returned, not leave Ready=True with an empty ledger.
+func TestReconcile_ContributionPersistFailureFlipsConverged(t *testing.T) {
+	t.Parallel()
+	key := types.NamespacedName{Namespace: "default", Name: "g"}
+
+	g := graph("g", withFinalizer)
+	cl := newClient(t, g)
+	// Refuse only ledger writes; the conditions write must still land.
+	gate := &statusPatchGate{Client: cl, field: "contributions", err: errors.New("etcdserver: request is too large")}
+
+	exec := &fakeExecutor{applyResult: executor.ApplyResult{
+		Contributions: manyContributions("kro-graphengine.patch.abc.def", 3),
+	}}
+	// A payload-less node has no write-ahead, so the only ledger write is the
+	// post-apply persist under test.
+	r := &Reconciler{Client: gate, Compiler: &fakeCompiler{program: emptyNodeProgram("p")}, Registry: registry.New(), Executor: exec}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	require.Error(t, err, "a refused contribution-ledger write must be returned, not swallowed")
+	assert.Contains(t, err.Error(), "persist contributions")
+	assert.Contains(t, err.Error(), "request is too large")
+	assert.GreaterOrEqual(t, gate.rejected, 1, "the ledger write must have been attempted and refused")
+
+	got := &expv1alpha1.Graph{}
+	require.NoError(t, cl.Get(context.Background(), key, got))
+	rc := requireConverged(t, got, metav1.ConditionFalse, "StatusWriteFailed")
+	require.NotNil(t, rc.Message)
+	assert.Contains(t, *rc.Message, "request is too large")
+	acc := findCondition(got.Status.Conditions, GraphAccepted)
+	require.NotNil(t, acc)
+	assert.Equal(t, metav1.ConditionTrue, acc.Status, "the Graph still compiled")
+	assert.Empty(t, got.Status.Contributions, "nothing landed on the server; status must not pretend otherwise")
+}
+
+// TestReconcile_WriteAheadRejectedStillPublishesConditions: a refused write-ahead
+// must publish Accepted=True and ResourcesConverged=False/WriteAheadFailed with
+// nothing applied, and the conditions write must not re-send the refused list.
+func TestReconcile_WriteAheadRejectedStillPublishesConditions(t *testing.T) {
+	t.Parallel()
+	key := types.NamespacedName{Namespace: "default", Name: "g"}
+
+	g := graph("g", withFinalizer)
+	cl := newClient(t, g)
+	rejection := apierrors.NewInvalid(
+		schema.GroupKind{Group: "kro.run", Kind: "Graph"}, "g",
+		field.ErrorList{field.TooMany(field.NewPath("status", "managedResources"), 6000, 5000)})
+	// Refuse the write-ahead (carries managedResources); let conditions through.
+	gate := &statusPatchGate{Client: cl, field: "managedResources", err: rejection}
+
+	exec := &fakeExecutor{}
+	fc := &fakeCompiler{program: templateProgram("widget", "example.com/v1", "Widget", "default", "w")}
+	r := &Reconciler{Client: gate, Compiler: fc, Registry: registry.New(), Executor: exec}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "write-ahead managed-resource intent")
+	assert.Equal(t, 0, exec.applyCalls, "a refused write-ahead must fail closed: nothing applied")
+	assert.Equal(t, 1, gate.rejected, "exactly the write-ahead was refused; the conditions write must not carry the refused list")
+
+	got := &expv1alpha1.Graph{}
+	require.NoError(t, cl.Get(context.Background(), key, got))
+	require.NotEmpty(t, got.Status.Conditions, "a Graph whose write-ahead was refused must not be left with no status at all")
+	acc := findCondition(got.Status.Conditions, GraphAccepted)
+	require.NotNil(t, acc)
+	assert.Equal(t, metav1.ConditionTrue, acc.Status, "Accepted/Compiled is still reported")
+	rc := requireConverged(t, got, metav1.ConditionFalse, "WriteAheadFailed")
+	require.NotNil(t, rc.Message)
+	assert.Contains(t, *rc.Message, "must have at most 5000 items")
+	assert.Empty(t, got.Status.ManagedResources, "the refused inventory must not have landed")
+}
+
+// TestReconcile_InventoryTooLargeFailsClosed: an inventory over
+// GraphInventoryMaxItems yields ResourcesConverged=False/InventoryTooLarge naming
+// the count and cap; before apply the executor is not run, and the server-side
+// inventory never grows past what it held.
+func TestReconcile_InventoryTooLargeFailsClosed(t *testing.T) {
+	t.Parallel()
+	limit := expv1alpha1.GraphInventoryMaxItems
+	key := types.NamespacedName{Namespace: "default", Name: "g"}
+
+	cases := []struct {
+		name         string
+		initial      func(*expv1alpha1.Graph)
+		program      *compiler.Program
+		exec         *fakeExecutor
+		wantApplied  bool   // was the executor run this cycle?
+		wantField    string // status field named in the condition message
+		wantCount    int    // entry count named in the condition message
+		wantManaged  int    // persisted managedResources length after reconcile
+		wantContribs int    // persisted contributions length after reconcile
+	}{
+		{
+			// previous holds exactly the cap; the template intends one more.
+			name: "managed-resource write-ahead over the cap refuses to apply",
+			initial: func(g *expv1alpha1.Graph) {
+				g.Status.ManagedResources = manyManagedResources("cms", limit)
+			},
+			program:     templateProgram("widget", "example.com/v1", "Widget", "default", "w"),
+			exec:        &fakeExecutor{},
+			wantApplied: false,
+			wantField:   "managedResources",
+			wantCount:   limit + 1,
+			wantManaged: limit,
+		},
+		{
+			// prior ledger holds exactly the cap; the patch intends one more target.
+			name: "contribution write-ahead over the cap refuses to apply",
+			initial: func(g *expv1alpha1.Graph) {
+				g.SetUID("uid-contrib-cap")
+				g.Status.Contributions = toAPIContributions(manyContributions("kro-graphengine.patch.prior.x", limit))
+			},
+			program:      patchProgram("p", "v1", "ConfigMap", "default", "target"),
+			exec:         &fakeExecutor{},
+			wantApplied:  false,
+			wantField:    "contributions",
+			wantCount:    limit + 1,
+			wantContribs: limit,
+		},
+		{
+			// No write-ahead (payload-less node); apply reports cap+1 identities
+			// the projection could not see. Condition set, no prune, server
+			// inventory unchanged.
+			name:    "post-apply applied set over the cap surfaces InventoryTooLarge",
+			program: emptyNodeProgram("cms"),
+			exec: &fakeExecutor{applyResult: executor.ApplyResult{
+				Applied: manyManagedResources("cms", limit+1),
+			}},
+			wantApplied: true,
+			wantField:   "managedResources",
+			wantCount:   limit + 1,
+			wantManaged: 0,
+		},
+		{
+			// Same for contributions observed after apply.
+			name:    "post-apply contribution set over the cap surfaces InventoryTooLarge",
+			program: emptyNodeProgram("p"),
+			exec: &fakeExecutor{applyResult: executor.ApplyResult{
+				Contributions: manyContributions("kro-graphengine.patch.abc.def", limit+1),
+			}},
+			wantApplied:  true,
+			wantField:    "contributions",
+			wantCount:    limit + 1,
+			wantContribs: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := graph("g", withFinalizer)
+			if tc.initial != nil {
+				tc.initial(g)
+			}
+			cl := newClient(t, g)
+			r := &Reconciler{Client: cl, Compiler: &fakeCompiler{program: tc.program}, Registry: registry.New(), Executor: tc.exec}
+
+			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+			require.Error(t, err, "an over-cap inventory must be returned as an error so the Graph is retried")
+			var tooLarge *inventoryTooLargeError
+			require.ErrorAs(t, err, &tooLarge, "the error must be the typed cap error, not a raw apiserver rejection")
+			assert.Equal(t, tc.wantApplied, tc.exec.applyCalls > 0, "executor run")
+			assert.Empty(t, tc.exec.deleteCalls, "no prune may run on a cycle whose bookkeeping cannot be persisted")
+
+			got := &expv1alpha1.Graph{}
+			require.NoError(t, cl.Get(context.Background(), key, got))
+			rc := requireConverged(t, got, metav1.ConditionFalse, "InventoryTooLarge")
+			require.NotNil(t, rc.Message)
+			assert.Contains(t, *rc.Message, "status."+tc.wantField)
+			assert.Contains(t, *rc.Message, fmt.Sprintf("%d entries", tc.wantCount))
+			assert.Contains(t, *rc.Message, fmt.Sprintf("cap of %d", limit))
+			// The message says whether anything reached the cluster.
+			if tc.wantApplied {
+				assert.Contains(t, *rc.Message, "applied resources exceed the trackable inventory")
+			} else {
+				assert.Contains(t, *rc.Message, "refusing to apply")
+			}
+			acc := findCondition(got.Status.Conditions, GraphAccepted)
+			require.NotNil(t, acc)
+			assert.Equal(t, metav1.ConditionTrue, acc.Status, "the Graph still compiled")
+			assert.Len(t, got.Status.ManagedResources, tc.wantManaged, "server-side inventory must not grow past what it held")
+			assert.Len(t, got.Status.Contributions, tc.wantContribs, "server-side ledger must not grow past what it held")
+		})
+	}
+}
+
+// TestReconcile_PostApplyOverCapKeepsWriteAheadUIDs: when the applied set is
+// over the cap the inventory stays at the write-ahead union but adopts the
+// observed UIDs, since Delete skips UID-free entries.
+func TestReconcile_PostApplyOverCapKeepsWriteAheadUIDs(t *testing.T) {
+	t.Parallel()
+	limit := expv1alpha1.GraphInventoryMaxItems
+	key := types.NamespacedName{Namespace: "default", Name: "g"}
+
+	g := graph("g", withFinalizer)
+	cl := newClient(t, g)
+
+	// Write-ahead projects "w" UID-free; apply reports it with a UID plus cap
+	// more identities the projection never saw.
+	applied := append([]expv1alpha1.ManagedResource{{
+		NodeID: "widget", APIVersion: "example.com/v1", Kind: "Widget", Namespace: "default", Name: "w", UID: "uid-w",
+	}}, manyManagedResources("cms", limit)...)
+	exec := &fakeExecutor{applyResult: executor.ApplyResult{Applied: applied}}
+	fc := &fakeCompiler{program: templateProgram("widget", "example.com/v1", "Widget", "default", "w")}
+	r := &Reconciler{Client: cl, Compiler: fc, Registry: registry.New(), Executor: exec}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	var tooLarge *inventoryTooLargeError
+	require.ErrorAs(t, err, &tooLarge)
+
+	got := &expv1alpha1.Graph{}
+	require.NoError(t, cl.Get(context.Background(), key, got))
+	requireConverged(t, got, metav1.ConditionFalse, "InventoryTooLarge")
+	require.Len(t, got.Status.ManagedResources, 1, "the inventory stays at the write-ahead union, never the over-cap applied set")
+	assert.Equal(t, "w", got.Status.ManagedResources[0].Name)
+	assert.Equal(t, "uid-w", got.Status.ManagedResources[0].UID,
+		"the write-ahead entry must adopt the observed UID so teardown can still delete it")
 }
