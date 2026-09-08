@@ -250,6 +250,10 @@ Each instance of the custom resource resolves the CEL expression with its own sp
 CEL selector values are evaluated on every reconciliation. If the schema field changes, the matched set updates automatically on the next reconcile.
 :::
 
+:::warning
+A selector resolved from instance data must be a valid `LabelSelector` object (`matchLabels` and/or `matchExpressions`). Any other shape — a misspelled key such as `matchLabel`, a bare `{tier: db}` label map, or a non-object value — fails the external ref with `ResourcesReady=False` instead of matching every resource of the kind.
+:::
+
 ### Empty Selectors
 
 An empty selector matches **all** resources of the given kind across all namespaces (or in a specific namespace if `namespace` is set):

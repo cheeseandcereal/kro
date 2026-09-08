@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	krov1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	ctrlinstance "github.com/kubernetes-sigs/kro/pkg/controller/instance"
 	"github.com/kubernetes-sigs/kro/pkg/testutil/generator"
 )
 
@@ -633,6 +634,160 @@ var _ = Describe("ExternalRef", func() {
 			g.Expect(found).To(BeTrue())
 			g.Expect(configCount).To(Equal("2"))
 		}, 20*time.Second, time.Second).WithContext(ctx).Should(Succeed())
+	})
+
+	It("should fail closed on a malformed instance-supplied selector instead of matching every object", func(ctx SpecContext) {
+		// An instance-supplied selector (selector: ${schema.spec.selector}) is
+		// only seen at reconcile time, so a typo must fail the node hard rather
+		// than decode to an empty selector that matches every ConfigMap.
+		namespace := fmt.Sprintf("test-%s", rand.String(5))
+		uniqueLabel := fmt.Sprintf("strict-selector-%s", rand.String(5))
+
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: namespace,
+			},
+		}
+		Expect(env.Client.Create(ctx, ns)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			Expect(env.Client.Delete(ctx, ns)).To(Succeed())
+		})
+
+		By("pre-creating several ConfigMaps, only one of which carries the intended label")
+		for name, tier := range map[string]string{
+			"strict-selector-db":    uniqueLabel,
+			"strict-selector-web":   "web",
+			"strict-selector-cache": "cache",
+		} {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: namespace,
+					Labels:    map[string]string{"tier": tier},
+				},
+				Data: map[string]string{"key": tier},
+			}
+			Expect(env.Client.Create(ctx, cm)).To(Succeed())
+		}
+
+		By("creating an RGD whose external collection selector comes from instance spec")
+		rgd := generator.NewResourceGraphDefinition("test-extcoll-strict-selector",
+			generator.WithSchema(
+				"TestExtCollStrictSelector", "v1alpha1",
+				map[string]any{
+					"selector": "object",
+				},
+				map[string]any{
+					"configCount": "${string(size(allconfigs))}",
+				},
+			),
+			generator.WithExternalRef("allconfigs", &krov1alpha1.ExternalRef{
+				APIVersion: "v1",
+				Kind:       "ConfigMap",
+				Metadata: krov1alpha1.ExternalRefMetadata{
+					Selector: toRawExtension("${schema.spec.selector}"),
+				},
+			}, nil, nil),
+		)
+
+		Expect(env.Client.Create(ctx, rgd)).To(Succeed())
+		DeferCleanup(func(ctx SpecContext) {
+			Expect(env.Client.Delete(ctx, rgd)).To(Succeed())
+		})
+
+		By("waiting for the RGD to become active")
+		Eventually(func(g Gomega, ctx SpecContext) {
+			err := env.Client.Get(ctx, types.NamespacedName{Name: rgd.Name}, rgd)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(rgd.Status.State).To(Equal(krov1alpha1.ResourceGraphDefinitionStateActive))
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		By("creating an instance whose selector misspells matchLabels as matchLabel")
+		instance := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "kro.run/v1alpha1",
+				"kind":       "TestExtCollStrictSelector",
+				"metadata": map[string]any{
+					"name":      "test-strict-selector",
+					"namespace": namespace,
+				},
+				"spec": map[string]any{
+					"selector": map[string]any{
+						"matchLabel": map[string]any{"tier": uniqueLabel},
+					},
+				},
+			},
+		}
+		Expect(env.Client.Create(ctx, instance)).To(Succeed())
+
+		By("asserting the instance fails hard with a condition naming the unknown field")
+		Eventually(func(g Gomega, ctx SpecContext) {
+			err := env.Client.Get(ctx, types.NamespacedName{
+				Name:      instance.GetName(),
+				Namespace: namespace,
+			}, instance)
+			g.Expect(err).ToNot(HaveOccurred())
+
+			state, found, err := unstructured.NestedString(instance.Object, "status", "state")
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(found).To(BeTrue())
+			g.Expect(state).To(Equal(string(krov1alpha1.InstanceStateError)),
+				"a malformed selector is a permanent authoring error, not a soft not-ready")
+
+			cond := findInstanceConditionByType(instance, ctrlinstance.ResourcesReady)
+			g.Expect(cond).ToNot(BeNil())
+			g.Expect(cond["status"]).To(Equal("False"))
+			g.Expect(cond["message"]).To(And(
+				ContainSubstring("allconfigs"),
+				ContainSubstring("unknown field"),
+				ContainSubstring("matchLabel"),
+			), "the condition must tell the author what is wrong and where")
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		By("asserting the instance never goes ACTIVE with a match-everything collection")
+		Consistently(func(g Gomega, ctx SpecContext) {
+			err := env.Client.Get(ctx, types.NamespacedName{
+				Name:      instance.GetName(),
+				Namespace: namespace,
+			}, instance)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(instance.Object["status"]).ToNot(HaveKeyWithValue("state", "ACTIVE"))
+			_, found, err := unstructured.NestedString(instance.Object, "status", "configCount")
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(found).To(BeFalse(),
+				"a collection that failed to decode its selector must not publish a count of every ConfigMap in the namespace")
+		}, 6*time.Second, 500*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		By("correcting the selector to matchLabels on the instance")
+		Eventually(func(g Gomega, ctx SpecContext) {
+			err := env.Client.Get(ctx, types.NamespacedName{
+				Name:      instance.GetName(),
+				Namespace: namespace,
+			}, instance)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(unstructured.SetNestedField(instance.Object, map[string]any{
+				"matchLabels": map[string]any{"tier": uniqueLabel},
+			}, "spec", "selector")).To(Succeed())
+			g.Expect(env.Client.Update(ctx, instance)).To(Succeed())
+		}, 10*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		By("asserting the corrected instance converges on exactly the one labelled ConfigMap")
+		Eventually(func(g Gomega, ctx SpecContext) {
+			err := env.Client.Get(ctx, types.NamespacedName{
+				Name:      instance.GetName(),
+				Namespace: namespace,
+			}, instance)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(instance.Object).To(HaveKey("status"))
+			g.Expect(instance.Object["status"]).To(HaveKeyWithValue("state", "ACTIVE"))
+
+			configCount, found, err := unstructured.NestedString(instance.Object, "status", "configCount")
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(found).To(BeTrue())
+			g.Expect(configCount).To(Equal("1"))
+		}, 30*time.Second, 250*time.Millisecond).WithContext(ctx).Should(Succeed())
+
+		Expect(env.Client.Delete(ctx, instance)).To(Succeed())
 	})
 
 	It("should reject a selector label CEL value that references a missing schema field", func(ctx SpecContext) {

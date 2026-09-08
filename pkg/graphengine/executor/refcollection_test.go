@@ -17,6 +17,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -94,6 +95,197 @@ func TestRefCollectionSelector(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "coll", "the error must name the offending node")
 	})
+}
+
+// TestRefCollectionSelector_FailsClosed pins the strict decode of a rendered
+// metadata.selector: malformed shapes are errors, not labels.Everything(). The
+// objects are raw maps because a typed metav1.LabelSelector cannot express them.
+func TestRefCollectionSelector_FailsClosed(t *testing.T) {
+	t.Parallel()
+
+	// withSelector sets metadata.selector even when nil (present-but-null).
+	withSelector := func(selector any) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{
+				"namespace": "default",
+				"selector":  selector,
+			},
+		}}
+	}
+
+	t.Run("malformed selectors are errors naming the node and the fault", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name     string
+			selector any
+			wantErr  string
+		}{
+			{
+				name:     "misspelled matchLabels key",
+				selector: map[string]any{"matchLabel": map[string]any{"tier": "db"}},
+				wantErr:  `unknown field "matchLabel"`,
+			},
+			{
+				name:     "bare label map without matchLabels",
+				selector: map[string]any{"tier": "db"},
+				wantErr:  `unknown field "tier"`,
+			},
+			{
+				name: "unknown field in a matchExpressions item",
+				selector: map[string]any{"matchExpressions": []any{
+					map[string]any{"key": "tier", "operator": "In", "values": []any{"db"}, "bogus": true},
+				}},
+				wantErr: `unknown field "matchExpressions[0].bogus"`,
+			},
+			{
+				name:     "matchLabels holding a string instead of a map",
+				selector: map[string]any{"matchLabels": "tier=db"},
+				wantErr:  "not a valid LabelSelector object",
+			},
+			{
+				name:     "matchLabels value that is not a string",
+				selector: map[string]any{"matchLabels": map[string]any{"tier": int64(3)}},
+				wantErr:  "not a valid LabelSelector object",
+			},
+			{
+				name:     "selector that is a string",
+				selector: "tier=db",
+				wantErr:  "must be a LabelSelector object",
+			},
+			{
+				name:     "selector that is a list",
+				selector: []any{map[string]any{"tier": "db"}},
+				wantErr:  "must be a LabelSelector object",
+			},
+			{
+				name:     "selector that is present but null",
+				selector: nil,
+				wantErr:  "must be a LabelSelector object",
+			},
+			{
+				name:     "malformed label key",
+				selector: map[string]any{"matchLabels": map[string]any{"bad key!": "db"}},
+				wantErr:  "invalid label selector",
+			},
+			{
+				name: "In operator without values",
+				selector: map[string]any{"matchExpressions": []any{
+					map[string]any{"key": "tier", "operator": "In"},
+				}},
+				wantErr: "invalid label selector",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				sel, err := refCollectionSelector("coll", withSelector(tc.selector))
+				require.Error(t, err,
+					"selector %#v resolved to %v, which would list every ConfigMap in scope", tc.selector, sel)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				assert.Contains(t, err.Error(), `"coll"`, "the error must name the offending node")
+			})
+		}
+	})
+
+	t.Run("empty selectors select everything", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name string
+			ref  *unstructured.Unstructured
+		}{
+			{name: "empty selector object", ref: withSelector(map[string]any{})},
+			{name: "empty matchLabels", ref: withSelector(map[string]any{"matchLabels": map[string]any{}})},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				sel, err := refCollectionSelector("coll", tc.ref)
+				require.NoError(t, err)
+				assert.Equal(t, labels.Everything(), sel)
+			})
+		}
+	})
+
+	t.Run("well-formed raw selectors decode to the expected requirements", func(t *testing.T) {
+		t.Parallel()
+		sel, err := refCollectionSelector("coll", withSelector(map[string]any{
+			"matchLabels": map[string]any{"tier": "db"},
+			"matchExpressions": []any{
+				map[string]any{"key": "env", "operator": "NotIn", "values": []any{"test"}},
+			},
+		}))
+		require.NoError(t, err)
+		assert.Equal(t, "env notin (test),tier=db", sel.String())
+	})
+}
+
+// TestSimple_ApplyRefCollectionMalformedSelectorFailsClosed drives a CEL-derived
+// malformed selector through Apply: a hard error (not ErrNotReady, since a typo
+// never self-heals), no drift watch, nothing published into scope.
+func TestSimple_ApplyRefCollectionMalformedSelectorFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	seed := func(name, tier string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]any{
+				"name": name, "namespace": "default",
+				"labels": map[string]any{"tier": tier},
+			},
+		}}
+	}
+
+	cases := []struct {
+		name     string
+		selector any
+		wantErr  string
+	}{
+		{
+			name:     "misspelled matchLabels key",
+			selector: map[string]any{"matchLabel": map[string]any{"tier": "db"}},
+			wantErr:  `unknown field "matchLabel"`,
+		},
+		{
+			name:     "selector resolves to a string",
+			selector: "tier=db",
+			wantErr:  "must be a LabelSelector object",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cl := fake.NewClientBuilder().WithScheme(newScheme(t)).
+				WithObjects(seed("db-a", "db"), seed("web", "web")).Build()
+
+			// Route the selector through a def node so its value only exists
+			// at apply time, like ${schema.spec.sel}.
+			rt := compileAndBuild(t, generator.NewGraph("g",
+				generator.WithNamespace("default"),
+				generator.WithDef("input", map[string]any{"selector": tc.selector}),
+				generator.WithRef("coll", &expv1alpha1.ExternalRef{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+					Metadata: expv1alpha1.ExternalRefMetadata{
+						Namespace: "default",
+						Selector:  apimachineryruntime.RawExtension{Raw: []byte(`"${input.selector}"`)},
+					},
+				}),
+			))
+
+			w := &recordingWatcher{}
+			_, err := NewSimple(cl).Apply(context.Background(), rt, w)
+			require.Error(t, err)
+			assert.False(t, errors.Is(err, ErrNotReady),
+				"a malformed selector is a permanent authoring error, not a soft not-ready")
+			assert.Contains(t, err.Error(), `"coll"`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+
+			assert.Empty(t, w.reqs, "no drift watch may be registered for a selector that failed to decode")
+			_, published := rt.Scope()["coll"]
+			assert.False(t, published, "a failed collection must not publish a match-everything list into scope")
+		})
+	}
 }
 
 // An external collection is read-only: kro lists the matching objects and

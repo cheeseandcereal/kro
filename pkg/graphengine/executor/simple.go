@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
-	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -1274,8 +1273,9 @@ func (s *Simple) applyRef(ctx context.Context, w watchrouter.Watcher, rt *runtim
 // Namespace handling deliberately skips defaultNamespace: an empty
 // metadata.namespace for a namespaced GVR means "list across ALL namespaces",
 // not "the instance's
-// namespace". An empty selector lists everything. A List error is hard; an
-// empty result is valid (an empty collection, treated as ready).
+// namespace". An absent selector lists everything; a malformed one is a hard
+// error (see refCollectionSelector). A List error is hard; an empty result is
+// valid (an empty collection, treated as ready).
 func (s *Simple) applyRefCollection(ctx context.Context, w watchrouter.Watcher, n *runtime.Node, desired []*unstructured.Unstructured) ([]*unstructured.Unstructured, error) {
 	// forEach is rejected on ref nodes at translate time, so Resolve produced
 	// exactly one projected {apiVersion, kind, metadata{selector,namespace?}}
@@ -1345,20 +1345,27 @@ func (s *Simple) applyRefCollection(ctx context.Context, w watchrouter.Watcher, 
 }
 
 // refCollectionSelector extracts the label selector from a rendered
-// external-collection ExternalRef. A missing or empty metadata.selector means
-// "select everything" (labels.Everything).
+// external-collection ExternalRef. An absent selector selects everything; a
+// present but malformed one is an error, never a labels.Everything() fallback.
 func refCollectionSelector(id string, ref *unstructured.Unstructured) (labels.Selector, error) {
-	selectorRaw, found, err := unstructured.NestedMap(ref.Object, "metadata", "selector")
-	if err != nil || !found {
+	raw, found, err := unstructured.NestedFieldNoCopy(ref.Object, "metadata", "selector")
+	if err != nil {
+		return nil, fmt.Errorf("external collection %q: read metadata.selector: %w", id, err)
+	}
+	if !found {
 		return labels.Everything(), nil
 	}
-	ls := &metav1.LabelSelector{}
-	if err := apimachineryruntime.DefaultUnstructuredConverter.FromUnstructured(selectorRaw, ls); err != nil {
-		return nil, fmt.Errorf("convert selector for %q: %w", id, err)
+	selectorRaw, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("external collection %q: metadata.selector must be a LabelSelector object (matchLabels and/or matchExpressions), got %T", id, raw)
+	}
+	ls, err := compiler.DecodeLabelSelector(selectorRaw)
+	if err != nil {
+		return nil, fmt.Errorf("external collection %q: %w", id, err)
 	}
 	selector, err := metav1.LabelSelectorAsSelector(ls)
 	if err != nil {
-		return nil, fmt.Errorf("invalid label selector for %q: %w", id, err)
+		return nil, fmt.Errorf("external collection %q: invalid label selector: %w", id, err)
 	}
 	return selector, nil
 }

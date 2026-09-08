@@ -220,7 +220,7 @@ func (ctx *CompilationContext) buildDefNode(n *expv1alpha1.Node, order int, payl
 }
 
 func (ctx *CompilationContext) buildNode(p *parser.Parser, n *expv1alpha1.Node, order int) (*Node, *spec.Schema, error) {
-	kind, payload, err := projectPayload(n)
+	kind, payload, err := projectPayload(p, n)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -589,8 +589,9 @@ func validateRefMetadata(payload map[string]any) error {
 }
 
 // projectPayload converts the discriminated-union API node into a single
-// unstructured map suitable for CEL extraction.
-func projectPayload(n *expv1alpha1.Node) (NodeKind, map[string]any, error) {
+// unstructured map suitable for CEL extraction. Ref metadata contracts are
+// checked here so they cover both the static and dynamic-GVK ref paths.
+func projectPayload(p *parser.Parser, n *expv1alpha1.Node) (NodeKind, map[string]any, error) {
 	switch {
 	case n.Template != nil:
 		obj, err := unmarshalRaw(n.Template.Raw)
@@ -608,6 +609,11 @@ func projectPayload(n *expv1alpha1.Node) (NodeKind, map[string]any, error) {
 		// (bypassing the CRD XValidation on ExternalRefMetadata) as well as to
 		// both the static and dynamic ref compile paths.
 		if err := validateRefMetadata(obj); err != nil {
+			return 0, nil, fmt.Errorf("ref: %w", err)
+		}
+		// metadata.selector is schemaless; reject a malformed literal here as a
+		// compile error rather than per instance at apply time.
+		if err := validateRefSelector(p, obj); err != nil {
 			return 0, nil, fmt.Errorf("ref: %w", err)
 		}
 		return NodeKindRef, obj, nil
