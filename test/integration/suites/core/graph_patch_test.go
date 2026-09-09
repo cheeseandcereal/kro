@@ -26,10 +26,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
-var _ = Describe("Graph Patch", func() {
+var _ = Describe("Graph Patch", requiresFeatureGate(features.GraphKind), func() {
 	It("contributes fields to pre-existing resources and releases them on node removal", func() {
 		t := GinkgoT()
 		ns := env.CreateNamespace(t)

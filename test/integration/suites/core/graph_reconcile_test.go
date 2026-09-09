@@ -27,13 +27,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/pkg/metadata"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
 var configMapGVK = schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
 
-var _ = Describe("Graph Reconcile", func() {
+var _ = Describe("Graph Reconcile", requiresFeatureGate(features.GraphKind), func() {
 	It("applies, updates, and deletes resources cleanly with finalizer management", func() {
 		t := GinkgoT()
 		ns := env.CreateNamespace(t)

@@ -23,13 +23,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
 // Exercises the def-schema inference path: the compiler synthesizes an
 // OpenAPI schema from the def literal, so a misspelled field on a downstream
 // CEL reference fails at compile time instead of at apply.
-var _ = Describe("Graph Def Type Inference", func() {
+var _ = Describe("Graph Def Type Inference", requiresFeatureGate(features.GraphKind), func() {
 	It("catches typos on def field references at compile time", func() {
 		t := GinkgoT()
 		tests := []struct {

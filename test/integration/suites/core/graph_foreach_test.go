@@ -27,10 +27,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
-var _ = Describe("Graph ForEach", func() {
+var _ = Describe("Graph ForEach", requiresFeatureGate(features.GraphKind), func() {
 	It("expands single-dimension forEach to per-item children", func() {
 		t := GinkgoT()
 		ns := env.CreateNamespace(t)

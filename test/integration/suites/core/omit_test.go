@@ -28,10 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 
 	krov1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/pkg/testutil/generator"
 )
 
-var _ = Describe("Omit", func() {
+var _ = Describe("Omit", requiresFeatureGate(features.CELOmitFunction), func() {
 	var namespace string
 
 	BeforeEach(func(ctx SpecContext) {

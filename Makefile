@@ -130,28 +130,36 @@ go-generate: ## Run go generate against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+# Ginkgo flags shared by both integration lanes; they differ only in the
+# feature gates enabled (KRO_INTEGRATION_FEATURE_GATES, see test/README.md).
+INTEGRATION_GINKGO_FLAGS = -p --timeout=8m --cover -coverpkg=github.com/kubernetes-sigs/kro/pkg/...
+
 .PHONY: test
-test: manifests generate fmt vet envtest ## Run tests. Use WHAT=unit or WHAT=integration, pass extra args after --
+test: manifests generate fmt vet envtest ## Run tests. WHAT=unit|integration (alpha gates on)|integration-default-gates (production gate defaults)|upgrade; extra args after --
 ifeq ($(WHAT),integration)
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_VERSION) --bin-dir $(LOCALBIN) -p path)" \
-		go tool ginkgo -p \
-		--timeout=8m \
-		--cover \
+		go tool ginkgo $(INTEGRATION_GINKGO_FLAGS) \
 		--coverprofile=integration-cover.out \
-		-coverpkg=github.com/kubernetes-sigs/kro/pkg/... \
+		$(filter-out $@,$(MAKECMDGOALS)) \
+		./test/integration/suites/...
+else ifeq ($(WHAT),integration-default-gates)
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+	KRO_INTEGRATION_FEATURE_GATES="" \
+		go tool ginkgo $(INTEGRATION_GINKGO_FLAGS) \
+		--coverprofile=integration-default-gates-cover.out \
 		$(filter-out $@,$(MAKECMDGOALS)) \
 		./test/integration/suites/...
 else ifeq ($(WHAT),unit)
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_VERSION) --bin-dir $(LOCALBIN) -p path)" \
-		go test -race ./pkg/... -coverprofile unit-cover.out $(filter-out $@,$(MAKECMDGOALS))
+		go test -race ./pkg/... ./test/integration/environment/... -coverprofile unit-cover.out $(filter-out $@,$(MAKECMDGOALS))
 else ifeq ($(WHAT),upgrade)
 	KRO_UPGRADE_FROM_VERSION=$(KRO_UPGRADE_FROM_VERSION) \
 	KRO_UPGRADE_MODE=$(MODE) \
 	KRO_UPGRADE_SKIP_GR_ASSERTIONS=$(KRO_UPGRADE_SKIP_GR_ASSERTIONS) \
 		go tool ginkgo -v $(filter-out $@,$(MAKECMDGOALS)) ./test/upgrade/...
 else
-	@echo "Error: WHAT must be either 'unit', 'integration', or 'upgrade'"
-	@echo "Usage: make test WHAT=unit|integration|upgrade"
+	@echo "Error: WHAT must be one of 'unit', 'integration', 'integration-default-gates', or 'upgrade'"
+	@echo "Usage: make test WHAT=unit|integration|integration-default-gates|upgrade"
 	@exit 1
 endif
 

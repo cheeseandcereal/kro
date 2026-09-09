@@ -23,10 +23,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
-var _ = Describe("Graph Compilation", func() {
+var _ = Describe("Graph Compilation", requiresFeatureGate(features.GraphKind), func() {
 	It("exercises the Accepted condition for valid and invalid Graph specs", func() {
 		t := GinkgoT()
 		tests := []struct {

@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
@@ -44,7 +45,7 @@ func getDriftRouterEnv(t environment.TestingT) *environment.Environment {
 	return testEnv
 }
 
-var _ = Describe("Graph Drift", func() {
+var _ = Describe("Graph Drift", requiresFeatureGate(features.GraphKind), func() {
 	It("recreates deleted child solely via watch event", func() {
 		t := GinkgoT()
 		ns := env.CreateNamespace(t)

@@ -18,10 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -278,14 +278,11 @@ func (e *Environment) UpdateGraphSpec(t TestingT, key types.NamespacedName, muta
 	t.Fatalf("UpdateGraphSpec %s: gave up after 10 conflict retries", key)
 }
 
-// isConflictErr reports whether err is a 409 from the API server.
-// Kept inline (rather than depending on apimachinery's IsConflict)
-// because the import surface here is already busy.
+// isConflictErr reports whether err is a 409 Conflict from the API server. It
+// matches on the status reason, so every conflict shape is retried, not only
+// the optimistic-concurrency message text.
 func isConflictErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "the object has been modified")
+	return apierrors.IsConflict(err)
 }
 
 // Eventually polls fn until it returns nil or the timeout fires. The

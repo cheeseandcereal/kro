@@ -17,12 +17,15 @@ package core_test
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/component-base/featuregate"
 
 	ctrlinstance "github.com/kubernetes-sigs/kro/pkg/controller/instance"
 	"github.com/kubernetes-sigs/kro/pkg/features"
@@ -31,13 +34,45 @@ import (
 
 var env *environment.Environment
 
-func TestCore(t *testing.T) {
-	// Enable alpha feature gates for integration test coverage.
-	if err := features.FeatureGate.Set("CELOmitFunction=true"); err != nil {
-		t.Fatalf("failed to enable CELOmitFunction feature gate: %v", err)
+// fullFeatureGates is enabled when environment.FeatureGatesEnv is unset: the
+// alpha gates this suite has dedicated specs for.
+const fullFeatureGates = "CELOmitFunction=true,GraphKind=true"
+
+const featureGateLabelPrefix = "feature-gate:"
+
+// requiresFeatureGate labels a container whose specs need the given alpha gate;
+// the top-level BeforeEach below skips them when the gate is off.
+func requiresFeatureGate(gate featuregate.Feature) Labels {
+	return Label(featureGateLabelPrefix + string(gate))
+}
+
+// Skips gate-labelled specs whose gate is off. It must stay at the top level:
+// Ginkgo then runs neither the container's BeforeEach nor its AfterEach for a
+// skipped spec, so no fixtures are created or torn down.
+var _ = BeforeEach(func() {
+	for _, label := range CurrentSpecReport().Labels() {
+		name, ok := strings.CutPrefix(label, featureGateLabelPrefix)
+		if !ok {
+			continue
+		}
+		gate := featuregate.Feature(name)
+		if _, known := features.FeatureGate.GetAll()[gate]; !known {
+			Fail(fmt.Sprintf("spec is labelled with unknown feature gate %q", name))
+		}
+		if !features.FeatureGate.Enabled(gate) {
+			Skip(fmt.Sprintf("requires feature gate %s=true, which is off in this lane (%s=%q)",
+				name, environment.FeatureGatesEnv, os.Getenv(environment.FeatureGatesEnv)))
+		}
 	}
-	if err := features.FeatureGate.Set("GraphKind=true"); err != nil {
-		t.Fatalf("failed to enable GraphKind feature gate: %v", err)
+})
+
+func TestCore(t *testing.T) {
+	// Gates are process-global and consulted while the manager is wired, so
+	// they must be set before the suite boots (see environment.FeatureGatesEnv).
+	if gates := environment.FeatureGatesFromEnv(fullFeatureGates); gates != "" {
+		if err := features.FeatureGate.Set(gates); err != nil {
+			t.Fatalf("failed to enable feature gates %q: %v", gates, err)
+		}
 	}
 
 	RegisterFailHandler(Fail)

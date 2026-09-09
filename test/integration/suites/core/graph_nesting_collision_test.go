@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/pkg/metadata"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
@@ -44,7 +45,7 @@ import (
 // and, behaviorally, that each subgraph's drift watch is routed to ITS OWN
 // items and does not cross-match the sibling's (the watch selector is keyed on
 // the same token as the label).
-var _ = Describe("Graph Nesting NodeID Collision", func() {
+var _ = Describe("Graph Nesting NodeID Collision", requiresFeatureGate(features.GraphKind), func() {
 	subgraphNode := func(t environment.TestingT, id, cmName string) expv1alpha1.Node {
 		return expv1alpha1.Node{
 			ID: id,

@@ -110,3 +110,54 @@ func TestProjectInstanceConditions_DataPendingIsIncompleteNotAnError(t *testing.
 	assert.True(t, incomplete, "the caller needs to know a condition was skipped")
 	assert.Empty(t, conditions)
 }
+
+// One failing author condition is dropped and reported as degraded; the
+// well-formed sibling still surfaces.
+func TestProjectInstanceConditions_FatalErrorInOneExpressionSkippedNotAborted(t *testing.T) {
+	const good = "${runtime.newCondition({type: 'Good', status: 'True', reason: 'Fine', message: 'sibling survives'})}"
+
+	tests := []struct {
+		name        string
+		bad         string
+		wantInError string
+	}{
+		{
+			name:        "evaluation error is skipped, not aborted",
+			bad:         "${1 / 0}",
+			wantInError: "division by zero",
+		},
+		{
+			name:        "non-condition value is skipped, not aborted",
+			bad:         "${'not a condition'}",
+			wantInError: "must return a Condition or list(Condition)",
+		},
+		{
+			name:        "list of non-conditions is skipped, not aborted",
+			bad:         "${['still', 'not', 'conditions']}",
+			wantInError: "list element is not a Condition",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The bad expression comes first so the loop must continue past it.
+			rgd := buildRGDWithStatus(map[string]any{
+				"conditions": []any{tt.bad, good},
+			})
+			rt := compileAndSeedRuntime(t, rgd, projectionInstance(), nil)
+
+			conditions, incomplete, err := ProjectInstanceConditions(rt, rgd, nil, 0)
+			require.Error(t, err)
+			assert.True(t, errors.Is(err, ErrConditionProjectionDegraded), "got %v", err)
+			assert.Contains(t, err.Error(), tt.wantInError)
+			assert.Contains(t, err.Error(), tt.bad, "the error must name the offending expression")
+			assert.True(t, incomplete)
+
+			require.Len(t, conditions, 1, "the well-formed sibling must survive")
+			assert.Equal(t, "Good", conditions[0].ConditionType)
+			assert.Equal(t, "True", conditions[0].Status)
+			assert.Equal(t, "Fine", conditions[0].Reason)
+			assert.Equal(t, "sibling survives", conditions[0].Message)
+		})
+	}
+}

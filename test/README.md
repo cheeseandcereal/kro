@@ -58,6 +58,17 @@ controllers, you should:
 11. Repeat until all the RGD instances are created
 12. Do the same for updates and deletions
 
+### Feature-gate lanes
+
+The integration suites run in two lanes selected by the
+`KRO_INTEGRATION_FEATURE_GATES` environment variable (see
+`test/integration/environment/featuregates.go`). `make test WHAT=integration`
+leaves it unset and enables the alpha gates the suite has specs for
+(`CELOmitFunction=true,GraphKind=true`); `make test WHAT=integration-default-gates`
+exports it empty and runs with production defaults (every alpha gate off), so
+specs whose container is decorated with `requiresFeatureGate(features.X)` are
+skipped. Run both lanes; extra ginkgo arguments go after `--` in either.
+
 ## E2e tests
 
 E2E tests for kro should focus on validating the entire system's behavior in a

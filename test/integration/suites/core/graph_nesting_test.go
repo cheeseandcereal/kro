@@ -24,10 +24,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
-var _ = Describe("Graph Nesting", func() {
+var _ = Describe("Graph Nesting", requiresFeatureGate(features.GraphKind), func() {
 	It("captures parent def and applies child in nested subgraph", func() {
 		t := GinkgoT()
 		ns := env.CreateNamespace(t)

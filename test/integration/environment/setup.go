@@ -377,6 +377,8 @@ func (e *Environment) setupController() error {
 		return fmt.Errorf("setting up graph revision reconciler: %w", err)
 	}
 
+	// Gated like cmd/controller/main.go so a suite run with GraphKind off boots
+	// the stock component set; e.Router and e.SchemaWatcher stay nil then.
 	if features.FeatureGate.Enabled(features.GraphKind) {
 		router := watchrouter.NewRouter(
 			zap.New(zap.WriteTo(e.ControllerConfig.LogWriter), zap.UseDevMode(true)).WithName("graph-watch-router"),

@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
@@ -129,7 +130,7 @@ func lowerASCII(s string) string {
 	return string(out)
 }
 
-var _ = Describe("Graph Schema Watch", func() {
+var _ = Describe("Graph Schema Watch", requiresFeatureGate(features.GraphKind), func() {
 	It("indexes static dependencies in the schema watcher reverse index", func() {
 		t := GinkgoT()
 		testEnv := getSchemaWatchEnv(t)

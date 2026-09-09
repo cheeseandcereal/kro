@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
@@ -33,7 +34,7 @@ import (
 // its downstream dependents: a child of an ignored node is itself ignored,
 // even if its own includeWhen evaluates true. Cases are layered to prove
 // transitivity end-to-end.
-var _ = Describe("Graph Contagious Ignore", func() {
+var _ = Describe("Graph Contagious Ignore", requiresFeatureGate(features.GraphKind), func() {
 	It("propagates includeWhen=false contagiously to downstream dependents", func() {
 		t := GinkgoT()
 		tests := []struct {
