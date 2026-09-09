@@ -15,10 +15,8 @@
 #   - .ready() on a node is deferred to KREP-006 (readiness lifecycle) — used
 #     here for status gating; there is no working replacement yet.
 #   - propagateWhen (conditional status updates) is deferred to KREP-006.
-#   - Multi-level deferral of generated child-node CEL (the L1/L2 node-list
-#     built as a string) relies on encodings the scanner does not yet accept
-#     for every case shown, and generated external-ref nodes here omit
-#     includeWhen/readyWhen modifiers the real engine supports.
+#   - Generated external-ref nodes here omit includeWhen/readyWhen modifiers
+#     the real engine supports.
 # When those land (KREP-006 readiness, KREP-011 variables, the CEL-function
 # registrations), this example is intended to compile and run unchanged.
 # ╚═══════════════════════════════════════════════════════════════╗
@@ -71,12 +69,19 @@
 #   are ready, the instance's status condition becomes Ready and state
 #   transitions from IN_PROGRESS to ACTIVE.
 #
-# ─── Escaping Convention ─────────────────────────────────────────────────────
+# ─── Deferral Convention ─────────────────────────────────────────────────────
 #
-#   ${...}         — evaluated by L0
-#   ${"${...}"}    — deferred to L1 (evaluated by L1's controller)
-#   Expressions inside L2's CEL-constructed node list survive as opaque strings
-#   and are evaluated by L2's controller.
+#   ${...}         — evaluated by L0 (this Graph)
+#   $${...}        — deferred to L1: L0 emits the literal text ${...}, which
+#                    L1's controller evaluates in its own scope
+#
+#   Each level peels one dollar sign ($$${...} would defer to L2), but this
+#   file needs only one layer: L2's node list (see `instances` below) is
+#   built by L1 as a CEL list, so the user's own ${schema.spec.*} expressions
+#   inside it survive as plain string data and are evaluated by L2's
+#   controller. The body of a deferred expression is opaque to L0 — quotes,
+#   braces and backslashes inside it reach the next level verbatim, so
+#   nothing needs escaping.
 #
 # ---------------------------------------------------------------------------
 apiVersion: kro.run/v1alpha1
@@ -172,65 +177,65 @@ spec:
             - id: checks
               def:
                 resources: >-
-                  ${"${schema.?spec.?resources.orValue([])}"}
+                  $${schema.?spec.?resources.orValue([])}
                 reserved: >-
-                  ${"${['apiVersion','context','dependency','dependencies','each','externalRef','externalReference','externalRefs','externalReferences','graph','instance','item','items','kind','kro','metadata','namespace','object','resource','resourcegraphdefinition','resourceGraphDefinition','resources','root','runtime','schema','self','serviceAccountName','spec','status','this','variables','vars','version']}"}
+                  $${['apiVersion','context','dependency','dependencies','each','externalRef','externalReference','externalRefs','externalReferences','graph','instance','item','items','kind','kro','metadata','namespace','object','resource','resourcegraphdefinition','resourceGraphDefinition','resources','root','runtime','schema','self','serviceAccountName','spec','status','this','variables','vars','version']}
                 allIDs: >-
-                  ${"${schema.?spec.?resources.orValue([]).map(r, r.id)}"}
+                  $${schema.?spec.?resources.orValue([]).map(r, r.id)}
 
             - id: validation
               def:
                 result: >-
-                  ${"${checks.resources.exists(r, checks.reserved.exists(w, r.id == w)) ? {'valid': false, 'message': 'naming convention violation: id ' + checks.resources.filter(r, checks.reserved.exists(w, r.id == w))[0].id + ' is a reserved keyword in KRO'} : checks.resources.exists(r, !r.id.matches('^[a-z][a-zA-Z0-9]*$')) ? {'valid': false, 'message': 'naming convention violation: id ' + checks.resources.filter(r, !r.id.matches('^[a-z][a-zA-Z0-9]*$'))[0].id + ' is not a valid KRO resource id: must be lower camelCase'} : checks.resources.exists(r, checks.resources.filter(s, s.id == r.id).size() > 1) ? {'valid': false, 'message': 'found duplicate resource IDs: ' + checks.resources.filter(r, checks.resources.filter(s, s.id == r.id).size() > 1)[0].id} : checks.resources.exists(r, has(r.forEach) && r.forEach.size() > 0 && r.forEach.exists(d, d.exists(k, checks.reserved.exists(w, k == w)))) ? {'valid': false, 'message': 'forEach iterator is a reserved keyword'} : checks.resources.exists(r, has(r.forEach) && r.forEach.size() > 0 && r.forEach.exists(d, d.exists(k, checks.allIDs.exists(id, id == k)))) ? {'valid': false, 'message': 'forEach iterator conflicts with resource ID'} : schema.?spec.?schema.?status.orValue({}).size() > 0 && schema.spec.schema.status.exists(k, !string(schema.spec.schema.status[k]).contains('${')) ? {'valid': false, 'message': 'failed to build instance status schema: status fields without expressions are not supported'} : checks.resources.exists(r, !has(r.externalRef) && has(r.template) && (!has(r.template.apiVersion) || !has(r.template.kind) || !has(r.template.metadata))) ? {'valid': false, 'message': 'resource ' + checks.resources.filter(r, !has(r.externalRef) && has(r.template) && (!has(r.template.apiVersion) || !has(r.template.kind) || !has(r.template.metadata)))[0].id + ' is not a valid Kubernetes object: missing apiVersion, kind, or metadata'} : checks.resources.exists(r, !has(r.externalRef) && has(r.template) && has(r.template.apiVersion) && !string(r.template.apiVersion).contains('${') && !string(r.template.apiVersion).matches('^([a-zA-Z0-9][a-zA-Z0-9.-]*/)?v[0-9]+((?:alpha|beta)[0-9]+)?$')) ? {'valid': false, 'message': 'resource ' + checks.resources.filter(r, !has(r.externalRef) && has(r.template) && has(r.template.apiVersion) && !string(r.template.apiVersion).contains('${') && !string(r.template.apiVersion).matches('^([a-zA-Z0-9][a-zA-Z0-9.-]*/)?v[0-9]+((?:alpha|beta)[0-9]+)?$'))[0].id + ' has invalid apiVersion format'} : {'valid': true, 'message': ''}}"}
+                  $${checks.resources.exists(r, checks.reserved.exists(w, r.id == w)) ? {'valid': false, 'message': 'naming convention violation: id ' + checks.resources.filter(r, checks.reserved.exists(w, r.id == w))[0].id + ' is a reserved keyword in KRO'} : checks.resources.exists(r, !r.id.matches('^[a-z][a-zA-Z0-9]*$')) ? {'valid': false, 'message': 'naming convention violation: id ' + checks.resources.filter(r, !r.id.matches('^[a-z][a-zA-Z0-9]*$'))[0].id + ' is not a valid KRO resource id: must be lower camelCase'} : checks.resources.exists(r, checks.resources.filter(s, s.id == r.id).size() > 1) ? {'valid': false, 'message': 'found duplicate resource IDs: ' + checks.resources.filter(r, checks.resources.filter(s, s.id == r.id).size() > 1)[0].id} : checks.resources.exists(r, has(r.forEach) && r.forEach.size() > 0 && r.forEach.exists(d, d.exists(k, checks.reserved.exists(w, k == w)))) ? {'valid': false, 'message': 'forEach iterator is a reserved keyword'} : checks.resources.exists(r, has(r.forEach) && r.forEach.size() > 0 && r.forEach.exists(d, d.exists(k, checks.allIDs.exists(id, id == k)))) ? {'valid': false, 'message': 'forEach iterator conflicts with resource ID'} : schema.?spec.?schema.?status.orValue({}).size() > 0 && schema.spec.schema.status.exists(k, !string(schema.spec.schema.status[k]).contains('${')) ? {'valid': false, 'message': 'failed to build instance status schema: status fields without expressions are not supported'} : checks.resources.exists(r, !has(r.externalRef) && has(r.template) && (!has(r.template.apiVersion) || !has(r.template.kind) || !has(r.template.metadata))) ? {'valid': false, 'message': 'resource ' + checks.resources.filter(r, !has(r.externalRef) && has(r.template) && (!has(r.template.apiVersion) || !has(r.template.kind) || !has(r.template.metadata)))[0].id + ' is not a valid Kubernetes object: missing apiVersion, kind, or metadata'} : checks.resources.exists(r, !has(r.externalRef) && has(r.template) && has(r.template.apiVersion) && !string(r.template.apiVersion).contains('${') && !string(r.template.apiVersion).matches('^([a-zA-Z0-9][a-zA-Z0-9.-]*/)?v[0-9]+((?:alpha|beta)[0-9]+)?$')) ? {'valid': false, 'message': 'resource ' + checks.resources.filter(r, !has(r.externalRef) && has(r.template) && has(r.template.apiVersion) && !string(r.template.apiVersion).contains('${') && !string(r.template.apiVersion).matches('^([a-zA-Z0-9][a-zA-Z0-9.-]*/)?v[0-9]+((?:alpha|beta)[0-9]+)?$'))[0].id + ' has invalid apiVersion format'} : {'valid': true, 'message': ''}}
 
             # ─── L1: Create the user's Kind CRD ──────────────────────────────
             - id: crd
               includeWhen:
                 - >-
-                  ${"${validation.result.valid}"}
+                  $${validation.result.valid}
               template:
                 apiVersion: apiextensions.k8s.io/v1
                 kind: CustomResourceDefinition
                 metadata:
                   name: >-
-                    ${"${plural(schema.spec.schema.kind).lowerAscii()}"}.${"${schema.spec.schema.group}"}
+                    $${plural(schema.spec.schema.kind).lowerAscii()}.$${schema.spec.schema.group}
                   labels: >-
-                    ${"${schema.?spec.?schema.?metadata.?labels.orValue({})}"}
+                    $${schema.?spec.?schema.?metadata.?labels.orValue({})}
                   annotations: >-
-                    ${"${schema.?spec.?schema.?metadata.?annotations.orValue({})}"}
+                    $${schema.?spec.?schema.?metadata.?annotations.orValue({})}
                 spec:
                   group: >-
-                    ${"${schema.spec.schema.group}"}
+                    $${schema.spec.schema.group}
                   names:
                     kind: >-
-                      ${"${schema.spec.schema.kind}"}
+                      $${schema.spec.schema.kind}
                     plural: >-
-                      ${"${plural(schema.spec.schema.kind).lowerAscii()}"}
+                      $${plural(schema.spec.schema.kind).lowerAscii()}
                   scope: >-
-                    ${"${schema.spec.schema.scope}"}
+                    $${schema.spec.schema.scope}
                   versions:
                     - name: >-
-                        ${"${schema.spec.schema.apiVersion}"}
+                        $${schema.spec.schema.apiVersion}
                       served: true
                       storage: true
                       subresources:
                         status: {}
                       schema:
                         openAPIV3Schema: >-
-                          ${"${simpleSchema.toOpenAPI(schema.spec.schema, has(schema.spec.resources) ? schema.spec.resources : [])}"}
+                          $${simpleSchema.toOpenAPI(schema.spec.schema, has(schema.spec.resources) ? schema.spec.resources : [])}
                       additionalPrinterColumns: >-
-                        ${"${schema.?spec.?schema.?additionalPrinterColumns.orValue([])}"}
+                        $${schema.?spec.?schema.?additionalPrinterColumns.orValue([])}
 
             # ─── L1: Watch all instances of the user's Kind ──────────────────
             - id: watchInstances
               includeWhen:
                 - >-
-                  ${"${crd.?status.?conditions.orValue([]).exists(c, c.type == 'Established' && c.status == 'True')}"}
+                  $${crd.?status.?conditions.orValue([]).exists(c, c.type == 'Established' && c.status == 'True')}
               ref:
                 apiVersion: >-
-                  ${"${schema.spec.schema.group}"}/${"${schema.spec.schema.apiVersion}"}
+                  $${schema.spec.schema.group}/$${schema.spec.schema.apiVersion}
                 kind: >-
-                  ${"${schema.spec.schema.kind}"}
+                  $${schema.spec.schema.kind}
                 metadata:
                   selector: {}
 
@@ -244,29 +249,29 @@ spec:
             - id: instances
               forEach:
                 - instance: >-
-                    ${"${watchInstances}"}
+                    $${watchInstances}
               template:
                 apiVersion: kro.run/v1alpha1
                 kind: Graph
                 metadata:
                   name: >-
-                    ${"${'rgd.' + schema.metadata.name + '.' + instance.metadata.name}"}
+                    $${'rgd.' + schema.metadata.name + '.' + instance.metadata.name}
                   namespace: >-
-                    ${"${has(instance.metadata.namespace) && instance.metadata.namespace != '' ? instance.metadata.namespace : 'kro-system'}"}
+                    $${has(instance.metadata.namespace) && instance.metadata.namespace != '' ? instance.metadata.namespace : 'kro-system'}
                   ownerReferences:
                     - apiVersion: >-
-                        ${"${schema.spec.schema.group + '/' + schema.spec.schema.apiVersion}"}
+                        $${schema.spec.schema.group + '/' + schema.spec.schema.apiVersion}
                       kind: >-
-                        ${"${schema.spec.schema.kind}"}
+                        $${schema.spec.schema.kind}
                       name: >-
-                        ${"${instance.metadata.name}"}
+                        $${instance.metadata.name}
                       uid: >-
-                        ${"${instance.metadata.uid}"}
+                        $${instance.metadata.uid}
                       controller: true
                       blockOwnerDeletion: true
                 spec:
                   nodes: >-
-                    ${"${[{'id': 'schema', 'ref': {'apiVersion': schema.spec.schema.group + '/' + schema.spec.schema.apiVersion, 'kind': schema.spec.schema.kind, 'metadata': {'name': instance.metadata.name, 'namespace': instance.metadata.namespace}}}] + schema.spec.resources.filter(r, has(r.externalRef) && !has(r.externalRef.metadata.selector)).map(r, {'id': r.id, 'ref': {'apiVersion': r.externalRef.apiVersion, 'kind': r.externalRef.kind, 'metadata': {'name': r.externalRef.metadata.name}.merge(has(r.externalRef.metadata.namespace) && r.externalRef.metadata.namespace != '' ? {'namespace': r.externalRef.metadata.namespace} : {})}}) + schema.spec.resources.filter(r, has(r.externalRef) && has(r.externalRef.metadata.selector)).map(r, {'id': r.id, 'ref': {'apiVersion': r.externalRef.apiVersion, 'kind': r.externalRef.kind, 'metadata': {'selector': r.externalRef.metadata.selector}.merge(has(r.externalRef.metadata.namespace) && r.externalRef.metadata.namespace != '' ? {'namespace': r.externalRef.metadata.namespace} : {})}}) + schema.spec.resources.filter(r, !has(r.externalRef)).map(r, r.merge({'readyWhen': r.?readyWhen.orValue([]).map(expr, expr.replace('each.', r.id + '.')), 'template': r.template.merge({'metadata': (has(r.template.metadata) ? r.template.metadata : {}).merge({'labels': (has(r.template.metadata) && has(r.template.metadata.labels) ? r.template.metadata.labels : {}).merge({'kro.run/instance-id': string(instance.metadata.uid), 'kro.run/instance-name': instance.metadata.name, 'kro.run/instance-namespace': instance.metadata.namespace, 'kro.run/instance-group': schema.spec.schema.group, 'kro.run/instance-version': schema.spec.schema.apiVersion, 'kro.run/instance-kind': schema.spec.schema.kind})})})})) + [{'id': 'rgdInstancePatch', 'patch': {'apiVersion': schema.spec.schema.group + '/' + schema.spec.schema.apiVersion, 'kind': schema.spec.schema.kind, 'metadata': {'name': instance.metadata.name, 'namespace': instance.metadata.namespace}, 'status': {'state': '${' + (schema.spec.resources.size() == 0 ? 'true' : schema.spec.resources.map(r, r.id + '.ready().orValue(false)').join(' && ')) + ' ? \'ACTIVE\' : \'IN_PROGRESS\'}', 'conditions': [{'type': 'Ready', 'status': '${' + (schema.spec.resources.size() == 0 ? 'true' : schema.spec.resources.map(r, r.id + '.ready().orValue(false)').join(' && ')) + ' ? \'True\' : \'False\'}', 'reason': 'Ready', 'observedGeneration': instance.metadata.generation, 'lastTransitionTime': instance.metadata.creationTimestamp}]}.merge(schema.?spec.?schema.?status.orValue({}))}]}"}
+                    $${[{'id': 'schema', 'ref': {'apiVersion': schema.spec.schema.group + '/' + schema.spec.schema.apiVersion, 'kind': schema.spec.schema.kind, 'metadata': {'name': instance.metadata.name, 'namespace': instance.metadata.namespace}}}] + schema.spec.resources.filter(r, has(r.externalRef) && !has(r.externalRef.metadata.selector)).map(r, {'id': r.id, 'ref': {'apiVersion': r.externalRef.apiVersion, 'kind': r.externalRef.kind, 'metadata': {'name': r.externalRef.metadata.name}.merge(has(r.externalRef.metadata.namespace) && r.externalRef.metadata.namespace != '' ? {'namespace': r.externalRef.metadata.namespace} : {})}}) + schema.spec.resources.filter(r, has(r.externalRef) && has(r.externalRef.metadata.selector)).map(r, {'id': r.id, 'ref': {'apiVersion': r.externalRef.apiVersion, 'kind': r.externalRef.kind, 'metadata': {'selector': r.externalRef.metadata.selector}.merge(has(r.externalRef.metadata.namespace) && r.externalRef.metadata.namespace != '' ? {'namespace': r.externalRef.metadata.namespace} : {})}}) + schema.spec.resources.filter(r, !has(r.externalRef)).map(r, r.merge({'readyWhen': r.?readyWhen.orValue([]).map(expr, expr.replace('each.', r.id + '.')), 'template': r.template.merge({'metadata': (has(r.template.metadata) ? r.template.metadata : {}).merge({'labels': (has(r.template.metadata) && has(r.template.metadata.labels) ? r.template.metadata.labels : {}).merge({'kro.run/instance-id': string(instance.metadata.uid), 'kro.run/instance-name': instance.metadata.name, 'kro.run/instance-namespace': instance.metadata.namespace, 'kro.run/instance-group': schema.spec.schema.group, 'kro.run/instance-version': schema.spec.schema.apiVersion, 'kro.run/instance-kind': schema.spec.schema.kind})})})})) + [{'id': 'rgdInstancePatch', 'patch': {'apiVersion': schema.spec.schema.group + '/' + schema.spec.schema.apiVersion, 'kind': schema.spec.schema.kind, 'metadata': {'name': instance.metadata.name, 'namespace': instance.metadata.namespace}, 'status': {'state': '${' + (schema.spec.resources.size() == 0 ? 'true' : schema.spec.resources.map(r, r.id + '.ready().orValue(false)').join(' && ')) + ' ? \'ACTIVE\' : \'IN_PROGRESS\'}', 'conditions': [{'type': 'Ready', 'status': '${' + (schema.spec.resources.size() == 0 ? 'true' : schema.spec.resources.map(r, r.id + '.ready().orValue(false)').join(' && ')) + ' ? \'True\' : \'False\'}', 'reason': 'Ready', 'observedGeneration': instance.metadata.generation, 'lastTransitionTime': instance.metadata.creationTimestamp}]}.merge(schema.?spec.?schema.?status.orValue({}))}}]}
 
             # ─── L1: Write status back to the RGD ────────────────────────────
             - id: rgdStatus
@@ -275,51 +280,51 @@ spec:
                 kind: ResourceGraphDefinition
                 metadata:
                   name: >-
-                    ${"${schema.metadata.name}"}
+                    $${schema.metadata.name}
                 status:
                   state: >-
-                    ${"${validation.result.valid && crd.ready().orValue(false) ? 'Active' : 'Inactive'}"}
+                    $${validation.result.valid && crd.ready().orValue(false) ? 'Active' : 'Inactive'}
                   topologicalOrder: >-
-                    ${"${checks.allIDs}"}
+                    $${checks.allIDs}
                   conditions:
                     - type: Ready
                       status: >-
-                        ${"${validation.result.valid && crd.ready().orValue(false) ? 'True' : 'False'}"}
+                        $${validation.result.valid && crd.ready().orValue(false) ? 'True' : 'False'}
                       reason: >-
-                        ${"${validation.result.valid && crd.ready().orValue(false) ? 'Ready' : 'Invalid'}"}
+                        $${validation.result.valid && crd.ready().orValue(false) ? 'Ready' : 'Invalid'}
                       message: >-
-                        ${"${validation.result.valid ? '' : validation.result.message}"}
+                        $${validation.result.valid ? '' : validation.result.message}
                       observedGeneration: >-
-                        ${"${schema.metadata.generation}"}
+                        $${schema.metadata.generation}
                       lastTransitionTime: >-
-                        ${"${schema.metadata.creationTimestamp}"}
+                        $${schema.metadata.creationTimestamp}
                     - type: GraphAccepted
                       status: >-
-                        ${"${validation.result.valid ? 'True' : 'False'}"}
+                        $${validation.result.valid ? 'True' : 'False'}
                       reason: >-
-                        ${"${validation.result.valid ? 'Valid' : 'Invalid'}"}
+                        $${validation.result.valid ? 'Valid' : 'Invalid'}
                       message: >-
-                        ${"${validation.result.valid ? 'resource graph and schema are valid' : validation.result.message}"}
+                        $${validation.result.valid ? 'resource graph and schema are valid' : validation.result.message}
                       observedGeneration: >-
-                        ${"${schema.metadata.generation}"}
+                        $${schema.metadata.generation}
                       lastTransitionTime: >-
-                        ${"${schema.metadata.creationTimestamp}"}
+                        $${schema.metadata.creationTimestamp}
                     - type: KindReady
                       status: >-
-                        ${"${validation.result.valid && crd.ready().orValue(false) ? 'True' : 'False'}"}
+                        $${validation.result.valid && crd.ready().orValue(false) ? 'True' : 'False'}
                       reason: >-
-                        ${"${validation.result.valid && crd.ready().orValue(false) ? 'Ready' : 'Invalid'}"}
+                        $${validation.result.valid && crd.ready().orValue(false) ? 'Ready' : 'Invalid'}
                       message: >-
-                        ${"${validation.result.valid ? '' : validation.result.message}"}
+                        $${validation.result.valid ? '' : validation.result.message}
                       observedGeneration: >-
-                        ${"${schema.metadata.generation}"}
+                        $${schema.metadata.generation}
                       lastTransitionTime: >-
-                        ${"${schema.metadata.creationTimestamp}"}
+                        $${schema.metadata.creationTimestamp}
                     - type: ControllerReady
                       status: "True"
                       reason: Running
                       message: controller is running
                       observedGeneration: >-
-                        ${"${schema.metadata.generation}"}
+                        $${schema.metadata.generation}
                       lastTransitionTime: >-
-                        ${"${schema.metadata.creationTimestamp}"}
+                        $${schema.metadata.creationTimestamp}

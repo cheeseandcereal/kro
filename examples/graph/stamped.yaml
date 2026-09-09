@@ -1,0 +1,200 @@
+# KREP-024 Example: Stamped Graphs (deferred expressions)
+#
+# A Graph can stamp other Graphs: a `template:` node whose payload is
+# `kind: Graph` creates child Graph objects in the cluster — here one per team,
+# via forEach — and each child is then reconciled on its own by the Graph
+# controller. This is how a single Graph fans out into many independent
+# reconcile loops (forEach is not allowed on inline `graph:` nodes; see
+# nested.yaml for that form of nesting).
+#
+# The twist is CEL: the child's own `${...}` expressions live inside the
+# parent's template, and the parent would evaluate them. To hand an expression
+# down untouched, add a dollar sign:
+#
+#   ${cfg.team}      evaluated HERE (L0)                      -> "alpha"
+#   $${cfg.team}     deferred one level: L0 emits the text    -> ${cfg.team}
+#                    ${cfg.team}; the child (L1) evaluates it
+#   $$${x}           deferred two levels: L0 emits $${x},     -> $${x}
+#                    L1 emits ${x}, the grandchild (L2)
+#                    evaluates it
+#
+# Each evaluation level peels exactly one dollar sign. The body of a deferred
+# expression is opaque to the level that peels it: quotes, braces and
+# backslashes inside it reach the next level verbatim, so nothing needs
+# escaping. Deferred spans work anywhere a string works:
+#
+#   name: $${cfg.team}                       whole field
+#   label: ${team}-$${cfg.team}              mixed with evaluated parts
+#   ${'team-' + $${cfg.team}}                as an operand inside CEL
+#   ${'${' + 'cfg.team.upperAscii()' + '}'}  or build the child's text by hand
+#
+# (The older spelling ${"${cfg.team}"} — a string literal whose value happens
+# to be an expression — still works and produces the same text.)
+#
+# ─── Levels in this file ──────────────────────────────────────────────────────
+#
+#   L0  team-stamper           this Graph
+#   └── L1  team-<team>        one per team; owns ConfigMap <team>
+#       └── L2  team-<team>-audit   stamped by L1; owns ConfigMap <team>-audit
+#
+# The audit ConfigMap records who evaluated what:
+#   fromL0: ${team}                 -> alpha
+#   fromL1: $${cfg.team + '-l1'}    -> alpha-l1   (real CEL, run by L1)
+#   fromL2: $$${audit.stamp}        -> audited    (run by L2)
+#
+# ─── Rules ────────────────────────────────────────────────────────────────────
+#
+#   - A deferred span is a STRING to the level that peels it. Put it where the
+#     next level's object accepts the text ${...}: inside template/def/patch
+#     payloads it is always fine; a CRD-validated field such as a child's
+#     node `id` or `serviceAccountName` will be rejected by the API server.
+#   - The body must have balanced braces and balanced quotes (the same rules
+#     the next level uses to find the end of the expression). A body with a
+#     stray quote or brace can still use the string-literal spelling above.
+#   - The body is not checked by the level that peels it: a mistake in it
+#     (a bare nested ${...}, a typo in a node name) surfaces on the CHILD
+#     Graph's Accepted condition, not on this one.
+#   - A bare nested ${...} (no extra dollar) is still a compile error.
+#   - Stamped children reconcile ASYNCHRONOUSLY. This Graph reports Ready as
+#     soon as the child Graph objects exist; it does not wait for them to
+#     converge. Gate on a child explicitly with a `ref:` to it and a
+#     `readyWhen` on its Ready condition if you need that.
+#   - Deleting this Graph deletes the L1 Graphs, whose finalizers delete their
+#     ConfigMaps and the L2 Graphs, and so on down. (No ownerReferences are
+#     involved; each Graph tracks what it applied in status.managedResources.)
+#
+# ─── Permissions ──────────────────────────────────────────────────────────────
+#
+# Every level applies while impersonating spec.serviceAccountName in its own
+# namespace. The children set the same ServiceAccount, so one Role covers all
+# three levels: it must be allowed to manage Graphs (to stamp) and ConfigMaps.
+#
+# ─── Try it ──────────────────────────────────────────────────────────────────
+#
+#   kubectl apply -f examples/graph/stamped.yaml
+#   kubectl -n stamped-demo get graphs
+#   # each hop peeled one dollar sign:
+#   kubectl -n stamped-demo get graph team-alpha \
+#     -o jsonpath='{.spec.nodes[1].template.metadata.name}{"\n"}'   # ${cfg.team}
+#   kubectl -n stamped-demo get graph team-alpha-audit \
+#     -o jsonpath='{.spec.nodes[1].template.data}{"\n"}'            # fromL2: ${audit.stamp}
+#   kubectl -n stamped-demo get cm alpha alpha-audit -o jsonpath='{range .items[*]}{.metadata.name}: {.data}{"\n"}{end}'
+#
+# Tear down the root Graph FIRST, then the rest of the file. Every level's
+# finalizer deletes what it created while impersonating the ServiceAccount,
+# so `kubectl delete -f` alone (which deletes in file order: Namespace and
+# RBAC before the Graph) leaves all five Graphs unable to clean up and the
+# namespace stuck Terminating.
+#
+#   kubectl -n stamped-demo delete graph team-stamper
+#   kubectl delete -f examples/graph/stamped.yaml --ignore-not-found
+#
+# Requires the controller to run with the GraphKind feature gate enabled
+# (helm: --set config.featureGates.GraphKind=true).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stamped-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stamped
+  namespace: stamped-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: stamped
+  namespace: stamped-demo
+rules:
+  - apiGroups: [kro.run]
+    resources: [graphs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: stamped
+  namespace: stamped-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: stamped
+subjects:
+  - kind: ServiceAccount
+    name: stamped
+    namespace: stamped-demo
+---
+apiVersion: kro.run/v1alpha1
+kind: Graph
+metadata:
+  name: team-stamper
+  namespace: stamped-demo
+spec:
+  serviceAccountName: stamped
+  nodes:
+    - id: teams
+      def:
+        names: [alpha, beta]
+        region: eu-west-1
+
+    # ─── L0 → L1: one child Graph per team ───────────────────────────────────
+    - id: children
+      forEach:
+        - team: ${teams.names}
+      template:
+        apiVersion: kro.run/v1alpha1
+        kind: Graph
+        metadata:
+          name: team-${team}                # L0 evaluates: team-alpha
+        spec:
+          serviceAccountName: stamped
+          nodes:
+            # Inputs to the child are simply baked in by L0.
+            - id: cfg
+              def:
+                team: ${team}
+                region: ${teams.region}
+
+            # The child's own expressions are deferred with $$.
+            - id: cm
+              template:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: $${cfg.team}        # L1 evaluates: alpha
+                data:
+                  region: $${cfg.region}
+                  # Mixed: the left half is evaluated by L0, the right by L1.
+                  label: ${team}-$${cfg.team}
+                  # The child's expression text can also be built by L0's CEL.
+                  upper: ${'${' + 'cfg.team.upperAscii()' + '}'}
+
+            # ─── L1 → L2: the child stamps a grandchild ──────────────────────
+            - id: audit
+              template:
+                apiVersion: kro.run/v1alpha1
+                kind: Graph
+                metadata:
+                  name: team-${team}-audit  # L0 evaluates
+                spec:
+                  serviceAccountName: stamped
+                  nodes:
+                    - id: audit
+                      def:
+                        stamp: audited
+                    - id: cm
+                      template:
+                        apiVersion: v1
+                        kind: ConfigMap
+                        metadata:
+                          name: ${team}-audit
+                        data:
+                          fromL0: ${team}
+                          fromL1: $${cfg.team + '-l1'}
+                          fromL2: $$${audit.stamp}

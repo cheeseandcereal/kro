@@ -39,6 +39,7 @@ import (
 	"github.com/kubernetes-sigs/kro/pkg/cel/library"
 	celunstructured "github.com/kubernetes-sigs/kro/pkg/cel/unstructured"
 	"github.com/kubernetes-sigs/kro/pkg/graph"
+	"github.com/kubernetes-sigs/kro/pkg/graph/parser"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
 )
 
@@ -124,7 +125,11 @@ func ProjectInstanceConditions(
 	var out []library.Condition
 	var failures []string
 	for _, rawExpr := range conditionExprs {
-		inner := unwrapExpr(rawExpr)
+		inner, err := unwrapExpr(rawExpr)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%q: %v", rawExpr, err))
+			continue
+		}
 		raw, evalErr := evalConditionRaw(env, scope, inner, costLimit)
 		if evalErr != nil {
 			if runtime.IsCELDataPending(evalErr) {
@@ -413,13 +418,15 @@ func dedupConditionTypes(conds []library.Condition) ([]library.Condition, []stri
 	return kept, slices.Sorted(maps.Keys(dupSet))
 }
 
-// unwrapExpr strips ${...} wrappers from a CEL expression string.
-// Standalone ${expr} → expr; bare expression → unchanged.
-func unwrapExpr(s string) string {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "${") && strings.HasSuffix(s, "}") {
-		s = strings.TrimPrefix(s, "${")
-		s = strings.TrimSuffix(s, "}")
+// unwrapExpr strips the ${...} wrapper from a condition expression using the
+// same scanner the builder used to admit it (parser.UnwrapExpressions), so
+// the text evaluated here is exactly the text that was type-checked at build
+// time — including deferred "$${...}" spans, which the scanner rewrites into
+// string literals. A plain string trim would hand those to CEL unrewritten.
+func unwrapExpr(s string) (string, error) {
+	exprs, err := parser.UnwrapExpressions([]string{s})
+	if err != nil {
+		return "", err
 	}
-	return s
+	return exprs[0].Original, nil
 }

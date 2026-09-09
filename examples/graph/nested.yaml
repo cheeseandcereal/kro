@@ -1,0 +1,300 @@
+# KREP-024 Example: Nested Graph (inline subgraphs)
+#
+# A Graph node can carry a `graph:` payload instead of `template:`, `ref:`,
+# `def:`, or `patch:`. The payload is an inline GraphSpec — a `nodes:` list —
+# that is compiled as a CHILD SCOPE of the enclosing Graph. Nothing is looked up
+# in the cluster: the child spec lives inside the parent object and reconciles
+# in the same pass as the parent. (The other form of nesting — stamping
+# independent child Graph objects — is shown in stamped.yaml.)
+#
+# This example builds a small "web stack" out of three subgraphs to show every
+# scoping rule the engine enforces:
+#
+#   app                    (def)   shared values at the root scope
+#   ├── storage            (graph) ConfigMap + a computed def
+#   │   ├── settings       (def)   captures ${app.*}
+#   │   └── cm             (template) captures ${app.*}, reads local ${settings.*}
+#   ├── workload           (graph) Deployment + Service
+#   │   ├── labels         (def)   shadows nothing, purely local
+#   │   ├── deploy         (template) captures ${app.*} and ${storage.cm.*}
+#   │   └── svc            (template)
+#   ├── ingress            (graph) demonstrates SHADOWING and TWO-LEVEL nesting
+#   │   ├── app            (def)   shadows the root `app` inside this frame
+#   │   ├── rules          (graph) grandchild frame: a subgraph in a subgraph
+#   │   │   └── host       (def)   `${app.host}` binds to ingress.app (nearest frame)
+#   │   └── ing            (template) reads local ${rules.host.*}
+#   └── summary            (template) root node reading child outputs via
+#                                     ${storage.cm...}, ${workload.svc...}
+#
+# ─── Scoping rules ────────────────────────────────────────────────────────────
+#
+# 1. CAPTURE: a child expression may reference any node in an enclosing frame
+#    (parent, grandparent, ...). Each captured ID becomes a hard dependency of
+#    the `graph:` node, so the subgraph runs only after the captured nodes have
+#    resolved. There is no `inputs:` block — capture IS the input contract.
+#
+# 2. OUTPUTS: every node published inside a subgraph is exposed to the parent
+#    as a map under the `graph:` node's ID: `${<graphNodeID>.<childNodeID>.<field>}`.
+#    There is no `outputs:` block — the whole child scope is the output.
+#    Nested frames chain: `${workload.svc.spec.clusterIP}`.
+#
+# 3. SHADOWING: a child node with the same ID as an ancestor node hides the
+#    ancestor within that frame (nearest frame wins). See the `ingress` subgraph.
+#
+# 4. NO-MIX: a SINGLE CEL expression must reference nodes from ONE frame only.
+#    `${settings.key + app.name}` inside `storage` is rejected at compile time
+#    ("mixes node references from different graph scopes"). Split it across
+#    two expressions, or hoist the parent value into a local `def:` first —
+#    that is exactly what `storage.settings` does below.
+#
+# 5. RESTRICTIONS:
+#      - `forEach`, `includeWhen`, `readyWhen` on a `graph:` node itself are
+#        rejected at compile time. To fan out whole Graphs, stamp child Graph
+#        objects with a `template:` node instead — see stamped.yaml.
+#      - A child may not capture an ancestor `patch:` node (patches publish no value).
+#      - `readyWhen` on any node may only reference that node itself; inside
+#        a subgraph that also rules out captures.
+#      - Child node IDs must be unique within their own frame; siblings in
+#        different subgraphs may reuse IDs (they are tracked as `storage/cm`,
+#        `workload/deploy`, ...).
+#      - A subgraph must declare at least one node. Nesting depth is unlimited.
+#
+# 6. RUNTIME: the subgraph runs against the SAME Graph object — same namespace
+#    default, same impersonated ServiceAccount, same tracking and teardown
+#    (status.managedResources plus the Graph's finalizer; no ownerReferences
+#    are set). Managed resources appear in status.managedResources with
+#    frame-qualified nodeIDs (e.g. `workload/deploy`) and carry a
+#    `kro.run/node-id: workload.deploy` label.
+#
+# ─── Permissions ──────────────────────────────────────────────────────────────
+#
+# A Graph applies while impersonating spec.serviceAccountName in its own
+# namespace. Everything here is created in the Graph's namespace, so a Role is
+# sufficient.
+#
+# ─── Try it ──────────────────────────────────────────────────────────────────
+#
+#   kubectl apply -f examples/graph/nested.yaml
+#   kubectl -n nested-demo get graph web-stack -o yaml      # status.managedResources
+#   kubectl -n nested-demo get cm web-stack-summary -o yaml # values read from subgraphs
+#
+# Tear down the Graph FIRST, then the rest of the file. The Graph's finalizer
+# removes the managed resources while impersonating the ServiceAccount, so
+# `kubectl delete -f` alone (which deletes in file order: Namespace and RBAC
+# before the Graph) leaves the Graph unable to clean up and the namespace
+# stuck Terminating.
+#
+#   kubectl -n nested-demo delete graph web-stack
+#   kubectl delete -f examples/graph/nested.yaml --ignore-not-found
+#
+# Requires the controller to run with the GraphKind feature gate enabled
+# (helm: --set config.featureGates.GraphKind=true).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nested-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: web-stack
+  namespace: nested-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: web-stack
+  namespace: nested-demo
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: web-stack
+  namespace: nested-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: web-stack
+subjects:
+  - kind: ServiceAccount
+    name: web-stack
+    namespace: nested-demo
+---
+apiVersion: kro.run/v1alpha1
+kind: Graph
+metadata:
+  name: web-stack
+  namespace: nested-demo
+spec:
+  serviceAccountName: web-stack
+  nodes:
+    # ─── Root scope ──────────────────────────────────────────────────────────
+    - id: app
+      def:
+        name: web-stack
+        image: nginx:1.27
+        replicas: 2
+        host: web-stack.example.com
+        message: hello from a nested graph
+
+    # ─── Subgraph 1: storage ─────────────────────────────────────────────────
+    # Captures `app` from the root. Because `settings` and `cm` both reference
+    # `app`, the compiler records `app` as a hard dependency of the `storage`
+    # node; `storage` runs after `app` resolves.
+    - id: storage
+      graph:
+        nodes:
+          # Hoist parent values into the local frame. This is the idiom for
+          # working around the no-mix rule: once the values are local you can
+          # combine them freely in one expression.
+          - id: settings
+            def:
+              name: ${app.name}
+              message: ${app.message}
+              # ${app.name + "-config"} references only the parent frame — fine.
+              cmName: ${app.name + "-config"}
+
+          - id: cm
+            template:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                # `${settings.cmName}` is a LOCAL reference within `storage`.
+                name: ${settings.cmName}
+              data:
+                # Local references can be combined in one expression.
+                index.html: ${"<h1>" + settings.name + "</h1><p>" + settings.message + "</p>"}
+                # Captures of the root frame are also fine, as long as the
+                # expression does not also touch a local node.
+                image: ${app.image}
+
+    # ─── Subgraph 2: workload ────────────────────────────────────────────────
+    # Captures both `app` (a def) and `storage` (a sibling subgraph!). A
+    # sibling subgraph is just another node in the parent frame, so its child
+    # outputs are reachable as ${storage.<child>.<field>}. This creates the
+    # edge storage -> workload: the Deployment is not applied until the
+    # ConfigMap exists.
+    - id: workload
+      graph:
+        nodes:
+          - id: labels
+            def:
+              selector:
+                app.kubernetes.io/name: ${app.name}
+                app.kubernetes.io/part-of: nested-demo
+
+          - id: deploy
+            template:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: ${app.name}
+              spec:
+                replicas: ${app.replicas}
+                selector:
+                  matchLabels: ${labels.selector}
+                template:
+                  metadata:
+                    labels: ${labels.selector}
+                  spec:
+                    containers:
+                      - name: web
+                        image: ${app.image}
+                        ports:
+                          - containerPort: 80
+                        volumeMounts:
+                          - name: html
+                            mountPath: /usr/share/nginx/html
+                    volumes:
+                      - name: html
+                        configMap:
+                          # Reads a value published by the sibling subgraph.
+                          name: ${storage.cm.metadata.name}
+
+          - id: svc
+            template:
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: ${app.name}
+              spec:
+                selector: ${labels.selector}
+                ports:
+                  - name: http
+                    port: 80
+                    targetPort: 80
+
+    # ─── Subgraph 3: ingress (shadowing + two-level nesting) ────────────────
+    - id: ingress
+      graph:
+        nodes:
+          # SHADOWING: this frame declares its own `app`. Every `${app.*}`
+          # inside `ingress` (and inside its nested `rules` frame) now binds
+          # here, not to the root `app`. Because nothing in this frame reaches
+          # the root `app`, the `ingress` node has NO dependency on it.
+          - id: app
+            def:
+              host: shadowed.example.com
+              serviceName: web-stack
+
+          # Two-level nesting: a subgraph inside a subgraph. Capture resolves
+          # to the NEAREST frame that declares the ID — `ingress.app`.
+          - id: rules
+            graph:
+              nodes:
+                - id: host
+                  def:
+                    value: ${app.host}
+                    path: /
+
+          - id: ing
+            template:
+              apiVersion: networking.k8s.io/v1
+              kind: Ingress
+              metadata:
+                name: ${app.serviceName}
+              spec:
+                rules:
+                  # Reads the grandchild's output through the local `rules` node.
+                  - host: ${rules.host.value}
+                    http:
+                      paths:
+                        - path: ${rules.host.path}
+                          pathType: Prefix
+                          backend:
+                            service:
+                              name: ${app.serviceName}
+                              port:
+                                number: 80
+
+    # ─── Root node reading subgraph outputs ──────────────────────────────────
+    # Each `${<subgraph>.<child>.<field>}` reference creates a dependency on
+    # that subgraph node, so `summary` is applied last, after all three
+    # subgraphs have converged. Subgraph outputs are untyped (dyn) in CEL, so
+    # the compiler cannot check field names here — typos surface at runtime.
+    - id: summary
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${app.name + "-summary"}
+        data:
+          configMap: ${storage.cm.metadata.name}
+          deployment: ${workload.deploy.metadata.name}
+          clusterIP: ${workload.svc.spec.clusterIP}
+          # The shadowed value from the `ingress` frame, two levels down.
+          ingressHost: ${ingress.rules.host.value}
+          # The root `app` is still the root `app` here — shadowing is
+          # frame-local and does not leak upward.
+          rootHost: ${app.host}

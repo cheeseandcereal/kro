@@ -292,12 +292,12 @@ func (p *Parser) parseArray(field []any, schema *spec.Schema, path string, expec
 func parseString(field string, path string, expectedTypes []string) ([]variable.FieldDescriptor, error) {
 	matches, err := extractExpressions(field)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("path %s: %w", path, err)
 	}
 
-	if len(matches) == 1 && matches[0].start == 0 && matches[0].end == len(field) {
+	if isStandalone(field, matches) {
 		return []variable.FieldDescriptor{{
-			Expression: &krocel.Expression{Original: matches[0].expr},
+			Expression: standaloneExpression(field, matches[0]),
 			Path:       path,
 		}}, nil
 	}
@@ -314,6 +314,18 @@ func parseString(field string, path string, expectedTypes []string) ([]variable.
 		}}, nil
 	}
 	return nil, nil
+}
+
+// standaloneExpression builds the Expression for a field that is exactly one
+// ${...}. When the scanner rewrote the expression (a deferred $${...} span was
+// turned into a string literal), the author's text is kept in OriginalTemplate
+// so diagnostics show what was written rather than the generated literal.
+func standaloneExpression(field string, m exprMatch) *krocel.Expression {
+	e := &krocel.Expression{Original: m.expr}
+	if m.rewritten {
+		e.OriginalTemplate = field
+	}
+	return e
 }
 
 // buildStringTemplate builds a CEL concatenation expression from a string

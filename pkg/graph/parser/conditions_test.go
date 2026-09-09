@@ -27,17 +27,17 @@ func TestParseReadyWhen(t *testing.T) {
 		{
 			name:          "Two expressions",
 			expression:    []string{"${hello}${goodbye}"},
-			expectedError: "only standalone expressions are allowed",
+			expectedError: `"${hello}${goodbye}": only standalone expressions are allowed`,
 		},
 		{
 			name:          "With Postfix",
 			expression:    []string{"${hello}-world"},
-			expectedError: "only standalone expressions are allowed",
+			expectedError: `"${hello}-world": only standalone expressions are allowed`,
 		},
 		{
 			name:          "With Prefix",
 			expression:    []string{"hello-${world}"},
-			expectedError: "only standalone expressions are allowed",
+			expectedError: `"hello-${world}": only standalone expressions are allowed`,
 		},
 		{
 			name:          "Standalone expression",

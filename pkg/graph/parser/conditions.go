@@ -16,7 +16,6 @@ package parser
 
 import (
 	"fmt"
-	"strings"
 
 	krocel "github.com/kubernetes-sigs/kro/pkg/cel"
 )
@@ -34,16 +33,14 @@ func UnwrapExpressions(conditions []string) ([]*krocel.Expression, error) {
 	expressions := make([]*krocel.Expression, 0, len(conditions))
 
 	for _, e := range conditions {
-		ok, err := IsStandaloneExpression(e)
+		m, err := standaloneMatch(e)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			return nil, fmt.Errorf("only standalone expressions are allowed")
+		if m == nil {
+			return nil, fmt.Errorf("%q: only standalone expressions are allowed", e)
 		}
-		expr := strings.TrimPrefix(e, "${")
-		expr = strings.TrimSuffix(expr, "}")
-		expressions = append(expressions, &krocel.Expression{Original: expr})
+		expressions = append(expressions, standaloneExpression(e, *m))
 	}
 
 	return expressions, nil

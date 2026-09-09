@@ -146,11 +146,11 @@ readyWhen:
 
 ### Escaping `${VAR}` Syntax
 
-kro uses `${...}` as CEL expression delimiters, which conflicts with shell `${VAR}` variable expansion syntax. To produce a literal `${VAR}` in the output, wrap the variable reference in a CEL string literal:
+kro uses `${...}` as CEL expression delimiters, which conflicts with shell `${VAR}` variable expansion syntax. To produce a literal `${VAR}` in the output, add a second dollar sign:
 
-**Pattern:** `${"${VAR}"}` produces the literal output `${VAR}`
+**Pattern:** `$${VAR}` produces the literal output `${VAR}`
 
-kro sees the outer `${...}` and evaluates the contents as CEL. The contents `"${VAR}"` is just a CEL string literal (text between double quotes), so it evaluates to the string `${VAR}`.
+kro treats `$${...}` as a *deferred* expression: instead of evaluating the contents, it emits them as text with one dollar sign removed. The contents are never parsed as CEL, so nothing inside needs escaping. Each extra dollar sign adds one more layer (`$$${VAR}` produces `$${VAR}`).
 
 **Example:**
 ```kro
@@ -159,16 +159,23 @@ containers:
     command:
       - bash
       - -c
-      - echo "Hello ${"${USER}"}"
+      - echo "Hello $${USER}"
 ```
 
-This works for all shell parameter expansion forms:
+This works for shell parameter expansion forms, and mixes freely with evaluated expressions in the same string:
 
 | Shell syntax | Escaped for kro | CEL evaluates to |
 |---|---|---|
-| `${VAR}` | `${"${VAR}"}` | `${VAR}` |
-| `${VAR:-default}` | `${"${VAR:-default}"}` | `${VAR:-default}` |
-| `${VAR:=value}` | `${"${VAR:=value}"}` | `${VAR:=value}` |
+| `${VAR}` | `$${VAR}` | `${VAR}` |
+| `${VAR:-default}` | `$${VAR:-default}` | `${VAR:-default}` |
+| `${VAR:=value}` | `$${VAR:=value}` | `${VAR:=value}` |
+| `${schema.spec.name}-${VAR}` | `${schema.spec.name}-$${VAR}` | `my-app-${VAR}` |
+
+To find the end of a deferred expression, kro matches braces and treats `'...'` and `"..."` as quoted text, so the contents must have **balanced braces and balanced quotes**. Text that does not — for example `${VAR:-don't}`, whose apostrophe swallows the closing brace — is reported as an unterminated expression. Wrap such text in a CEL string literal instead: `${"${VAR:-don't}"}`. That older spelling works for any text and produces the same output.
+
+:::warning[Changed behavior]
+`$${x}` previously produced a literal `$` followed by the value of `x`; it now produces the text `${x}`. To put a literal dollar sign directly in front of an evaluated expression, write `${"$"}${x}`.
+:::
 
 :::note
 Shell syntax that does **not** use `${` doesn't need escaping:

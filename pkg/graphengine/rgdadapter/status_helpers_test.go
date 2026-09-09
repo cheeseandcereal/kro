@@ -90,22 +90,40 @@ func TestIsDataPendingCEL(t *testing.T) {
 	}
 }
 
-// unwrapExpr strips a standalone ${...} wrapper so the expression can be handed
-// to CEL directly.
+// unwrapExpr must hand CEL exactly the text the builder type-checked at
+// admission: the builder unwraps conditions with parser.UnwrapExpressions, so
+// the runtime has to use the same scanner. A deferred "$${...}" span in a
+// condition is the case a plain "${"/"}" trim gets wrong — the builder sees a
+// string literal, the trim would leave "$${...}" for CEL to choke on.
 func TestUnwrapExpr(t *testing.T) {
 	t.Parallel()
-	tests := []struct{ in, want string }{
-		{"${bucket.status.arn}", "bucket.status.arn"},
-		{"bucket.status.arn", "bucket.status.arn"},
-		{"  ${bucket.status.arn}  ", "bucket.status.arn"},
-		{"${a} and ${b}", "a} and ${b"},
-		{"${unterminated", "${unterminated"},
-		{"", ""},
+	tests := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{in: "${bucket.status.arn}", want: "bucket.status.arn"},
+		{
+			in:   `${runtime.newCondition({type: 'Ready', status: 'True', reason: 'R', message: $${msg}})}`,
+			want: `runtime.newCondition({type: 'Ready', status: 'True', reason: 'R', message: "${msg}"})`,
+		},
+		{in: "$${x}", want: `"${x}"`},
+		// Anything the builder rejects is rejected here too, not guessed at.
+		{in: "bucket.status.arn", wantErr: true},
+		{in: "${a} and ${b}", wantErr: true},
+		{in: "${unterminated", wantErr: true},
+		{in: "", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tt.want, unwrapExpr(tt.in))
+			got, err := unwrapExpr(tt.in)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

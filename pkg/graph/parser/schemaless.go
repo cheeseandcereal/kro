@@ -15,6 +15,7 @@
 package parser
 
 import (
+	"fmt"
 	"strconv"
 
 	krocel "github.com/kubernetes-sigs/kro/pkg/cel"
@@ -57,11 +58,11 @@ func parseSchemalessResource(resource any, path string) ([]variable.FieldDescrip
 	case string:
 		matches, err := extractExpressions(field)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("path %s: %w", path, err)
 		}
-		if len(matches) == 1 && matches[0].start == 0 && matches[0].end == len(field) {
+		if isStandalone(field, matches) {
 			expressionsFields = append(expressionsFields, variable.FieldDescriptor{
-				Expression: &krocel.Expression{Original: matches[0].expr},
+				Expression: standaloneExpression(field, matches[0]),
 				Path:       path,
 			})
 		} else if len(matches) > 0 {

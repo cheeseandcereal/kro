@@ -67,9 +67,11 @@ type Expression struct {
 	// See OriginalTemplate for the user-facing form. Set by parser.
 	Original string
 
-	// OriginalTemplate is the user's original string template before compilation
-	// into a CEL concatenation expression. Only set for compiled templates
-	// (e.g. "prefix-${expr}" → Original: `"prefix-" + expr`).
+	// OriginalTemplate is the user's original string template when Original
+	// was generated rather than written by the user: a compiled template
+	// (e.g. "prefix-${expr}" → Original: `"prefix-" + expr`) or a standalone
+	// deferred expression (e.g. "$${expr}" → Original: `"${expr}"`). Empty
+	// when Original is the user's text verbatim.
 	OriginalTemplate string
 
 	// References lists all identifiers this expression accesses (e.g., "schema", "vpc").

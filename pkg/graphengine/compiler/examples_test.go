@@ -219,8 +219,9 @@ func TestExamplesGraphCompile(t *testing.T) {
 // Note: stamped child Graphs (a `template:` node with `kind: Graph`) are
 // applied as independent objects and compiled on the child's own reconcile, so
 // their generated expressions cannot be reached from a compiler-level test;
-// that path needs integration-level coverage. This test covers the inline
-// `graph:` nesting that IS compiled by the parent.
+// that path is covered by the "Graph Stamping" specs in
+// test/integration/suites/core/graph_stamping_test.go. This test covers the
+// inline `graph:` nesting that IS compiled by the parent.
 func TestExamplesNestedGraphCompile(t *testing.T) {
 	child := generator.NewGraph("child",
 		generator.WithDef("inner", map[string]any{"suffix": "child"}),

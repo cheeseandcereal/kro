@@ -15,19 +15,26 @@
 package environment
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
@@ -319,4 +326,84 @@ func Consistently(t TestingT, duration, interval time.Duration, fn func() error)
 		}
 		time.Sleep(interval)
 	}
+}
+
+// RepoPath resolves a path relative to the repository root by walking up
+// from the working directory to the first go.mod. Suites run with the
+// package directory as cwd (also under `ginkgo -p`), so shipped fixtures
+// such as examples/graph/*.yaml can be located without hard-coding depth.
+func RepoPath(t TestingT, parts ...string) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return filepath.Join(append([]string{dir}, parts...)...)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("repository root (go.mod) not found above %s", dir)
+		}
+		dir = parent
+	}
+}
+
+// ApplyYAMLFile creates every document in a multi-document YAML file, in
+// order, and returns the created objects. AlreadyExists is tolerated so a
+// shipped example can be applied verbatim. Cleanup deletes the objects in
+// reverse order: Graphs are deleted and awaited (their finalizers cascade to
+// managed resources), Namespaces are left alone because envtest runs no
+// namespace controller to finish their termination.
+func (e *Environment) ApplyYAMLFile(t TestingT, path string) []*unstructured.Unstructured {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	ctx := e.context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Registered before creating anything so a failure part-way through the
+	// file still tears down what was created. Reverse order: the Graph is
+	// deleted and awaited first, while the RBAC its finalizer impersonates
+	// still exists.
+	var created []*unstructured.Unstructured
+	t.Cleanup(func() {
+		for i := len(created) - 1; i >= 0; i-- {
+			obj := created[i]
+			switch obj.GetKind() {
+			case "Namespace":
+				continue
+			case "Graph":
+				g := &expv1alpha1.Graph{}
+				g.Name, g.Namespace = obj.GetName(), obj.GetNamespace()
+				_ = e.deleteGraphAndWait(g)
+			default:
+				_ = e.Client.Delete(context.Background(), obj)
+			}
+		}
+	})
+
+	decoder := k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+	for {
+		obj := &unstructured.Unstructured{}
+		if err := decoder.Decode(obj); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		if len(obj.Object) == 0 {
+			continue
+		}
+		if err := e.Client.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("create %s %s/%s from %s: %v", obj.GetKind(), obj.GetNamespace(), obj.GetName(), path, err)
+		}
+		created = append(created, obj)
+	}
+	return created
 }

@@ -34,6 +34,11 @@ Beyond the RGD proof, Graph enables patterns that are simpler than what RGD can 
   static-bundle pattern: dependency-ordered, health-aware, one object replaces a Helm chart.
 - [Singleton](../../../examples/graph/singleton.yaml) — fan-in with priority-based resolution when
   multiple actors claim the same resource.
+- [Nested](../../../examples/graph/nested.yaml) — inline `graph:` subgraphs: lexical capture of
+  parent nodes, child outputs read back through the node ID, shadowing, and the no-mix rule.
+- [Stamped](../../../examples/graph/stamped.yaml) — a Graph that stamps child Graphs (one per team
+  via `forEach`), which in turn stamp grandchildren; shows the `$${...}` deferred-expression syntax
+  that hands CEL down one level per dollar sign.
 
 > **These examples are illustrative.** They are shipped to demonstrate patterns, not as guaranteed
 > ready-to-run manifests, and not all of them necessarily compile or run as-is pending follow-up.
@@ -59,8 +64,11 @@ inference from CEL expressions, the evaluation model (nodes evaluate when hard d
 not when they are ready), status conditions (`Accepted`, `ResourcesConverged`, `Ready`), and nested composition. These are
 new primitives that do not exist in KRO today.
 
-**Inherited unchanged from RGD:** `includeWhen`, `forEach`, `readyWhen`, and CEL expression syntax.
-These mechanisms carry forward with the same semantics and are not redefined by this KREP.
+**Inherited from RGD:** `includeWhen`, `forEach`, `readyWhen`, and CEL expression syntax. These
+mechanisms carry forward with the same semantics; this KREP does not redefine them. It does add one
+piece of expression syntax — `$${...}` deferral, needed to stamp child Graphs — which lives in the
+shared scanner and is therefore available to RGDs too, see
+[Deferral Boundaries](#deferral-boundaries-for-stamped-graphs).
 
 **Defers to KREP-006 (Planned / Not yet implemented):** `propagateWhen` gating semantics, `.ready()` and `.updated()` lifecycle
 signals, collection-level rollout strategies, and budget syntax. These features are deferred to KREP-006 and are not yet implemented in the engine.
@@ -324,8 +332,8 @@ _(Note: `propagateWhen` gating and `.ready()` lifecycle signals are deferred to 
 
 Graph supports two forms of nesting:
 
-1. **Inline Subgraphs (`graph:` node):** An explicit `graph:` node embeds a child `GraphSpec` inline. The compiler compiles this into a child `SubProgram` frame with lexical scoping. Ancestor node references are captured as dependencies of the subgraph node, while expressions inside the subgraph cannot mix frames.
-2. **Stamping Graph Custom Resources (`template:` node with `kind: Graph`):** A parent Graph can stamp child `Graph` custom resources into the cluster (for example, combined with `forEach`). The child Graph is applied as an independent Kubernetes object and reconciled **asynchronously** by the Graph controller — the parent's apply of the child object completes as soon as the object exists, and the child then compiles and converges on its own reconcile.
+1. **Inline Subgraphs (`graph:` node):** An explicit `graph:` node embeds a child `GraphSpec` inline. The compiler compiles this into a child `SubProgram` frame with lexical scoping. Ancestor node references are captured as dependencies of the subgraph node, while expressions inside the subgraph cannot mix frames. See [examples/graph/nested.yaml](../../../examples/graph/nested.yaml).
+2. **Stamping Graph Custom Resources (`template:` node with `kind: Graph`):** A parent Graph can stamp child `Graph` custom resources into the cluster (for example, combined with `forEach`). The child Graph is applied as an independent Kubernetes object and reconciled **asynchronously** by the Graph controller — the parent's apply of the child object completes as soon as the object exists, and the child then compiles and converges on its own reconcile. See [examples/graph/stamped.yaml](../../../examples/graph/stamped.yaml).
 
 > **Revision history is not implemented for standalone/nested Graphs.** Only the RGD controller
 > issues `GraphRevision` objects (via `createGraphRevision` in
@@ -347,23 +355,32 @@ Graph supports two forms of nesting:
 
 #### Deferral Boundaries for Stamped Graphs
 
-When stamping child Graph resources via a `template:` node, child CEL expressions live as literal strings inside the parent's template. The shipped scanner (`pkg/graph/parser/cel.go` — `extractExpressions`) tracks single- and double-quoted string literals and only permits a nested `${` when it is **immediately preceded by a quote character** (`'` or `"`); a bare nested `${...}` is rejected (`ErrNestedExpression`), and a `${` that never closes before end-of-input is rejected (`ErrUnterminatedExpression`). The supported deferral forms follow directly from that scanner:
+When stamping child Graph resources via a `template:` node, the child's CEL expressions live inside the parent's template, where the parent would evaluate them. An expression is handed down unevaluated by prefixing its opening delimiter with extra dollar signs — **deferral**. N consecutive dollar signs (N ≥ 2) produce the literal text of the same expression with one dollar sign removed, so each evaluation level peels exactly one layer:
 
-- `${...}` — evaluated by the current (parent) Graph.
-- `${"${...}"}` (or `${'${...}'}`) — the inner `${` sits inside a quoted string literal, so the parent parses the whole thing as **one** expression: it evaluates the CEL string literal `"${...}"` to produce the literal text `${...}`, which the child Graph then evaluates at its own scope. This is the two-level form.
-- Three levels nest the same way, one quoted layer per level: `${"${'${...}'}"}`. Each layer's `${` is guarded by the quote that opens the literal it lives in; the parent peels the outermost quoted layer, the child peels the next, and so on.
+| Written at L0 | L0 evaluates to | L1 evaluates to |
+|---|---|---|
+| `${cfg.team}` | `alpha` | — |
+| `$${cfg.team}` | the text `${cfg.team}` | `alpha` |
+| `$$${x}` | the text `$${x}` | the text `${x}` (L2 evaluates it) |
 
-Because the guard is purely "a nested `${` must be preceded by a quote," every additional level of deferral is exactly one more layer of string quoting. A bare `${outer(${inner})}` (no quotes around the inner `${`) does not parse.
+The body of a deferred expression is opaque to the level that peels it: the scanner (`pkg/graph/parser/cel.go` — `extractExpressions`) only finds its matching `}` (honoring CEL string literals and escapes, the same rules the next level uses) and rewrites the span into a CEL string literal. Quotes, braces and backslashes inside the body therefore reach the next level verbatim, and nothing needs escaping at any depth. Because the span becomes a string literal, it composes anywhere a string is allowed:
 
 ```yaml
-# Parent Graph (L0) evaluates this — bakes the RGD name into the child spec:
-name: ${rgd.metadata.name}
-
-# Parent produces literal "${rgd.spec.schema.group}" — child Graph (L1) evaluates it:
-group: ${'${rgd.spec.schema.group}'}
+name: $${cfg.team}                            # whole field → "${cfg.team}"
+label: ${team}-$${cfg.team}                   # mixed → (team) + "-" + ("${cfg.team}")
+tag: ${'team-' + $${cfg.team}}                # operand inside the parent's CEL → 'team-' + "${cfg.team}"
+upper: ${'${' + 'cfg.team.upperAscii()' + '}'} # or build the child's expression text with CEL
 ```
 
-This composes to arbitrary depth. Each layer evaluates one string literal, peeling off one level of quoting.
+Three rules follow from "a deferred span is a string to the level that peels it":
+
+- It must land on a field where the **next** level's object accepts the text `${...}`. Inside a child's `template`/`def`/`patch`/`graph` payloads (all preserve-unknown-fields) that is always the case; a CRD-validated field such as a child node's `id` or `serviceAccountName` will be rejected by the API server, and a typed non-string field of the *parent's own* object is rejected by the parent's type check at compile time.
+- The body must have balanced braces **and balanced quotes** (`'...'` and `"..."` are treated as quoted text while looking for the closing `}`). A body that does not — e.g. shell text such as `${VAR:-don't}` — is reported as an unterminated expression at the field, and can still be written with the older spelling below.
+- The body is **not validated** by the level that peels it: errors in it (a bare nested `${`, a reference to a node that does not exist) surface only when the next level compiles the object it received. This is deliberate — the text may be meant for a non-kro evaluator, such as a shell's nested `${VAR:-${OTHER}}`.
+
+A bare nested `${outer(${inner})}` (no extra dollar) does not parse (`ErrNestedExpression`); a `${` that never closes before end-of-input is rejected (`ErrUnterminatedExpression`). The older spelling `${"${...}"}` — a CEL string literal whose value happens to be an expression — remains valid and yields the same text as `$${...}`, but each further level needs one more layer of alternating/escaped quotes, which is what `$${` replaces.
+
+This syntax is part of the shared expression scanner, so it applies to ResourceGraphDefinition templates as well (where it doubles as the escape for shell `${VAR}` text). One consequence for existing templates: at the top level of a string, `$${x}` used to mean a literal `$` followed by the value of `x`; it now means the text `${x}`. The old meaning is spelled `${"$"}${x}`.
 
 ## Expressing RGD as Graph
 
