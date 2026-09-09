@@ -1,5 +1,5 @@
 ---
-sidebar_position: 4
+sidebar_position: 3
 ---
 
 import Tabs from '@theme/Tabs';
@@ -7,9 +7,10 @@ import TabItem from '@theme/TabItem';
 
 # Collections
 
-By default, each resource definition (in `spec.resources`) creates exactly one
-Kubernetes resource. This means the number of resources is fixed at design
-time - if you need 5 worker Pods, you write 5 resource definitions.
+By default, each resource definition (an RGD `resources` entry or a Graph
+`nodes` entry) creates exactly one Kubernetes resource. This means the number
+of resources is fixed at design time - if you need 5 worker Pods, you write 5
+resource definitions.
 
 Collections let you declaratively manage multiple similar resources from a
 single definition. This is useful when the number of resources depends on
@@ -18,6 +19,9 @@ runtime data like availability zones, tenants, or worker counts.
 kro provides the `forEach` field to turn any resource into a collection. The
 field takes one or more iterators, and kro creates one resource for each element
 (or combination of elements), keeping them in sync as the collection changes.
+The examples on this page use RGD `resources`; the same field applies to Graph
+`nodes` with the differences called out in
+[Collections in a Graph](#collections-in-a-graph).
 
 ## Basic Example
 
@@ -538,8 +542,9 @@ looks surprising.
 A resource cannot use both `forEach` and `externalRef` — they are mutually
 exclusive fields. However, external refs can act as collections on their own
 by using `selector` instead of `name`. See
-**[External Collections](./05-external-references.md#external-collections)**
-for details on label-selector-based external collections.
+**[External Collections](./04-external-references.md#external-collections)**
+for details on label-selector-based external collections. The same rule applies
+to Graph `ref` nodes, which reject `forEach`.
 
 ### Dimension Explosion
 
@@ -574,7 +579,8 @@ be required.
 
 Each resource is limited to **10 forEach dimensions** by default. If a resource
 defines more forEach iterators than this limit, validation fails at RGD
-processing time before any resources are created.
+processing time before any resources are created. For a Graph the same limit is
+enforced when the Graph is reconciled.
 
 This prevents combinatorial explosion from deeply nested cartesian products.
 This limit is configurable through the CLI flag `--rgd-max-collection-dimension-size`
@@ -762,7 +768,7 @@ template for multiple resources rather than a single one.
 **At RGD validation time (static analysis)**, kro analyzes the `forEach`
 expressions to determine the element types. If `schema.spec.workers` is
 `[]string`, kro knows each iteration yields a string and types the iterator
-variable accordingly. This enables [static type checking](../05-static-type-checking.md)
+variable accordingly. This enables [static type checking](../rgd/05-static-type-checking.md)
 of expressions inside the template before any resources are created.
 
 **At instance reconciliation time (runtime)**, when the reconciler reaches a
@@ -811,11 +817,55 @@ modify them manually.
 
 See [Constraints & Gotchas](#constraints--gotchas) for label management notes.
 
+## Collections in a Graph
+
+Everything above applies to Graph nodes, with these differences:
+
+- **Sources.** There is no `schema` variable. Iterate over a `ref` node that
+  reads a collection with a selector, over a `def` node that computes a list,
+  or over any other node's fields.
+- **Node kinds.** `forEach` is accepted on `template`, `def`, and `patch` nodes.
+  It is rejected on `ref` nodes (use a `selector` to read many objects) and on
+  `graph` nodes. See [Graph Modifiers](../graph/03-modifiers.md).
+- **Fan-out patches.** On a `patch` node, `forEach` applies the same
+  contribution to every rendered target. Each iterator must still appear in
+  `metadata.name` (or `metadata.namespace`) so every target is distinct.
+- **Readiness.** `readyWhen` uses `each` exactly as in an RGD, but a
+  not-yet-ready collection does not hold back dependent nodes. See
+  [Readiness](./02-readiness.md#dependencies-and-readiness).
+
+```kro
+nodes:
+  - id: namespaces
+    ref:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        selector:
+          matchLabels:
+            policy: enforced
+
+  - id: policies
+    forEach:
+      - ns: ${namespaces}
+    template:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: default-deny
+        namespace: ${ns.metadata.name}
+      spec:
+        podSelector: {}
+        policyTypes: [Ingress, Egress]
+```
+
 ## Next Steps
 
-- **[External References](./05-external-references.md)** - Reference existing
+- **[External References](./04-external-references.md)** - Reference existing
   resources not managed by kro
-- **[CEL Expressions](../03-cel-expressions.md)** - Learn about CEL functions
+- **[CEL Expressions](../expressions/01-cel-expressions.md)** - Learn about CEL functions
   like `lists.range()`, `filter()`, and `map()`
-- **[Dependencies & Ordering](../04-dependencies-ordering.md)** - Understand
+- **[Dependencies & Ordering](../expressions/03-dependencies-ordering.md)** - Understand
   how collections affect the dependency graph
+- **[Graph Nodes](../graph/02-nodes.md)** - The `ref`, `def`, and `patch` node
+  kinds used with collections in a Graph
