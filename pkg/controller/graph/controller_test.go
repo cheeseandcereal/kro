@@ -53,6 +53,7 @@ type fakeExecutor struct {
 	applyResult  executor.ApplyResult
 	deleteErr    error
 	deleteCalls  [][]expv1alpha1.ManagedResource // captures every Delete invocation in order
+	deleteOwners []types.UID                     // captures the ownerUID passed to each Delete, in order
 	releaseErr   error
 	releaseCalls [][]executor.Contribution // captures every Release invocation in order
 }
@@ -60,8 +61,9 @@ type fakeExecutor struct {
 func (f *fakeExecutor) Apply(context.Context, *krotruntime.Runtime, watchrouter.Watcher) (executor.ApplyResult, error) {
 	return f.applyResult, f.applyErr
 }
-func (f *fakeExecutor) Delete(_ context.Context, resources []expv1alpha1.ManagedResource) error {
+func (f *fakeExecutor) Delete(_ context.Context, ownerUID types.UID, resources []expv1alpha1.ManagedResource) error {
 	f.deleteCalls = append(f.deleteCalls, resources)
+	f.deleteOwners = append(f.deleteOwners, ownerUID)
 	return f.deleteErr
 }
 func (f *fakeExecutor) Release(_ context.Context, contributions []executor.Contribution) error {

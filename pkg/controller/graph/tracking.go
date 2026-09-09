@@ -116,7 +116,7 @@ func diffManagedResources(
 // UID so post-apply entries dedup against their intent entry. Subgraph nodes are
 // recursed to arbitrary depth, qualifying child NodeIDs with the subgraph prefix
 // exactly as the executor's applySubgraph does so intent and post-apply entries
-// dedup on identity.
+// dedup on identity (and render the kro.run/node-id token Delete verifies).
 func intendedManagedResources(rt *krotruntime.Runtime) []expv1alpha1.ManagedResource {
 	if rt == nil {
 		return nil
@@ -343,8 +343,9 @@ func projectContributions(
 // dedups against its applied counterpart), but on a key collision the surviving
 // entry keeps whichever side's UID is set, and a later UID overrides an earlier
 // one. Every caller passes the UID-free previous/intent set first, so plain
-// first-wins would strand a resource in status with no UID — which Simple.Delete
-// then refuses to delete, leaking it on teardown.
+// first-wins would leave a resource in status with no UID; Simple.Delete can
+// still verify and delete such an entry, but the recorded UID is the stricter
+// precondition, so the inventory must never lose one it has.
 func unionManagedResources(
 	previous []expv1alpha1.ManagedResource,
 	applied []expv1alpha1.ManagedResource,

@@ -524,25 +524,15 @@ func publishScope(rt *runtime.Runtime, n *runtime.Node, objs []*unstructured.Uns
 	rt.Set(n.ID(), objs[0].Object)
 }
 
-// Delete removes resources in reverse of the supplied slice order so
-// dependents go before dependencies. Identity comes from the persisted
-// ManagedResources list — no re-resolve of the current spec, so a
-// Graph whose templates were renamed or whose forEach shrunk between
-// apply and delete still gets every prior resource removed.
-//
-// Legitimate managed resources always carry a UID captured from SSA.
-// Refuse to delete any entry with an empty UID to close the forged/UID-less
-// prune vector where a user-forged status entry could delete arbitrary resources.
-// NotFound and "already deleted by something else" are tolerated.
-func (s *Simple) Delete(ctx context.Context, resources []expv1alpha1.ManagedResource) error {
+// Delete implements Interface.Delete from the persisted ManagedResources list
+// alone (no re-resolve of the current spec), in reverse slice order so
+// dependents go before dependencies. A UID-free entry is resolved against the
+// live object first (verifyUIDFreeEntry). Failures other than the tolerated
+// "nothing to do" cases are aggregated and returned after the whole inventory
+// has been visited, so one denied delete does not strand the remaining entries.
+func (s *Simple) Delete(ctx context.Context, ownerUID types.UID, resources []expv1alpha1.ManagedResource) error {
 	var errs []error
 	for _, r := range slices.Backward(resources) {
-		// Legitimate managed resources always carry a UID captured from SSA.
-		// Refuse to delete any resource without a UID to close the forged/UID-less prune vector.
-		if r.UID == "" {
-			continue
-		}
-
 		obj := &unstructured.Unstructured{}
 		obj.SetAPIVersion(r.APIVersion)
 		obj.SetKind(r.Kind)
@@ -550,22 +540,19 @@ func (s *Simple) Delete(ctx context.Context, resources []expv1alpha1.ManagedReso
 		obj.SetName(r.Name)
 
 		uid := types.UID(r.UID)
-		opts := []client.DeleteOption{
-			&client.DeleteOptions{
-				Preconditions: &metav1.Preconditions{UID: &uid},
-			},
+		if uid == "" {
+			liveUID, owned, err := s.verifyUIDFreeEntry(ctx, ownerUID, r, obj)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("delete %s/%s %s: %w", r.APIVersion, r.Kind, refName(r), err))
+				continue
+			}
+			if !owned {
+				continue
+			}
+			uid = liveUID
 		}
 
-		if err := s.Client.Delete(ctx, obj, opts...); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			// UID-precondition mismatch surfaces as Conflict — the
-			// resource we tracked is gone and a different object now
-			// occupies its identity. Not our problem; skip.
-			if apierrors.IsConflict(err) {
-				continue
-			}
+		if err := s.deletePreconditioned(ctx, obj, uid); err != nil {
 			// Accumulate and keep going: one denied/failed delete (e.g. an
 			// impersonated SA lacking delete RBAC on a single target) must not
 			// strand every remaining managed resource in the inventory. The
@@ -574,6 +561,106 @@ func (s *Simple) Delete(ctx context.Context, resources []expv1alpha1.ManagedReso
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// deletePreconditioned deletes obj preconditioned on uid. NotFound, Conflict
+// (the UID no longer matches: not ours to delete) and a NoMatch that survives a
+// mapper refresh (the type is gone, and its objects with it) return nil.
+func (s *Simple) deletePreconditioned(ctx context.Context, obj *unstructured.Unstructured, uid types.UID) error {
+	opts := []client.DeleteOption{
+		&client.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid},
+		},
+	}
+	err := s.retryOnNoMatch(func() error { return s.Client.Delete(ctx, obj, opts...) })
+	switch {
+	case err == nil, apierrors.IsNotFound(err), apierrors.IsConflict(err):
+		return nil
+	case meta.IsNoMatchError(err):
+		log.FromContext(ctx).V(1).Info("resource type is no longer served; treating managed resource as already deleted",
+			"gvk", obj.GroupVersionKind().String(), "object", client.ObjectKeyFromObject(obj).String())
+		return nil
+	}
+	return err
+}
+
+// retryOnNoMatch runs op once more after meta.MaybeResetRESTMapper when it
+// fails with a NoMatch, so a client with a resettable (deferred discovery)
+// mapper that predates a re-created CRD gets a fresh look instead of a
+// tolerated no-op. controller-runtime's lazy mapper has no Reset and already
+// reloads on the first NoMatch, so for it the retry is a no-op.
+func (s *Simple) retryOnNoMatch(op func() error) error {
+	err := op()
+	if err == nil || !meta.IsNoMatchError(err) {
+		return err
+	}
+	meta.MaybeResetRESTMapper(s.Client.RESTMapper())
+	return op()
+}
+
+// verifyUIDFreeEntry resolves a write-ahead (UID-free) entry against the live
+// object and returns its UID and whether this Graph may delete it
+// (ownedByGraph). An absent object, a type no longer served, an unmarked
+// object, or a Forbidden GET — an identity that cannot read a type cannot have
+// applied it — are "nothing to do" (false, nil); any other GET failure is
+// returned so the caller retries instead of dropping the entry.
+func (s *Simple) verifyUIDFreeEntry(ctx context.Context, ownerUID types.UID, r expv1alpha1.ManagedResource, obj *unstructured.Unstructured) (types.UID, bool, error) {
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(obj.GroupVersionKind())
+	key := client.ObjectKeyFromObject(obj)
+	err := s.retryOnNoMatch(func() error { return s.Client.Get(ctx, key, live) })
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		if meta.IsNoMatchError(err) {
+			log.FromContext(ctx).V(1).Info("resource type is no longer served; treating UID-free managed-resource entry as already deleted",
+				"gvk", obj.GroupVersionKind().String(), "object", key.String())
+			return "", false, nil
+		}
+		if apierrors.IsForbidden(err) {
+			log.FromContext(ctx).Info("skipping UID-free managed-resource entry: identity may not read the live object, so it cannot have applied it",
+				"gvk", obj.GroupVersionKind().String(), "object", key.String(), "node", r.NodeID, "reason", err.Error())
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("get live object for UID-free inventory entry: %w", err)
+	}
+	if !ownedByGraph(live, ownerUID, r.NodeID) {
+		log.FromContext(ctx).Info("skipping UID-free managed-resource entry: live object carries no ownership marker of this Graph",
+			"gvk", obj.GroupVersionKind().String(), "object", key.String(), "node", r.NodeID)
+		return "", false, nil
+	}
+	// The live UID is the delete precondition that closes the check-then-delete race.
+	if live.GetUID() == "" {
+		log.FromContext(ctx).Info("skipping UID-free managed-resource entry: live object has no UID to precondition the delete on",
+			"gvk", obj.GroupVersionKind().String(), "object", key.String(), "node", r.NodeID)
+		return "", false, nil
+	}
+	return live.GetUID(), true, nil
+}
+
+// ownedByGraph reports whether live carries a marker this executor stamps when
+// the Graph ownerUID applies an object: a managedFields entry under the Graph's
+// template field manager (matched on the per-Graph segment so a legacy per-node
+// manager counts; the RGD path never writes one), or — for collection members —
+// the instance-id label equal to ownerUID plus the node-id label equal to the
+// entry's node token (stampKROMeta). An empty ownerUID or nodeID matches nothing.
+func ownedByGraph(live *unstructured.Unstructured, ownerUID types.UID, nodeID string) bool {
+	if live == nil || ownerUID == "" {
+		return false
+	}
+	selfGraph := graphManagerSegment(ownerUID)
+	for _, mf := range live.GetManagedFields() {
+		if seg := templateManagerGraphSegment(mf.Manager); seg != "" && seg == selfGraph {
+			return true
+		}
+	}
+	if nodeID == "" {
+		return false
+	}
+	labels := live.GetLabels()
+	return labels[metadata.InstanceIDLabel] == string(ownerUID) &&
+		labels[metadata.NodeIDLabel] == nodeIDTokenForPath(nodeID)
 }
 
 func refName(r expv1alpha1.ManagedResource) string {
@@ -1153,13 +1240,21 @@ func (s *Simple) qualifiedPath(id string) string {
 // costs debuggability. The selector is built from this same function, so it
 // matches the stamped label by construction.
 func (s *Simple) nodeIDToken(id string) string {
-	dotted := strings.ReplaceAll(s.qualifiedPath(id), "/", ".")
+	return nodeIDTokenForPath(s.qualifiedPath(id))
+}
+
+// nodeIDTokenForPath renders the kro.run/node-id label value for a qualified
+// node path (the '/'-form persisted in ManagedResource.NodeID). Teardown has no
+// executor frame, so ownedByGraph calls this directly; nodeIDToken delegates
+// here so the stamped label and the verified token cannot drift.
+func nodeIDTokenForPath(path string) string {
+	dotted := strings.ReplaceAll(path, "/", ".")
 	if len(dotted) <= validation.LabelValueMaxLength {
 		return dotted
 	}
 	// Fallback: "h-<40 hex>" of the '/'-form. The leading letter keeps the
 	// value a valid label (must start alphanumeric) and marks it as hashed.
-	sum := sha256.Sum256([]byte(s.qualifiedPath(id)))
+	sum := sha256.Sum256([]byte(path))
 	return "h-" + hex.EncodeToString(sum[:20])
 }
 
@@ -2021,6 +2116,13 @@ var ErrFieldManagerConflict = errors.New("executor: field owned by a foreign fie
 // silently reassigning ownership between Graphs.
 func templateFieldManager(parentUID types.UID) string {
 	return templateFieldManagerPrefix + graphManagerSegment(parentUID)
+}
+
+// TemplateFieldManager is the exported derivation of a Graph's template
+// field-manager identity (see templateFieldManager), for tests that stage
+// objects as this Graph would have applied them.
+func TemplateFieldManager(parentUID types.UID) string {
+	return templateFieldManager(parentUID)
 }
 
 // ownedByForeignGraphTemplate reports whether current carries a managedFields

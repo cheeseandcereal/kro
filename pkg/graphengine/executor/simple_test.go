@@ -37,10 +37,14 @@ import (
 	krotruntime "github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/testutil/generator"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/watchrouter"
+	"github.com/kubernetes-sigs/kro/pkg/metadata"
 	testk8s "github.com/kubernetes-sigs/kro/pkg/testutil/k8s"
 )
 
 var configMapGVK = schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+
+// testOwnerUID is the Graph UID handed to Delete in tests.
+const testOwnerUID = types.UID("graph-uid-under-test")
 
 func newScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -359,7 +363,7 @@ func TestSimple_Delete(t *testing.T) {
 			},
 		},
 		{
-			name: "empty UID is skipped and does not delete pre-existing object",
+			name: "empty UID naming an unmarked object is skipped and does not delete it",
 			seed: func(t *testing.T, c client.Client) []expv1alpha1.ManagedResource {
 				cm := &unstructured.Unstructured{}
 				cm.SetGroupVersionKind(configMapGVK)
@@ -376,7 +380,32 @@ func TestSimple_Delete(t *testing.T) {
 				cm.SetGroupVersionKind(configMapGVK)
 				err := c.Get(context.Background(),
 					types.NamespacedName{Namespace: "default", Name: "victim"}, cm)
-				require.NoError(t, err, "victim must not be deleted when UID is empty")
+				require.NoError(t, err, "victim must not be deleted: UID-free entry, live object carries no ownership marker of this Graph")
+			},
+		},
+		{
+			// The fake client strips managedFields, so the collection-label
+			// marker is used here; the template-manager marker is covered by
+			// the envtest-backed TestSimple_Delete_UIDFreeEntries.
+			name: "empty UID naming an object stamped with this Graph's collection labels is deleted",
+			seed: func(t *testing.T, c client.Client) []expv1alpha1.ManagedResource {
+				cm := &unstructured.Unstructured{}
+				cm.SetGroupVersionKind(configMapGVK)
+				cm.SetName("write-ahead-item")
+				cm.SetNamespace("default")
+				cm.SetUID("uid-write-ahead-item") // the fake client assigns none; it is the delete precondition
+				cm.SetLabels(map[string]string{
+					metadata.InstanceIDLabel: string(testOwnerUID),
+					metadata.NodeIDLabel:     nodeIDTokenForPath("sub/items"),
+				})
+				require.NoError(t, c.Create(context.Background(), cm))
+				return []expv1alpha1.ManagedResource{{
+					NodeID: "sub/items", APIVersion: "v1", Kind: "ConfigMap",
+					Namespace: "default", Name: "write-ahead-item", UID: "",
+				}}
+			},
+			after: func(t *testing.T, c client.Client) {
+				assertCMGone(t, c, "write-ahead-item", "default")
 			},
 		},
 		{
@@ -400,7 +429,7 @@ func TestSimple_Delete(t *testing.T) {
 			cl := fake.NewClientBuilder().WithScheme(newScheme(t)).Build()
 			ex := NewSimple(cl)
 			resources := tc.seed(t, cl)
-			err := ex.Delete(context.Background(), resources)
+			err := ex.Delete(context.Background(), testOwnerUID, resources)
 			if tc.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tc.wantErr)
@@ -462,7 +491,7 @@ func TestSimple_PropagatesClientError(t *testing.T) {
 				// Delete no longer needs the runtime; we hand it a
 				// single tracked entry so the underlying Client.Delete
 				// is actually called and surfaces the injected error.
-				return ex.Delete(context.Background(), []expv1alpha1.ManagedResource{{
+				return ex.Delete(context.Background(), testOwnerUID, []expv1alpha1.ManagedResource{{
 					NodeID: "n", APIVersion: "v1", Kind: "ConfigMap",
 					Namespace: "default", Name: "x", UID: "uid-x",
 				}})

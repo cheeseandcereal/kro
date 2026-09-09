@@ -93,7 +93,8 @@ func (r *Reconciler) executorFor(g *expv1alpha1.Graph) (executor.Interface, erro
 
 // appliedIdentity returns the impersonation username the Graph applies under
 // this cycle, or "" when impersonation is inactive (the base controller
-// identity). Recorded in Status.AppliedServiceAccount on a successful apply so
+// identity). Recorded in Status.AppliedServiceAccount whenever an apply reached
+// the cluster — including a hard failure that landed some resources — so
 // teardown can resolve the same identity; empty leaves teardown to fall back to
 // the current spec.
 func (r *Reconciler) appliedIdentity(g *expv1alpha1.Graph) string {

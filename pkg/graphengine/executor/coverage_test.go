@@ -16,10 +16,12 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	memory "k8s.io/client-go/discovery/cached/memory"
@@ -151,33 +153,78 @@ func TestRefName(t *testing.T) {
 	}
 }
 
-// TestDelete_UIDPrecondition exercises the UID-precondition and empty-UID skip:
-// a resource carrying a UID calls Client.Delete with a DeleteOptions UID precondition,
-// while a resource without a UID is skipped without calling Client.Delete.
+// TestDelete_UIDPrecondition pins the UID each Delete call is preconditioned
+// on (the recorded UID, or the LIVE UID for a verified UID-free entry) and the
+// UID-free GET outcomes that produce no Delete call: absent, Forbidden (skipped
+// without error), and a server error (surfaced for retry).
 func TestDelete_UIDPrecondition(t *testing.T) {
 	t.Parallel()
+	liveWithManager := func(manager string) *unstructured.Unstructured {
+		live := obj("cm")
+		live.SetNamespace("default")
+		live.SetUID("live-uid-42")
+		return withManagedFields(live, manager)
+	}
 	cases := []struct {
 		name       string
 		uid        string
+		live       *unstructured.Unstructured // canned live object returned by Get (nil → NotFound)
+		getErr     error                      // when set, Get fails with this error instead
+		wantErr    string
 		wantCalls  int
-		wantPrecon bool
+		wantPrecon string // UID expected in the Delete precondition
 	}{
-		{name: "with UID adds a precondition and calls delete", uid: "abc-123", wantCalls: 1, wantPrecon: true},
-		{name: "without UID skips delete call completely", uid: "", wantCalls: 0, wantPrecon: false},
+		{
+			name:       "with UID adds that UID as precondition and calls delete",
+			uid:        "abc-123",
+			wantCalls:  1,
+			wantPrecon: "abc-123",
+		},
+		{
+			name:       "without UID and live object owned by this Graph deletes with the LIVE uid precondition",
+			uid:        "",
+			live:       liveWithManager(templateFieldManager(testOwnerUID)),
+			wantCalls:  1,
+			wantPrecon: "live-uid-42",
+		},
+		{
+			name:      "without UID and no live object skips delete",
+			uid:       "",
+			live:      nil,
+			wantCalls: 0,
+		},
+		{
+			name:      "without UID and a Forbidden GET skips delete without error",
+			uid:       "",
+			getErr:    apierrors.NewForbidden(schema.GroupResource{Group: "rbac.authorization.k8s.io", Resource: "clusterroles"}, "cm", fmt.Errorf("denied")),
+			wantCalls: 0,
+		},
+		{
+			name:      "without UID and a server-error GET is surfaced for retry",
+			uid:       "",
+			getErr:    apierrors.NewInternalError(fmt.Errorf("etcd unavailable")),
+			wantErr:   "get live object for UID-free inventory entry",
+			wantCalls: 0,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			rec := &recordingDeleteClient{}
+			rec := &recordingDeleteClient{live: tc.live, getErr: tc.getErr}
 			ex := NewSimple(rec)
-			err := ex.Delete(context.Background(), []expv1alpha1.ManagedResource{{
+			err := ex.Delete(context.Background(), testOwnerUID, []expv1alpha1.ManagedResource{{
 				NodeID: "n", APIVersion: "v1", Kind: "ConfigMap",
 				Namespace: "default", Name: "cm", UID: tc.uid,
 			}})
-			require.NoError(t, err)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
 			require.Len(t, rec.opts, tc.wantCalls)
 			if tc.wantCalls > 0 {
-				assert.Equal(t, tc.wantPrecon, rec.hasPrecondition(0))
+				assert.Equal(t, tc.wantPrecon, rec.preconditionUID(0))
 			}
 		})
 	}
@@ -367,11 +414,15 @@ func nodeFromSpec(id string, spec *compiler.Node) *krotruntime.Node {
 	return rt.Node(id)
 }
 
-// recordingDeleteClient captures the DeleteOptions passed to each Delete so
-// the UID-precondition branch can be asserted without an envtest server.
+// recordingDeleteClient captures the DeleteOptions passed to each Delete. Get
+// serves the canned live object (NotFound when nil, or getErr when set) so the
+// UID-free path can be driven with hand-built managedFields, which the fake
+// client would strip.
 type recordingDeleteClient struct {
 	clientStub
-	opts [][]client.DeleteOption
+	live   *unstructured.Unstructured
+	getErr error
+	opts   [][]client.DeleteOption
 }
 
 func (r *recordingDeleteClient) Delete(_ context.Context, _ client.Object, opts ...client.DeleteOption) error {
@@ -379,16 +430,31 @@ func (r *recordingDeleteClient) Delete(_ context.Context, _ client.Object, opts 
 	return nil
 }
 
-// hasPrecondition reports whether the i-th captured Delete carried a UID
-// precondition.
-func (r *recordingDeleteClient) hasPrecondition(i int) bool {
+func (r *recordingDeleteClient) Get(_ context.Context, key client.ObjectKey, out client.Object, _ ...client.GetOption) error {
+	if r.getErr != nil {
+		return r.getErr
+	}
+	if r.live == nil {
+		return apierrors.NewNotFound(schema.GroupResource{Resource: "configmaps"}, key.Name)
+	}
+	u, ok := out.(*unstructured.Unstructured)
+	if !ok {
+		return fmt.Errorf("recordingDeleteClient.Get: want *unstructured.Unstructured, got %T", out)
+	}
+	r.live.DeepCopyInto(u)
+	return nil
+}
+
+// preconditionUID returns the UID carried by the i-th captured Delete's
+// precondition, or "" when it carried none.
+func (r *recordingDeleteClient) preconditionUID(i int) string {
 	for _, o := range r.opts[i] {
 		do, ok := o.(*client.DeleteOptions)
 		if ok && do.Preconditions != nil && do.Preconditions.UID != nil {
-			return true
+			return string(*do.Preconditions.UID)
 		}
 	}
-	return false
+	return ""
 }
 
 // clientStub satisfies client.Client; only Delete is overridden by the

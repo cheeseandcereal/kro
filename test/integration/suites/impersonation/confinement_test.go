@@ -56,8 +56,9 @@ import (
 // TestGraphImpersonationConfinement proves an impersonated ServiceAccount whose
 // RBAC forbids a write cannot apply the Graph's resource. It stands up its OWN
 // envtest (RBAC-enforcing), grants a limited SA read-only access to ConfigMaps,
-// then submits a Graph (as that SA) that tries to CREATE a ConfigMap. The apply
-// must be refused and the ConfigMap must never appear.
+// then submits a Graph (as that SA) that tries to CREATE a ConfigMap and a
+// Secret. The apply must be refused, the ConfigMap must never appear, and the
+// refused Graph must still be deletable under that same identity.
 func TestGraphImpersonationConfinement(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping envtest-backed confinement test in -short mode")
@@ -179,20 +180,32 @@ func TestGraphImpersonationConfinement(t *testing.T) {
 		t.Fatal("cache did not sync")
 	}
 
-	// A Graph naming the read-only SA that tries to CREATE a ConfigMap.
+	// A Graph naming the read-only SA that tries to CREATE a ConfigMap (a type
+	// the SA may read but not write) and a Secret (a type it may not even read).
 	g := &expv1alpha1.Graph{
 		ObjectMeta: metav1.ObjectMeta{Name: "confined", Namespace: ns},
 		Spec: expv1alpha1.GraphSpec{
 			ServiceAccountName: saName,
-			Nodes: []expv1alpha1.Node{{
-				ID: "cm",
-				Template: rawExt(t, map[string]any{
-					"apiVersion": "v1",
-					"kind":       "ConfigMap",
-					"metadata":   map[string]any{"name": "forbidden-cm"},
-					"data":       map[string]any{"hello": "world"},
-				}),
-			}},
+			Nodes: []expv1alpha1.Node{
+				{
+					ID: "cm",
+					Template: rawExt(t, map[string]any{
+						"apiVersion": "v1",
+						"kind":       "ConfigMap",
+						"metadata":   map[string]any{"name": "forbidden-cm"},
+						"data":       map[string]any{"hello": "world"},
+					}),
+				},
+				{
+					ID: "secret",
+					Template: rawExt(t, map[string]any{
+						"apiVersion": "v1",
+						"kind":       "Secret",
+						"metadata":   map[string]any{"name": "forbidden-secret"},
+						"stringData": map[string]any{"hello": "world"},
+					}),
+				},
+			},
 		},
 	}
 	if err := adminClient.Create(ctx, g); err != nil {
@@ -241,6 +254,36 @@ func TestGraphImpersonationConfinement(t *testing.T) {
 	}
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("unexpected error checking ConfigMap absence: %v", err)
+	}
+
+	// Teardown resolves the UID-free write-ahead entries as the SA: NotFound for
+	// the ConfigMap, Forbidden for the Secret. Neither may wedge the finalizer.
+	if err := adminClient.Delete(ctx, g); err != nil {
+		t.Fatalf("delete graph: %v", err)
+	}
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		err := adminClient.Get(ctx, key, &expv1alpha1.Graph{})
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			got := &expv1alpha1.Graph{}
+			_ = adminClient.Get(ctx, key, got)
+			conds := make([]string, 0, len(got.Status.Conditions))
+			for _, c := range got.Status.Conditions {
+				reason, msg := "", ""
+				if c.Reason != nil {
+					reason = *c.Reason
+				}
+				if c.Message != nil {
+					msg = *c.Message
+				}
+				conds = append(conds, string(c.Type)+"="+string(c.Status)+"/"+reason+": "+msg)
+			}
+			t.Fatalf("Graph %s still present 30s after delete (finalizers=%v, conditions=%v)", key, got.Finalizers, conds)
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 
 	mgrCancel()

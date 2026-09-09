@@ -248,7 +248,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, logger logr.Logger, re
 	}
 
 	if len(g.Status.ManagedResources) > 0 {
-		if err := ex.Delete(ctx, g.Status.ManagedResources); err != nil {
+		if err := ex.Delete(ctx, g.GetUID(), g.Status.ManagedResources); err != nil {
 			return teardownFailed(err, "executor delete", "failed to persist teardown delete-failure condition")
 		}
 	}
@@ -374,12 +374,17 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 		marker.ResourcesApplyFailed(applyErr.Error())
 	}
 
-	// Record the identity that applied under, but ONLY when the apply reached
-	// the cluster (clean or soft not-ready) — never on a hard failure, which
-	// must preserve the last-good identity so teardown can still see resources a
-	// prior identity applied. Empty when impersonation is inactive (the base
-	// controller identity), in which case teardown falls back to the spec.
-	reachedCluster := applyErr == nil || errors.Is(applyErr, executor.ErrNotReady)
+	// Record the identity the apply ran under whenever anything reached the
+	// cluster, including a hard failure that still landed some resources or
+	// patch contributions: those entries are persisted below and teardown must
+	// delete them as this identity, not as whatever the spec says later. A hard
+	// failure that applied nothing keeps the last-good identity. Empty when
+	// impersonation is inactive (teardown then falls back to the spec).
+	// Limitation: the scalar cannot represent a mixed-identity inventory (SA
+	// changed mid-life, or an SSA whose response was lost and so is absent from
+	// result.Applied).
+	reachedCluster := applyErr == nil || errors.Is(applyErr, executor.ErrNotReady) ||
+		len(result.Applied) > 0 || len(result.Contributions) > 0
 	if reachedCluster {
 		if user := r.appliedIdentity(g); user != "" {
 			g.Status.AppliedServiceAccount = user
@@ -409,7 +414,7 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	}
 	if !hardErr {
 		if len(pruneCandidates) > 0 {
-			if err := ex.Delete(ctx, pruneCandidates); err != nil {
+			if err := ex.Delete(ctx, g.GetUID(), pruneCandidates); err != nil {
 				// A retired resource could not be deleted (e.g. the impersonated
 				// SA lacks delete RBAC). The Graph has NOT converged; surface it
 				// and keep the union so teardown still sees the un-deleted entry.

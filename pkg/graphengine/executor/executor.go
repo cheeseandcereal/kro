@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/watchrouter"
@@ -176,16 +178,22 @@ type Interface interface {
 	Apply(ctx context.Context, rt *runtime.Runtime, w watchrouter.Watcher) (ApplyResult, error)
 
 	// Delete removes the supplied managed resources from the cluster in
-	// the reverse of the slice's order. UID precondition is applied per
-	// entry so we never remove an impostor that replaced our resource
-	// out of band. NotFound is tolerated. Safe to call repeatedly.
+	// the reverse of the slice's order, on behalf of the Graph ownerUID.
+	// An entry with a recorded UID is deleted preconditioned on it; a
+	// UID-free (write-ahead) entry only if the live object carries
+	// ownerUID's ownership markers (template field manager, or the
+	// instance-id + node-id labels of a collection member), so a status
+	// entry naming another Graph's or a non-kro object never deletes it.
+	// NotFound, a UID mismatch, a type the cluster no longer serves, and a
+	// UID-free object this identity may not read are all "nothing to do".
+	// Safe to call repeatedly.
 	//
 	// Unlike Apply, Delete does not consult the runtime — it operates
 	// purely from the persisted tracking record. This means a Graph
 	// whose spec was edited (template renamed, forEach shrunk, node
 	// removed) can still be deleted cleanly: the record knows what was
 	// applied, regardless of what the current spec would re-derive.
-	Delete(ctx context.Context, resources []expv1alpha1.ManagedResource) error
+	Delete(ctx context.Context, ownerUID types.UID, resources []expv1alpha1.ManagedResource) error
 
 	// Release relinquishes the fields each Contribution's field manager
 	// owns on its target by server-side applying an object that carries
