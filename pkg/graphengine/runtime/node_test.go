@@ -669,6 +669,66 @@ func TestNode_Resolve_CRDTemplateSchemaFromCEL(t *testing.T) {
 		"both authoring styles must render the same CRD")
 }
 
+// TestNode_Resolve_SimpleSchemaToOpenAPI renders a CustomResourceDefinition
+// whose openAPIV3Schema comes from simpleschema.toOpenAPI() applied to a
+// SimpleSchema block (spec, types, status) held in a def node — the graph-native
+// way to define a Kind. The CEL result must land in the rendered object as
+// JSON-safe values, decode into a typed CRD and pass structural validation.
+func TestNode_Resolve_SimpleSchemaToOpenAPI(t *testing.T) {
+	t.Parallel()
+
+	kindSpec := map[string]any{
+		"types": map[string]any{
+			"Owner": map[string]any{"team": "string | required=true"},
+		},
+		"spec": map[string]any{
+			"name":     "string | required=true",
+			"replicas": "integer | default=1 minimum=0",
+			"owner":    "Owner",
+		},
+		"status": map[string]any{
+			"readyReplicas": "integer",
+			// Deferred: the def evaluates to the literal string
+			// "${service.spec.clusterIP}", which the function then sees as an
+			// expression-valued status field.
+			"url": "${'${service.spec.clusterIP}'}",
+		},
+	}
+	for k, v := range kindSpecNames {
+		kindSpec[k] = v
+	}
+
+	g := generator.NewGraph("g",
+		generator.WithDef("kindSpec", kindSpec),
+		generator.WithTemplate("crd", kindCRDTemplate("${simpleschema.toOpenAPI(kindSpec)}")),
+	)
+	crd, _ := renderCRD(t, g)
+	assertKindCRD(t, crd)
+
+	root := crd.Spec.Versions[0].Schema.OpenAPIV3Schema
+	assert.Equal(t, extv1.JSONSchemaProps{
+		Type:     "object",
+		Required: []string{"name"},
+		Properties: map[string]extv1.JSONSchemaProps{
+			"name":     {Type: "string"},
+			"replicas": {Type: "integer", Default: &extv1.JSON{Raw: []byte("1")}, Minimum: new(float64(0))},
+			"owner": {
+				Type:       "object",
+				Required:   []string{"team"},
+				Properties: map[string]extv1.JSONSchemaProps{"team": {Type: "string"}},
+			},
+		},
+	}, root.Properties["spec"])
+	assert.Equal(t, extv1.JSONSchemaProps{
+		Type: "object",
+		Properties: map[string]extv1.JSONSchemaProps{
+			"readyReplicas": {Type: "integer"},
+			// An expression-valued status field cannot be typed by the function.
+			"url": {XPreserveUnknownFields: new(true)},
+		},
+	}, root.Properties["status"])
+}
+
 func TestNode_TolerateDataPending(t *testing.T) {
 	t.Parallel()
 
