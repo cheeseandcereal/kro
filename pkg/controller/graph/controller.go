@@ -208,6 +208,8 @@ func (r *Reconciler) writeAheadIntent(
 	if len(intent) > len(previous) {
 		g.Status.ManagedResources = intent
 		if err := r.persistManagedResources(ctx, g); err != nil {
+			// Keep the rejected candidate out of the subsequent conditions patch.
+			g.Status.ManagedResources = previous
 			return nil, fmt.Errorf("write-ahead managed-resource intent: %w", err)
 		}
 	}
@@ -346,6 +348,7 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	// the inventory from shrinking below the pre-apply superset.
 	intent, err := r.writeAheadIntent(ctx, g, rt, previous, priorContribs)
 	if err != nil {
+		marker.ResourcesWriteAheadFailed(err.Error())
 		return err
 	}
 
@@ -862,6 +865,12 @@ func (m *ConditionsMarker) ResourcesDataPending(msg string) {
 // because nothing was applied and nothing will be until that owner releases it.
 func (m *ConditionsMarker) ResourcesFieldManagerConflict(msg string) {
 	m.cs.SetFalse(ResourcesConverged, "FieldManagerConflict", msg)
+}
+
+// ResourcesWriteAheadFailed marks ResourcesConverged=False with reason
+// "WriteAheadFailed" when pre-apply inventory persistence failed.
+func (m *ConditionsMarker) ResourcesWriteAheadFailed(msg string) {
+	m.cs.SetFalse(ResourcesConverged, "WriteAheadFailed", msg)
 }
 
 // ResourcesApplyFailed marks ResourcesConverged=False with reason
