@@ -18,11 +18,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/testutil/generator"
 )
 
@@ -66,7 +68,7 @@ func TestCartesianProductOverflowRejected(t *testing.T) {
 	for i := range dims {
 		dims[i] = evaluatedDimension{name: "a", values: axis}
 	}
-	rows, err := cartesianProduct(dims, 0)
+	rows, err := cartesianProduct(dims, 0, DefaultMaxCollectionDimensions)
 	require.Error(t, err, "overflow must be rejected even when cap disabled")
 	assert.Contains(t, err.Error(), "overflows")
 	assert.Nil(t, rows)
@@ -84,7 +86,7 @@ func TestCartesianProductDimensionCap(t *testing.T) {
 	for i := range dims10 {
 		dims10[i] = evaluatedDimension{name: fmt.Sprintf("d%d", i), values: []any{1}}
 	}
-	rows, err := cartesianProduct(dims10, 0)
+	rows, err := cartesianProduct(dims10, 0, DefaultMaxCollectionDimensions)
 	require.NoError(t, err)
 	assert.Len(t, rows, 1)
 
@@ -93,9 +95,59 @@ func TestCartesianProductDimensionCap(t *testing.T) {
 	for i := range dims11 {
 		dims11[i] = evaluatedDimension{name: fmt.Sprintf("d%d", i), values: []any{1}}
 	}
-	_, err = cartesianProduct(dims11, 0)
+	_, err = cartesianProduct(dims11, 0, DefaultMaxCollectionDimensions)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), fmt.Sprintf("collection has %d forEach dimensions, exceeds the maximum of %d", len(dims11), DefaultMaxCollectionDimensions))
+}
+
+func TestNodeResolveCollectionDimensions(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		axes    int
+		opts    []Option
+		wantMax int
+	}{
+		{name: "default allows ten", axes: 10},
+		{name: "configured allows eleven", axes: 11, opts: []Option{WithMaxCollectionDimensions(11)}},
+		{name: "default still rejects eleven", axes: 11, wantMax: 10},
+		{name: "configured rejects twelve", axes: 12, opts: []Option{WithMaxCollectionDimensions(11)}, wantMax: 11},
+		{name: "lower limit rejects three", axes: 3, opts: []Option{WithMaxCollectionDimensions(2)}, wantMax: 2},
+		{name: "lower limit allows two", axes: 2, opts: []Option{WithMaxCollectionDimensions(2)}},
+		{name: "zero retains default", axes: 11, opts: []Option{WithMaxCollectionDimensions(0)}, wantMax: 10},
+		{name: "negative retains default", axes: 11, opts: []Option{WithMaxCollectionDimensions(-1)}, wantMax: 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			axes := make([]expv1alpha1.ForEachDimension, tc.axes)
+			name := "dims"
+			for i := range axes {
+				iterator := fmt.Sprintf("d%d", i)
+				axes[i] = generator.ForEachDim(iterator, `${["x"]}`)
+				name += "-${" + iterator + "}"
+			}
+			g := generator.NewGraph("g", generator.WithTemplate("cm", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": name},
+			}, axes...))
+			prog := compileGraph(t, g)
+			rt := New(prog, g, tc.opts...)
+			// Keep both runtimes on the same Program before resolving either.
+			defaultRT := New(prog, g)
+			objects, err := rt.Node("cm").Resolve()
+			if tc.wantMax > 0 {
+				require.EqualError(t, err, fmt.Sprintf(
+					`node "cm": collection has %d forEach dimensions, exceeds the maximum of %d`, tc.axes, tc.wantMax))
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, objects, 1)
+			assert.Equal(t, "dims"+strings.Repeat("-x", tc.axes), objects[0].GetName())
+			if tc.axes > DefaultMaxCollectionDimensions {
+				_, err := defaultRT.Node("cm").Resolve()
+				require.EqualError(t, err, fmt.Sprintf(
+					`node "cm": collection has %d forEach dimensions, exceeds the maximum of %d`, tc.axes, DefaultMaxCollectionDimensions))
+			}
+		})
+	}
 }
 
 // TestCartesianProductHonoursCap regression-pins the post-multiply cap
@@ -105,7 +157,7 @@ func TestCartesianProductHonoursCap(t *testing.T) {
 		{name: "a", values: []any{1, 2, 3}},
 		{name: "b", values: []any{1, 2, 3}},
 	}
-	_, err := cartesianProduct(dims, 5)
+	_, err := cartesianProduct(dims, 5, DefaultMaxCollectionDimensions)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds")
 }

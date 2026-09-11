@@ -268,7 +268,7 @@ func TestCartesianProduct_EmptyDimensions(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := cartesianProduct(tc.dims, DefaultMaxCollectionSize)
+			got, err := cartesianProduct(tc.dims, DefaultMaxCollectionSize, DefaultMaxCollectionDimensions)
 			assert.NoError(t, err)
 			if tc.wantNil {
 				assert.Nil(t, got)
