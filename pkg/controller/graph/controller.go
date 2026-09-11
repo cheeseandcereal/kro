@@ -489,6 +489,7 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 		}
 	}
 	if err := r.persistContributions(ctx, g, result.Contributions); err != nil {
+		marker.ResourcesInventoryPersistFailed(fmt.Sprintf("persist contributions: %v", err))
 		return err
 	}
 	return nil
@@ -889,6 +890,12 @@ func (m *ConditionsMarker) ResourcesPruneFailed(msg string) {
 // while a stale contributed field remains.
 func (m *ConditionsMarker) ResourcesReleaseFailed(msg string) {
 	m.cs.SetFalse(ResourcesConverged, "ReleaseFailed", msg)
+}
+
+// ResourcesInventoryPersistFailed marks ResourcesConverged=False with reason
+// "StatusWriteFailed" when contribution persistence fails after a clean apply.
+func (m *ConditionsMarker) ResourcesInventoryPersistFailed(msg string) {
+	m.cs.SetFalse(ResourcesConverged, "StatusWriteFailed", msg)
 }
 
 // ResourcesDeleteFailed marks ResourcesConverged=False with reason
