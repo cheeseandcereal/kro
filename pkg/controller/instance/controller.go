@@ -43,6 +43,7 @@ import (
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/executor"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/registry"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/rgdadapter"
+	geruntime "github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
 	"github.com/kubernetes-sigs/kro/pkg/metadata"
 	"github.com/kubernetes-sigs/kro/pkg/metrics"
 	"github.com/kubernetes-sigs/kro/pkg/requeue"
@@ -310,7 +311,7 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (err error
 	}
 
 	//--------------------------------------------------------------
-	// 2b. Honor the reconcile-suspended annotation before touching the engine:
+	// 2b. Honor the reconcile-suspended annotation before reconciling nodes:
 	//     mark ResourcesReady=False/ReconciliationSuspended and persist status
 	//     without reconciling any nodes.
 	//--------------------------------------------------------------
@@ -329,7 +330,8 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (err error
 // built-in conditions report InstanceManaged=True, GraphResolved=True and
 // ResourcesReady=False with reason "ReconciliationSuspended", and no nodes are
 // applied or pruned. Status is persisted so the Reconcile defer emits the
-// condition-transition events/metrics.
+// condition-transition events/metrics. Resolvable author conditions are
+// reprojected at the current generation without adding a built-in entry.
 func (c *Controller) reconcileSuspended(ctx context.Context, inst *unstructured.Unstructured) error {
 	// Keep the instance managed even while suspended so deletion still works.
 	patched, err := c.stampInstanceMetadata(ctx, inst)
@@ -347,16 +349,54 @@ func (c *Controller) reconcileSuspended(ctx context.Context, inst *unstructured.
 	mark.GraphResolved()
 	mark.ReconciliationSuspended("reconciliation suspended via %s annotation", v1alpha1.InstanceReconcileAnnotation)
 
-	// No nodes are reconciled, so the instance-level state is Active (there is
-	// nothing to mark not-ready beyond the suspend condition). Author conditions
-	// are carried forward from the wire since they cannot be re-evaluated while
-	// suspended.
-	ri := c.client.Dynamic().Resource(c.gvr)
-	var instanceClient dynamic.ResourceInterface = ri
-	if c.namespaced {
-		instanceClient = ri.Namespace(inst.GetNamespace())
+	if !c.reconcileConfig.HasAuthorConditions {
+		return c.persistNodeFreeStatus(ctx, c.instanceClient(inst), inst, wireStatus, v1alpha1.InstanceStateActive)
 	}
-	return c.persistNodeFreeStatus(ctx, instanceClient, inst, wireStatus, v1alpha1.InstanceStateActive)
+
+	log := c.log.WithValues("namespace", inst.GetNamespace(), "name", inst.GetName(), "path", "suspended")
+	status := map[string]any{}
+	maps.Copy(status, wireStatus)
+	status["state"] = string(v1alpha1.InstanceStateActive)
+	if status["conditions"] == nil {
+		status["conditions"] = []any{}
+	}
+
+	// Only the latest issued revision may supply current conditions. If it
+	// cannot provide a runtime, preserve the previous author list verbatim.
+	latest, ok := c.graphResolver.GetLatestRevision()
+	if !ok || latest.State != revisions.RevisionStateActive || latest.RGDSpec == nil || c.graphEngineCompiler == nil {
+		log.V(1).Info("latest active revision or compiler unavailable; preserving suspended author conditions")
+	} else {
+		rgd := &v1alpha1.ResourceGraphDefinition{
+			ObjectMeta: metav1.ObjectMeta{Name: latest.OwnerKey},
+			Spec:       *latest.RGDSpec,
+		}
+		var rtOpts []geruntime.Option
+		if c.reconcileConfig.MaxCollectionSize > 0 {
+			rtOpts = append(rtOpts, geruntime.WithMaxCollectionSize(c.reconcileConfig.MaxCollectionSize))
+		}
+		rt, _, err := rgdadapter.BuildRuntimeForInstanceCached(rgd, inst, c.graphEngineCompiler, c.programCache, rtOpts...)
+		if err != nil {
+			log.V(1).Info("cannot build runtime; preserving suspended author conditions", "error", err)
+		} else {
+			authored, incomplete, condErr := rgdadapter.ProjectInstanceConditions(rt, rgd, builtinConditions(inst), c.reconcileConfig.CELCostLimit)
+			prev, _ := wireStatus["conditions"].([]any)
+			previous := decodeConditions(prev)
+			stamped := stampAuthorConditions(authored, previous, inst.GetGeneration())
+			// No resources are observed while suspended. Keep missing outputs
+			// under the same incomplete-projection rules as normal reconciliation.
+			if incomplete {
+				stamped = mergeWithPrevious(stamped, previous)
+			}
+			status["conditions"] = conditionsToInterfaceSlice(stamped)
+			if condErr != nil {
+				log.Error(condErr, "author conditions degraded while suspended; setting state=Error")
+				status["state"] = string(v1alpha1.InstanceStateError)
+			}
+		}
+	}
+	previousState, _ := wireStatus["state"].(string)
+	return c.persistStatus(ctx, c.instanceClient(inst), inst, wireStatus, status, previousState)
 }
 
 // stampInstanceMetadata stamps the kro finalizer and instance-management labels
