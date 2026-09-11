@@ -166,7 +166,7 @@ func (n *Node) computeIgnored() (bool, error) {
 			}
 			return false, fmt.Errorf("node %q: includeWhen %q: %w", n.spec.ID, expr.UserExpression(), err)
 		}
-		b, ok := v.(bool)
+		b, ok := conditionResult(v)
 		if !ok {
 			return false, fmt.Errorf("node %q: includeWhen %q returned %T, want bool", n.spec.ID, expr.UserExpression(), v)
 		}
@@ -176,6 +176,16 @@ func (n *Node) computeIgnored() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// conditionResult interprets a successfully evaluated predicate. Empty optionals
+// (nil or Omit) and CEL null are false; other nonboolean values remain invalid.
+func conditionResult(v any) (bool, bool) {
+	if v == nil || sentinels.IsOmit(v) {
+		return false, true
+	}
+	b, ok := v.(bool)
+	return b, ok
 }
 
 // CheckReadiness evaluates readyWhen against the node's observed state.
@@ -227,7 +237,7 @@ func (n *Node) CheckReadiness() error {
 			}
 			return fmt.Errorf("node %q: readyWhen %q: %w", n.spec.ID, expr.UserExpression(), err)
 		}
-		b, ok := v.(bool)
+		b, ok := conditionResult(v)
 		if !ok {
 			return fmt.Errorf("node %q: readyWhen %q returned %T, want bool", n.spec.ID, expr.UserExpression(), v)
 		}
@@ -276,7 +286,7 @@ func (n *Node) checkCollectionReadiness() error {
 				}
 				return fmt.Errorf("node %q: readyWhen %q (item %d): %w", n.spec.ID, expr.UserExpression(), i, err)
 			}
-			b, ok := v.(bool)
+			b, ok := conditionResult(v)
 			if !ok {
 				return fmt.Errorf("node %q: readyWhen %q (item %d) returned %T, want bool", n.spec.ID, expr.UserExpression(), i, v)
 			}
