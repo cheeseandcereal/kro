@@ -36,7 +36,7 @@ The `id` is the handle other nodes use in CEL expressions. It must:
 - Be unique within the Graph. The API server enforces this.
 - Not be a reserved word. The following are reserved and rejected when the
   Graph is compiled: `apiVersion`, `kind`, `metadata`, `namespace`, `spec`,
-  `status`, `graph`, `graphengine`, `kro`, `each`, `item`, `items`, `object`,
+  `status`, `graph`, `kro`, `each`, `item`, `items`, `object`,
   `self`, `this`, `context`, and every CEL keyword (`true`, `false`, `null`,
   `in`, `as`, `break`, `const`, `continue`, `else`, `for`, `function`, `if`,
   `import`, `let`, `loop`, `package`, `return`, `var`, `void`, `while`).

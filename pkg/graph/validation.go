@@ -69,7 +69,6 @@ var (
 		"externalRefs",
 		"externalReferences",
 		"graph",
-		"graphengine",
 		"instance",
 		"item",
 		"items",

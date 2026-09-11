@@ -45,7 +45,7 @@ var (
 		// Kubernetes manifest top-level fields and common subsections.
 		"apiVersion", "kind", "metadata", "namespace", "spec", "status",
 		// Project namespace.
-		"graph", "graphengine", "kro",
+		"graph", "kro",
 		// CEL / runtime identifiers we wire in.
 		"each", "item", "items", "object", "self", "this", "context",
 	).Union(celReservedSymbols)

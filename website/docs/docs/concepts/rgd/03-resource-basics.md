@@ -58,7 +58,7 @@ Resource IDs must be in **lowerCamelCase** format because they're used as identi
 A few identifiers are reserved and cannot be used as IDs: `apiVersion`,
 `context`, `dependency`, `dependencies`, `each`, `externalRef`,
 `externalReference`, `externalRefs`, `externalReferences`, `graph`,
-`graphengine`, `instance`, `item`, `items`, `kind`, `kro`, `metadata`,
+`instance`, `item`, `items`, `kind`, `kro`, `metadata`,
 `namespace`, `object`, `resource`, `resourcegraphdefinition`,
 `resourceGraphDefinition`, `resources`, `root`, `runtime`, `schema`, `self`,
 `serviceAccountName`, `spec`, `status`, `this`, `variables`, `vars`,
