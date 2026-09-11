@@ -16,17 +16,25 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/compiler"
@@ -126,6 +134,122 @@ func TestReconcile_WriteAheadIntentPersistedBeforeApply(t *testing.T) {
 	assert.Equal(t, "Widget", mr.Kind)
 	assert.Equal(t, "w", mr.Name)
 	assert.Equal(t, "widget", mr.NodeID)
+}
+
+func TestReconcile_WriteAheadRejectedStillPublishesConditions(t *testing.T) {
+	t.Parallel()
+	for _, rejectedField := range []string{"managedResources", "contributions"} {
+		for _, previouslyHealthy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/previouslyHealthy=%t", rejectedField, previouslyHealthy), func(t *testing.T) {
+				t.Parallel()
+				ctx := context.Background()
+				g := graph("g", withFinalizer)
+				g.UID = "graph-uid"
+				g.Spec.Nodes = []expv1alpha1.Node{
+					{ID: "child", Template: &runtime.RawExtension{Raw: []byte(
+						`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"child","namespace":"default"}}`)}},
+					{ID: "patch", Patch: &runtime.RawExtension{Raw: []byte(
+						`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"target","namespace":"default"},"data":{"k":"v"}}`)}},
+				}
+				if previouslyHealthy {
+					g.Status.ManagedResources = []expv1alpha1.ManagedResource{{
+						NodeID: "previous", APIVersion: "v1", Kind: "ConfigMap",
+						Namespace: "default", Name: "previous-child", UID: "previous-uid",
+					}}
+					g.Status.Contributions = []expv1alpha1.Contribution{{
+						APIVersion: "v1", Kind: "ConfigMap", Namespace: "default", Name: "previous-target",
+						FieldManager: executor.PatchFieldManager(g.UID, "previousPatch"),
+					}}
+					marker := NewConditionsMarkerFor(g)
+					marker.GraphCompiled(2)
+					marker.ResourcesConverged()
+				}
+				g.Generation++
+
+				wantManaged := slices.Clone(g.Status.ManagedResources)
+				wantWrites := [][]string{{"managedResources"}, {"conditions"}}
+				if rejectedField == "contributions" {
+					// Managed intent succeeds first and must survive the later refusal.
+					wantManaged = append(wantManaged, expv1alpha1.ManagedResource{
+						NodeID: "child", APIVersion: "v1", Kind: "ConfigMap", Namespace: "default", Name: "child",
+					})
+					wantWrites = [][]string{{"managedResources"}, {"contributions"}, {"conditions"}}
+				}
+				refusal := apierrors.NewInvalid(schema.GroupKind{Group: "kro.run", Kind: "Graph"}, g.Name,
+					field.ErrorList{field.Forbidden(field.NewPath("status", rejectedField), "inventory write rejected")})
+				var writes [][]string
+				rejections := 0
+				scheme := runtime.NewScheme()
+				require.NoError(t, expv1alpha1.AddToScheme(scheme))
+				cl := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(g).WithObjects(g).
+					WithInterceptorFuncs(interceptor.Funcs{
+						SubResourcePatch: func(ctx context.Context, c client.Client, subresource string,
+							obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption,
+						) error {
+							require.Equal(t, "status", subresource)
+							data, err := patch.Data(obj)
+							require.NoError(t, err)
+							var body struct {
+								Status map[string]json.RawMessage `json:"status"`
+							}
+							require.NoError(t, json.Unmarshal(data, &body))
+							fields := make([]string, 0, len(body.Status))
+							for name := range body.Status {
+								fields = append(fields, name)
+							}
+							slices.Sort(fields)
+							writes = append(writes, fields)
+							// Reject the changed field, even when bundled with conditions.
+							if _, rejected := body.Status[rejectedField]; rejected {
+								rejections++
+								return refusal
+							}
+							return c.SubResource(subresource).Patch(ctx, obj, patch, opts...)
+						},
+					}).Build()
+				prog := templateProgram("child", "v1", "ConfigMap", "default", "child")
+				prog.Nodes["patch"] = patchProgram("patch", "v1", "ConfigMap", "default", "target").Nodes["patch"]
+				prog.TopologicalOrder = append(prog.TopologicalOrder, "patch")
+				exec := &fakeExecutor{}
+				r := &Reconciler{Client: cl, Compiler: &fakeCompiler{program: prog}, Registry: registry.New(), Executor: exec}
+				key := client.ObjectKeyFromObject(g)
+
+				result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				require.ErrorIs(t, err, refusal)
+				assert.Contains(t, err.Error(), "write-ahead")
+				assert.Equal(t, ctrl.Result{}, result)
+				assert.Zero(t, exec.applyCalls, "inventory refusal must precede every resource apply")
+				assert.Empty(t, exec.deleteCalls)
+				assert.Empty(t, exec.releaseCalls)
+				assert.Equal(t, 1, rejections, "the rejected candidate must not accompany the conditions patch")
+				assert.Equal(t, wantWrites, writes)
+
+				stored := &expv1alpha1.Graph{}
+				require.NoError(t, cl.Get(ctx, key, stored))
+				assert.Equal(t, wantManaged, stored.Status.ManagedResources)
+				assert.Equal(t, g.Status.Contributions, stored.Status.Contributions)
+				for _, want := range []struct {
+					typeName string
+					status   metav1.ConditionStatus
+					reason   string
+				}{
+					{GraphAccepted, metav1.ConditionTrue, "Compiled"},
+					{ResourcesConverged, metav1.ConditionFalse, "WriteAheadFailed"},
+					{Ready, metav1.ConditionFalse, "WriteAheadFailed"},
+				} {
+					condition := findCondition(stored.Status.Conditions, want.typeName)
+					if assert.NotNil(t, condition, "stored %s", want.typeName) {
+						assert.Equal(t, want.status, condition.Status, want.typeName)
+						assert.Equal(t, new(want.reason), condition.Reason, want.typeName)
+						assert.Equal(t, g.Generation, condition.ObservedGeneration, want.typeName)
+						if want.status == metav1.ConditionFalse && assert.NotNil(t, condition.Message) {
+							assert.Contains(t, *condition.Message, refusal.Error(), want.typeName)
+						}
+					}
+				}
+			})
+		}
+	}
 }
 
 // TestIntendedManagedResources_ProjectsTemplateIdentities is a focused unit
