@@ -334,11 +334,8 @@ func (c *Controller) reconcileSuspended(ctx context.Context, inst *unstructured.
 	// Keep the instance managed even while suspended so deletion still works.
 	patched, err := c.stampInstanceMetadata(ctx, inst)
 	if err != nil {
-		NewConditionsMarkerFor(inst).InstanceNotManaged("%v", err)
-		if updateErr := c.updateConditionsStatus(ctx, inst); updateErr != nil {
-			c.log.V(1).Info("failed to update suspended instance conditions status",
-				"namespace", inst.GetNamespace(), "name", inst.GetName(), "error", updateErr)
-		}
+		log := c.log.WithValues("namespace", inst.GetNamespace(), "name", inst.GetName())
+		c.persistInstanceNotManaged(ctx, log, inst, err, "failed to update suspended instance conditions status")
 		return err
 	}
 	if patched != nil {
@@ -362,6 +359,14 @@ func (c *Controller) reconcileSuspended(ctx context.Context, inst *unstructured.
 		instanceClient = ri.Namespace(inst.GetNamespace())
 	}
 	return c.persistNodeFreeStatus(ctx, instanceClient, inst, wireStatus, v1alpha1.InstanceStateActive)
+}
+
+// persistInstanceNotManaged best-effort records a metadata stamping failure.
+func (c *Controller) persistInstanceNotManaged(ctx context.Context, log logr.Logger, inst *unstructured.Unstructured, err error, logMessage string) {
+	NewConditionsMarkerFor(inst).InstanceNotManaged("%v", err)
+	if updateErr := c.updateConditionsStatus(ctx, inst); updateErr != nil {
+		log.V(1).Info(logMessage, "error", updateErr)
+	}
 }
 
 // stampInstanceMetadata stamps the kro finalizer and instance-management labels
