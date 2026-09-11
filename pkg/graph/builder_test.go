@@ -282,6 +282,31 @@ func TestGraphBuilder_Validation(t *testing.T) {
 		errMsg                      string
 	}{
 		{
+			name: "graphengine resource reference",
+			resourceGraphDefinitionOpts: []generator.ResourceGraphDefinitionOption{
+				generator.WithSchema("Test", "v1alpha1", map[string]any{}, nil),
+				generator.WithResource("graphengine", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "ge-cm"},
+				}, nil, nil),
+				generator.WithResource("dependent", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "ge-cm-dep"},
+					"data":     map[string]any{"source": "${graphengine.metadata.name}"},
+				}, nil, nil),
+			},
+		},
+		{
+			name: "graphengine iterator binding",
+			resourceGraphDefinitionOpts: []generator.ResourceGraphDefinitionOption{
+				generator.WithSchema("Test", "v1alpha1", map[string]any{}, nil),
+				generator.WithResourceCollection("copies", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "${'ge-cm-' + graphengine}"},
+				}, []krov1alpha1.ForEachDimension{{"graphengine": "${['a', 'b']}"}}, nil, nil),
+			},
+		},
+		{
 			name: "invalid status",
 			resourceGraphDefinitionOpts: []generator.ResourceGraphDefinitionOption{
 				generator.WithSchema(
