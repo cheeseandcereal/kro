@@ -26,10 +26,13 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	krov1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	ctrlinstance "github.com/kubernetes-sigs/kro/pkg/controller/instance"
+	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/pkg/testutil/generator"
+	"github.com/kubernetes-sigs/kro/test/integration/environment"
 )
 
 func findInstanceConditionByType(inst *unstructured.Unstructured, condType string) map[string]any {
@@ -718,6 +721,139 @@ var _ = Describe("Instance Custom Conditions", func() {
 				"leftover author condition must be removed from the wire")
 			g.Expect(findInstanceConditionByType(instance, ctrlinstance.Ready)).ToNot(BeNil(),
 				"kro's built-in conditions must return")
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+	})
+})
+
+var _ = Describe("Suspended author conditions", Serial, func() {
+	It("reprojects author conditions while suspended with default feature gates", func(ctx SpecContext) {
+		// The shared suite enables alpha gates. Use a cold, isolated environment
+		// to exercise the default RGD path without changing the suite's wiring.
+		featuregatetesting.SetFeatureGateDuringTest(GinkgoT(), features.FeatureGate, features.GraphKind, false)
+		featuregatetesting.SetFeatureGateDuringTest(GinkgoT(), features.FeatureGate, features.CELOmitFunction, false)
+		testEnv, err := environment.New(ctx, environment.ControllerConfig{
+			AllowCRDDeletion: true,
+			ReconcileConfig:  ctrlinstance.ReconcileConfig{DefaultRequeueDuration: time.Second},
+			LogWriter:        GinkgoWriter,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { Expect(stopEnvironmentWithRetry(testEnv)).To(Succeed()) })
+		Expect(testEnv.Router).To(BeNil(), "GraphKind is disabled in this environment")
+		Expect(testEnv.SchemaWatcher).To(BeNil())
+
+		namespace := "suspended-author-conditions"
+		Expect(testEnv.Client.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+		rgd := generator.NewResourceGraphDefinition("suspended-author-conditions",
+			generator.WithSchema("SuspendedAuthorConditions", "v1alpha1",
+				map[string]any{"healthy": "boolean", "value": "string"},
+				map[string]any{
+					"value": "${configmap.data.value}",
+					"conditions": []any{
+						`${runtime.newCondition({type: 'AppReady', status: schema.spec.healthy ? 'True' : 'False', reason: 'CheckedSpec'})}`,
+						`${runtime.newCondition({type: 'CmReady', status: configmap.data.value == schema.spec.value ? 'True' : 'False', reason: 'FromConfigMap'})}`,
+						`${runtime.newCondition({type: 'Paused', status: runtime.condition(schema, 'ResourcesReady').reason == 'ReconciliationSuspended' ? 'True' : 'False', reason: runtime.condition(schema, 'ResourcesReady').reason})}`,
+					},
+				}),
+			generator.WithResource("configmap", map[string]any{
+				"apiVersion": "v1", "kind": "ConfigMap",
+				"metadata": map[string]any{"name": "${schema.metadata.name}"},
+				"data":     map[string]any{"value": "${schema.spec.value}"},
+			}, nil, nil),
+		)
+		Expect(testEnv.Client.Create(ctx, rgd)).To(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(testEnv.Client.Get(ctx, types.NamespacedName{Name: rgd.Name}, rgd)).To(Succeed())
+			g.Expect(rgd.Status.State).To(Equal(krov1alpha1.ResourceGraphDefinitionStateActive))
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		instance := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "kro.run/v1alpha1", "kind": "SuspendedAuthorConditions",
+			"metadata": map[string]any{"name": "demo", "namespace": namespace},
+			"spec":     map[string]any{"healthy": true, "value": "v1"},
+		}}
+		key := types.NamespacedName{Name: "demo", Namespace: namespace}
+		Expect(testEnv.Client.Create(ctx, instance)).To(Succeed())
+		cm := &corev1.ConfigMap{}
+		Eventually(func(g Gomega) {
+			g.Expect(testEnv.Client.Get(ctx, key, instance)).To(Succeed())
+			g.Expect(getConditionTypes(instance)).To(ConsistOf("AppReady", "CmReady", "Paused"))
+			for condType, status := range map[string]string{"AppReady": "True", "CmReady": "True", "Paused": "False"} {
+				condition := findInstanceConditionByType(instance, condType)
+				g.Expect(condition["status"]).To(Equal(status))
+				g.Expect(condition["observedGeneration"]).To(Equal(instance.GetGeneration()))
+			}
+			value, _, _ := unstructured.NestedString(instance.Object, "status", "value")
+			g.Expect(value).To(Equal("v1"))
+			g.Expect(testEnv.Client.Get(ctx, key, cm)).To(Succeed())
+			g.Expect(cm.Data["value"]).To(Equal("v1"))
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+		previousGeneration := instance.GetGeneration()
+		previousCmReady := findInstanceConditionByType(instance, "CmReady")
+		previousCM := cm.DeepCopy()
+
+		By("changing the desired child value and health atomically with suspension")
+		Eventually(func(g Gomega) {
+			g.Expect(testEnv.Client.Get(ctx, key, instance)).To(Succeed())
+			g.Expect(unstructured.SetNestedField(instance.Object, false, "spec", "healthy")).To(Succeed())
+			g.Expect(unstructured.SetNestedField(instance.Object, "v2", "spec", "value")).To(Succeed())
+			annotations := instance.GetAnnotations()
+			annotations[krov1alpha1.InstanceReconcileAnnotation] = krov1alpha1.ReconcileSuspended
+			instance.SetAnnotations(annotations)
+			g.Expect(testEnv.Client.Update(ctx, instance)).To(Succeed())
+		}).WithContext(ctx).WithTimeout(20 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		Eventually(func(g Gomega) {
+			g.Expect(testEnv.Client.Get(ctx, key, instance)).To(Succeed())
+			g.Expect(instance.GetGeneration()).To(BeNumerically(">", previousGeneration))
+			appReady := findInstanceConditionByType(instance, "AppReady")
+			g.Expect(appReady["status"]).To(Equal("False"), "a resolvable author condition must follow the suspended spec change")
+			g.Expect(appReady["observedGeneration"]).To(Equal(instance.GetGeneration()))
+			paused := findInstanceConditionByType(instance, "Paused")
+			g.Expect(paused["status"]).To(Equal("True"))
+			g.Expect(paused["reason"]).To(Equal("ReconciliationSuspended"))
+			g.Expect(paused["observedGeneration"]).To(Equal(instance.GetGeneration()))
+			g.Expect(findInstanceConditionByType(instance, "CmReady")).To(Equal(previousCmReady))
+			g.Expect(getConditionTypes(instance)).To(ConsistOf("AppReady", "CmReady", "Paused"))
+			status, _, _ := unstructured.NestedMap(instance.Object, "status")
+			g.Expect(status["state"]).To(Equal(string(krov1alpha1.InstanceStateActive)))
+			g.Expect(status["value"]).To(Equal("v1"))
+			g.Expect(testEnv.Client.Get(ctx, key, cm)).To(Succeed())
+			g.Expect(cm.Data).To(Equal(previousCM.Data))
+			g.Expect(cm.UID).To(Equal(previousCM.UID))
+			g.Expect(cm.ResourceVersion).To(Equal(previousCM.ResourceVersion))
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
+		suspendedStatus, _, _ := unstructured.NestedMap(instance.Object, "status")
+		suspendedRV := instance.GetResourceVersion()
+		Consistently(func(g Gomega) {
+			g.Expect(testEnv.Client.Get(ctx, key, instance)).To(Succeed())
+			status, _, _ := unstructured.NestedMap(instance.Object, "status")
+			g.Expect(status).To(Equal(suspendedStatus))
+			g.Expect(instance.GetResourceVersion()).To(Equal(suspendedRV))
+			g.Expect(testEnv.Client.Get(ctx, key, cm)).To(Succeed())
+			g.Expect(cm.ResourceVersion).To(Equal(previousCM.ResourceVersion))
+		}).WithContext(ctx).WithTimeout(5 * time.Second).WithPolling(time.Second).Should(Succeed())
+
+		By("resuming and applying the spec change that was held during suspension")
+		Eventually(func(g Gomega) {
+			g.Expect(testEnv.Client.Get(ctx, key, instance)).To(Succeed())
+			annotations := instance.GetAnnotations()
+			delete(annotations, krov1alpha1.InstanceReconcileAnnotation)
+			instance.SetAnnotations(annotations)
+			g.Expect(testEnv.Client.Update(ctx, instance)).To(Succeed())
+		}).WithContext(ctx).WithTimeout(20 * time.Second).WithPolling(time.Second).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(testEnv.Client.Get(ctx, key, instance)).To(Succeed())
+			g.Expect(getConditionTypes(instance)).To(ConsistOf("AppReady", "CmReady", "Paused"))
+			for condType, status := range map[string]string{"AppReady": "False", "CmReady": "True", "Paused": "False"} {
+				condition := findInstanceConditionByType(instance, condType)
+				g.Expect(condition["status"]).To(Equal(status))
+				g.Expect(condition["observedGeneration"]).To(Equal(instance.GetGeneration()))
+			}
+			value, _, _ := unstructured.NestedString(instance.Object, "status", "value")
+			g.Expect(value).To(Equal("v2"))
+			g.Expect(testEnv.Client.Get(ctx, key, cm)).To(Succeed())
+			g.Expect(cm.Data["value"]).To(Equal("v2"))
+			g.Expect(cm.UID).To(Equal(previousCM.UID))
 		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(time.Second).Should(Succeed())
 	})
 })
