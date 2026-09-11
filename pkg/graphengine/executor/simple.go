@@ -530,16 +530,13 @@ func publishScope(rt *runtime.Runtime, n *runtime.Node, objs []*unstructured.Uns
 // Graph whose templates were renamed or whose forEach shrunk between
 // apply and delete still gets every prior resource removed.
 //
-// Legitimate managed resources always carry a UID captured from SSA.
-// Refuse to delete any entry with an empty UID to close the forged/UID-less
-// prune vector where a user-forged status entry could delete arbitrary resources.
-// NotFound and "already deleted by something else" are tolerated.
-func (s *Simple) Delete(ctx context.Context, resources []expv1alpha1.ManagedResource) error {
+// Recorded UIDs are used directly. UID-free write-ahead entries are recovered
+// only from this Graph's template-manager markers, using the live UID as a
+// precondition. NotFound and UID-precondition conflicts are tolerated.
+func (s *Simple) Delete(ctx context.Context, ownerUID types.UID, resources []expv1alpha1.ManagedResource) error {
 	var errs []error
 	for _, r := range slices.Backward(resources) {
-		// Legitimate managed resources always carry a UID captured from SSA.
-		// Refuse to delete any resource without a UID to close the forged/UID-less prune vector.
-		if r.UID == "" {
+		if r.UID == "" && ownerUID == "" {
 			continue
 		}
 
@@ -550,6 +547,27 @@ func (s *Simple) Delete(ctx context.Context, resources []expv1alpha1.ManagedReso
 		obj.SetName(r.Name)
 
 		uid := types.UID(r.UID)
+		if uid == "" {
+			live, err := s.getLive(ctx, obj)
+			if err != nil {
+				if meta.IsNoMatchError(err) || apierrors.IsForbidden(err) {
+					// Preserve non-adoption of unverifiable intent. A denied read
+					// does not establish whether an earlier apply reached the API.
+					log.FromContext(ctx).Info("skipping UID-free entry whose ownership cannot be verified",
+						"kind", r.Kind, "resource", refName(r), "err", err.Error())
+				} else {
+					errs = append(errs, err)
+				}
+				continue
+			}
+			if !ownedByGraph(live, ownerUID) {
+				continue
+			}
+			uid = live.GetUID()
+			if uid == "" {
+				continue
+			}
+		}
 		opts := []client.DeleteOption{
 			&client.DeleteOptions{
 				Preconditions: &metav1.Preconditions{UID: &uid},
@@ -574,6 +592,25 @@ func (s *Simple) Delete(ctx context.Context, resources []expv1alpha1.ManagedReso
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ownedByGraph requires a current or legacy self template marker and lets any
+// peer template marker veto recovery. Labels and patch managers are insufficient.
+func ownedByGraph(current *unstructured.Unstructured, ownerUID types.UID) bool {
+	if current == nil || ownerUID == "" {
+		return false
+	}
+	self := templateFieldManager(ownerUID)
+	if ownedByForeignGraphTemplate(current, self) {
+		return false
+	}
+	selfGraph := templateManagerGraphSegment(self)
+	for _, mf := range current.GetManagedFields() {
+		if templateManagerGraphSegment(mf.Manager) == selfGraph {
+			return true
+		}
+	}
+	return false
 }
 
 func refName(r expv1alpha1.ManagedResource) string {

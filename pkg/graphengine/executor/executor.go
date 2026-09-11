@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/watchrouter"
@@ -180,12 +182,17 @@ type Interface interface {
 	// entry so we never remove an impostor that replaced our resource
 	// out of band. NotFound is tolerated. Safe to call repeatedly.
 	//
-	// Unlike Apply, Delete does not consult the runtime — it operates
-	// purely from the persisted tracking record. This means a Graph
+	// UID-free entries require a nonempty ownerUID and this Graph's template
+	// manager on the live object, with no peer template manager. Recovery uses
+	// the live UID as precondition. NotFound/NoMatch/Forbidden reads skip the
+	// unverifiable entry; other read failures and DELETE Forbidden are errors.
+	//
+	// Unlike Apply, Delete does not consult the runtime — identities come
+	// from the persisted tracking record. This means a Graph
 	// whose spec was edited (template renamed, forEach shrunk, node
-	// removed) can still be deleted cleanly: the record knows what was
-	// applied, regardless of what the current spec would re-derive.
-	Delete(ctx context.Context, resources []expv1alpha1.ManagedResource) error
+	// removed) can still be deleted cleanly: the record preserves prior
+	// identities, regardless of what the current spec would re-derive.
+	Delete(ctx context.Context, ownerUID types.UID, resources []expv1alpha1.ManagedResource) error
 
 	// Release relinquishes the fields each Contribution's field manager
 	// owns on its target by server-side applying an object that carries
