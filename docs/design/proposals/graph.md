@@ -413,6 +413,7 @@ A Graph object exposes three standard conditions managed by the controller:
   - Status `False` with reason `DataPending` when a node's CEL expression references data the cluster has not surfaced yet (e.g. pending status fields).
   - Status `False` with reason `FieldManagerConflict` when a field a node wants to write is owned by another field manager that kro refuses to steal: a main-resource `patch:` contribution whose target field is owned by a human (`kubectl`), another controller, or a peer Graph, or a `template:` object owned by a peer Graph's template manager. Nothing was applied to the contested field; the message names the target and the contending manager. This reason takes precedence over `WaitingForReadiness`/`DataPending` from other nodes. The Graph is requeued with backoff and converges once the other owner releases the field.
   - Status `False` with reason `ApplyFailed` when the executor encounters a hard error applying resources.
+  - Status `False` with reason `WriteAheadFailed` when pre-apply inventory persistence fails. No resources are applied that cycle; the message includes the persistence error.
 - **`Ready`** (`kro.run/v1alpha1` `GraphConditionTypeReady`): Root aggregate condition rolled up from `Accepted` and `ResourcesConverged`.
   - Status `True` when both `Accepted` and `ResourcesConverged` are `True`.
   - Status `False` when either condition is `False`.
@@ -427,6 +428,7 @@ A Graph object exposes three standard conditions managed by the controller:
 | `ResourcesConverged` | False   | `DataPending`        | Waiting for upstream cluster data in scope   |
 | `ResourcesConverged` | False   | `FieldManagerConflict`| A patch/template field is owned by another manager; not applied |
 | `ResourcesConverged` | False   | `ApplyFailed`        | Hard failure during resource apply           |
+| `ResourcesConverged` | False   | `WriteAheadFailed`   | Pre-apply inventory could not be persisted; no resources applied |
 | `Ready`              | True    | `Ready`              | All dependent conditions True (graph ready)  |
 | `Ready`              | False   | _(from dependent)_   | Spec invalid or apply failed                 |
 | `Ready`              | Unknown | _(from dependent)_   | Still reconciling or waiting on readiness    |
