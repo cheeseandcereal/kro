@@ -27,7 +27,7 @@ import (
 // objects per reconcile — a runaway. This cap keeps the expansion bounded.
 const DefaultMaxCollectionSize = 1000
 
-// DefaultMaxCollectionDimensions is the maximum number of forEach axes
+// DefaultMaxCollectionDimensions is the default maximum number of forEach axes
 // a collection node may declare.
 const DefaultMaxCollectionDimensions = 10
 
@@ -125,16 +125,16 @@ type evaluatedDimension struct {
 }
 
 // cartesianProduct computes the cartesian product of multiple axes and
-// caps the total combination count at maxSize. Each output row maps
-// every iterator name to one value from its source list. Any zero-length
-// source short-circuits the whole expansion to empty (the SQL outer-join
-// semantics).
-func cartesianProduct(dims []evaluatedDimension, maxSize int) ([]map[string]any, error) {
+// caps the total combination count at maxSize and the axes at maxDimensions.
+// Each output row maps every iterator name to one value from its source list.
+// Any zero-length source short-circuits the whole expansion to empty (the SQL
+// outer-join semantics).
+func cartesianProduct(dims []evaluatedDimension, maxSize, maxDimensions int) ([]map[string]any, error) {
 	if len(dims) == 0 {
 		return []map[string]any{{}}, nil
 	}
-	if len(dims) > DefaultMaxCollectionDimensions {
-		return nil, fmt.Errorf("collection has %d forEach dimensions, exceeds the maximum of %d", len(dims), DefaultMaxCollectionDimensions)
+	if len(dims) > maxDimensions {
+		return nil, fmt.Errorf("collection has %d forEach dimensions, exceeds the maximum of %d", len(dims), maxDimensions)
 	}
 	total := 1
 	for _, d := range dims {
