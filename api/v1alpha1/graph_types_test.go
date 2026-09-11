@@ -23,9 +23,9 @@ import (
 // +kubebuilder:validation:Pattern marker on GraphSpec.ServiceAccountName in
 // graph_types.go. The pattern is only enforced by the apiserver via the
 // generated CRD OpenAPI schema, so this test guards the regex contract that
-// the marker encodes: a Kubernetes ServiceAccount name is an RFC 1123
-// subdomain (dots allowed), not a bare RFC 1123 label.
-const serviceAccountNamePattern = `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+// the marker encodes: empty selects the default ServiceAccount; nonempty names
+// are RFC 1123 subdomains (dots allowed), not bare RFC 1123 labels.
+const serviceAccountNamePattern = `^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 
 func TestGraphSpec_ServiceAccountNamePattern(t *testing.T) {
 	re := regexp.MustCompile(serviceAccountNamePattern)
@@ -48,7 +48,8 @@ func TestGraphSpec_ServiceAccountNamePattern(t *testing.T) {
 		{name: "trailing dot rejected", value: "invalid.", allowed: false},
 		{name: "double dot rejected", value: "a..b", allowed: false},
 		{name: "leading hyphen rejected", value: "-invalid", allowed: false},
-		{name: "empty rejected", value: "", allowed: false},
+		{name: "empty selects default", value: "", allowed: true},
+		{name: "whitespace rejected", value: " ", allowed: false},
 	}
 
 	for _, tt := range tests {
