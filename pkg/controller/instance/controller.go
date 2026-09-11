@@ -334,6 +334,11 @@ func (c *Controller) reconcileSuspended(ctx context.Context, inst *unstructured.
 	// Keep the instance managed even while suspended so deletion still works.
 	patched, err := c.stampInstanceMetadata(ctx, inst)
 	if err != nil {
+		NewConditionsMarkerFor(inst).InstanceNotManaged("%v", err)
+		if updateErr := c.updateConditionsStatus(ctx, inst); updateErr != nil {
+			c.log.V(1).Info("failed to update suspended instance conditions status",
+				"namespace", inst.GetNamespace(), "name", inst.GetName(), "error", updateErr)
+		}
 		return err
 	}
 	if patched != nil {

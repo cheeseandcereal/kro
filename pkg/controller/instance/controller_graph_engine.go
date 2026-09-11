@@ -133,6 +133,10 @@ func (c *Controller) reconcileViaGraphEngine(
 
 	// Stamp the kro finalizer and management labels on the instance.
 	if patched, err := c.stampInstanceMetadata(ctx, inst); err != nil {
+		NewConditionsMarkerFor(inst).InstanceNotManaged("%v", err)
+		if updateErr := c.updateConditionsStatus(ctx, inst); updateErr != nil {
+			log.V(1).Info("graph-engine: failed to update conditions status", "error", updateErr)
+		}
 		return err
 	} else if patched != nil {
 		inst.Object = patched.Object
