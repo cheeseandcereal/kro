@@ -458,9 +458,10 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	// result.Contributions rather than needing a release to break the wedge.
 
 	if applyErr != nil {
-		// Soft or hard failure — keep the union so a future reconcile can
-		// release contributions we couldn't observe cleanly this cycle.
-		if err := r.persistContributions(ctx, g, UnionContributions(priorContribs, result.Contributions)); err != nil {
+		// Retain the just-written intent as well as observed contributions. An
+		// incomplete apply may omit targets; dropping their rows would rewrite
+		// the ledger twice per reconcile and continuously re-enqueue the Graph.
+		if err := r.persistContributions(ctx, g, UnionContributions(fromAPIContributions(g.Status.Contributions), result.Contributions)); err != nil {
 			return errors.Join(fmt.Errorf("apply: %w", applyErr), err)
 		}
 		if !errors.Is(applyErr, executor.ErrNotReady) {
