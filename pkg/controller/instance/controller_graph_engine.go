@@ -225,7 +225,7 @@ func (c *Controller) reconcileViaGraphEngine(
 		} else {
 			mark.ResourcesDeleting("%v", applyErr)
 		}
-	case errors.Is(applyErr, executor.ErrNotReady) && errors.Is(applyErr, executor.ErrFieldManagerConflict):
+	case isSoftFieldManagerConflict(applyErr):
 		// Soft like any not-ready node, but the message must say the field is
 		// owned by another manager (the instance markers have no dedicated reason).
 		mark.ResourcesNotReady("field manager conflict: %v", applyErr)
@@ -968,6 +968,12 @@ func (c *Controller) persistGraphEngineStatus(
 	}
 
 	return c.persistConditionsAndState(ctx, inst, wireStatus, status, previousState)
+}
+
+// isSoftFieldManagerConflict reports whether err signals both not-ready and a
+// field-manager conflict.
+func isSoftFieldManagerConflict(err error) bool {
+	return errors.Is(err, executor.ErrNotReady) && errors.Is(err, executor.ErrFieldManagerConflict)
 }
 
 // isResourceDeleting reports whether err (an executor apply error) signals a
