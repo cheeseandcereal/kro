@@ -179,6 +179,10 @@ func (c *Controller) reconcileViaGraphEngine(
 			mark.ResourcesNotReady("duplicate resource in graph: %v", preErr)
 			return c.persistRejectedGraphEngineStatus(ctx, inst, wireStatus, rt, rgd, preErr)
 		}
+		mark.ResourcesNotReady("pre-apply inventory failed: %v", preErr)
+		if statusErr := c.persistGraphEngineStatus(ctx, inst, wireStatus, rt, rgd, true); statusErr != nil {
+			log.V(1).Info("graph-engine: failed to persist pre-apply inventory failure status", "error", statusErr)
+		}
 		return preErr
 	}
 
