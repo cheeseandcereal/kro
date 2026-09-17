@@ -143,7 +143,7 @@ ifeq ($(WHAT),integration)
 		./test/integration/suites/...
 else ifeq ($(WHAT),unit)
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_VERSION) --bin-dir $(LOCALBIN) -p path)" \
-		go test -race ./pkg/... -coverprofile unit-cover.out $(filter-out $@,$(MAKECMDGOALS))
+		go test -race ./pkg/... ./test/integration/environment/... -coverprofile unit-cover.out $(filter-out $@,$(MAKECMDGOALS))
 else ifeq ($(WHAT),upgrade)
 	KRO_UPGRADE_FROM_VERSION=$(KRO_UPGRADE_FROM_VERSION) \
 	KRO_UPGRADE_MODE=$(MODE) \
