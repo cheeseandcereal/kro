@@ -30,6 +30,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -47,6 +49,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/apis"
 	ctrlgraph "github.com/kubernetes-sigs/kro/pkg/controller/graph"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/compiler"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/executor"
@@ -249,6 +252,146 @@ func TestGraphImpersonationConfinement(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Log("manager did not stop within 10s")
 	}
+}
+
+// TestGraphPartialApplyTeardownIdentity exercises persisted identity through a
+// partial apply, a spec identity change, another hard failure, and deletion.
+func TestGraphPartialApplyTeardownIdentity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping envtest-backed partial-apply test in -short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	testEnv := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "..", "helm", "crds")},
+		ErrorIfCRDPathMissing: true,
+	}
+	cfg, err := testEnv.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, testEnv.Stop()) })
+	scheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(scheme))
+	require.NoError(t, expv1alpha1.AddToScheme(scheme))
+	admin, err := client.New(cfg, client.Options{Scheme: scheme})
+	require.NoError(t, err)
+
+	const ns = "partial-identity"
+	const childName = "partial-child"
+	const applyingUser = "system:serviceaccount:" + ns + ":deployer"
+	const blindUser = "system:serviceaccount:" + ns + ":blind"
+	create(t, ctx, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+	for _, name := range []string{"deployer", "blind"} {
+		create(t, ctx, admin, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}})
+	}
+	create(t, ctx, admin, &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cm-deployer"},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""}, Resources: []string{"configmaps"},
+			Verbs: []string{"get", "list", "watch", "create", "patch", "update", "delete"},
+		}},
+	})
+	create(t, ctx, admin, &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "cm-deployer"},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "cm-deployer"},
+		Subjects:   []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Namespace: ns, Name: "deployer"}},
+	})
+
+	httpClient, err := rest.HTTPClientFor(cfg)
+	require.NoError(t, err)
+	cmp, err := compiler.NewCompiler(cfg, httpClient)
+	require.NoError(t, err)
+	exec := executor.NewSimple(admin)
+	exec.ConflictDetection = true
+	newClient := func(user string) (client.Client, error) {
+		ic := rest.CopyConfig(cfg)
+		ic.Impersonate = rest.ImpersonationConfig{UserName: user}
+		return client.New(ic, client.Options{Scheme: scheme, Mapper: admin.RESTMapper()})
+	}
+	// Direct reconciles make the spec change and deletion deterministic while
+	// resource requests still use the real executor and RBAC-enforcing API.
+	r := &ctrlgraph.Reconciler{
+		Client: admin, Compiler: cmp, Registry: registry.New(), Executor: exec,
+		Impersonation: ctrlgraph.NewImpersonation(exec, newClient, nil), RequireImpersonation: true,
+	}
+	deployer, err := newClient(applyingUser)
+	require.NoError(t, err)
+	childKey := types.NamespacedName{Namespace: ns, Name: childName}
+	require.Eventually(t, func() bool {
+		return apierrors.IsNotFound(deployer.Get(ctx, childKey, &corev1.ConfigMap{}))
+	}, 10*time.Second, 100*time.Millisecond, "wait for the ConfigMap RBAC grant")
+
+	g := &expv1alpha1.Graph{
+		ObjectMeta: metav1.ObjectMeta{Name: "partial", Namespace: ns},
+		Spec: expv1alpha1.GraphSpec{
+			ServiceAccountName: "deployer",
+			Nodes: []expv1alpha1.Node{
+				{
+					ID: "cm",
+					Template: rawExt(t, map[string]any{
+						"apiVersion": "v1", "kind": "ConfigMap",
+						"metadata": map[string]any{"name": childName},
+						"data":     map[string]any{"hello": "world"},
+					}),
+				},
+				{
+					ID: "denied",
+					Template: rawExt(t, map[string]any{
+						"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+						"metadata": map[string]any{"name": "${cm.metadata.name}"},
+						"rules":    []any{},
+					}),
+				},
+			},
+		},
+	}
+	require.NoError(t, admin.Create(ctx, g))
+	key := client.ObjectKeyFromObject(g)
+	req := ctrl.Request{NamespacedName: key}
+	_, err = r.Reconcile(ctx, req)
+	require.ErrorContains(t, err, `cannot get resource "clusterroles"`)
+	require.ErrorContains(t, err, applyingUser)
+	cm := &corev1.ConfigMap{}
+	require.NoError(t, admin.Get(ctx, childKey, cm))
+	require.NotEmpty(t, cm.UID)
+	observed := expv1alpha1.ManagedResource{
+		NodeID: "cm", APIVersion: "v1", Kind: "ConfigMap", Namespace: ns, Name: childName, UID: string(cm.UID),
+	}
+	checkStatus := func() {
+		t.Helper()
+		require.NoError(t, admin.Get(ctx, key, g))
+		assert.Equal(t, applyingUser, g.Status.AppliedServiceAccount)
+		assert.Contains(t, g.Status.ManagedResources, observed)
+		condition := apis.NewReadyConditions(ctrlgraph.ResourcesConverged).For(g).Get(ctrlgraph.ResourcesConverged)
+		require.NotNil(t, condition)
+		assert.Equal(t, metav1.ConditionFalse, condition.Status)
+		require.NotNil(t, condition.Reason)
+		assert.Equal(t, "ApplyFailed", *condition.Reason)
+		assert.Equal(t, g.Generation, condition.ObservedGeneration)
+	}
+	checkStatus()
+
+	// The new identity cannot observe or delete the child. Its empty hard
+	// failure must retain the earlier identity together with the child's UID.
+	g.Spec.ServiceAccountName = "blind"
+	require.NoError(t, admin.Update(ctx, g))
+	_, err = r.Reconcile(ctx, req)
+	require.ErrorContains(t, err, `cannot get resource "configmaps"`)
+	require.ErrorContains(t, err, blindUser)
+	checkStatus()
+	blind, err := newClient(blindUser)
+	require.NoError(t, err)
+	err = blind.Delete(ctx, cm.DeepCopy())
+	require.True(t, apierrors.IsForbidden(err), "blind DELETE control: %v", err)
+
+	require.NoError(t, admin.Delete(ctx, g))
+	_, err = r.Reconcile(ctx, req)
+	assert.NoError(t, err, "teardown must use the persisted deployer identity")
+	err = admin.Get(ctx, key, g)
+	assert.True(t, apierrors.IsNotFound(err), "Graph finalizer must be released; get=%v status=%+v", err, g.Status)
+	err = admin.Get(ctx, childKey, &corev1.ConfigMap{})
+	assert.True(t, apierrors.IsNotFound(err), "partially applied child must be deleted; get=%v", err)
+	err = admin.Get(ctx, types.NamespacedName{Name: childName}, &rbacv1.ClusterRole{})
+	assert.True(t, apierrors.IsNotFound(err), "denied ClusterRole must never be created; get=%v", err)
 }
 
 func ptr[T any](v T) *T { return &v }
