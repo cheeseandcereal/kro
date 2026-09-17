@@ -406,3 +406,215 @@ func TestReconcile_FailedRevisionDoesNotDelayedRequeue(t *testing.T) {
 	require.NotNil(t, cond.Message)
 	assert.Contains(t, *cond.Message, "latest issued revision 1 failed")
 }
+
+func suspendedAuthorRGDSpec(pendingType string) *v1alpha1.ResourceGraphDefinitionSpec {
+	spec := testRGDSpecWithConfigMap("demo", "")
+	spec.Schema.Spec = apimachineryruntime.RawExtension{Raw: []byte(`{"healthy":"boolean","value":"string"}`)}
+	spec.Schema.Status = apimachineryruntime.RawExtension{Raw: []byte(strings.ReplaceAll(`{"conditions":[
+		"${runtime.newCondition({type: 'AppReady', status: schema.spec.healthy ? 'True' : 'False', reason: 'CheckedSpec'})}",
+		"${runtime.newCondition({type: 'CmReady', status: cm.data.value == 'v1' ? 'True' : 'False', reason: 'FromConfigMap'})}",
+		"${runtime.newCondition({type: 'Paused', status: runtime.condition(schema, 'ResourcesReady').reason == 'ReconciliationSuspended' ? 'True' : 'False', reason: runtime.condition(schema, 'ResourcesReady').reason})}"
+	]}`, "CmReady", pendingType))}
+	spec.Resources[0].Template.Raw = []byte(`{"apiVersion":"v1","kind":"ConfigMap",
+		"metadata":{"name":"demo"},"data":{"value":"${schema.spec.value}"}}`)
+	return spec
+}
+
+func newSuspendedAuthorInstance(t *testing.T, pendingType string) *unstructured.Unstructured {
+	t.Helper()
+	inst := newInstanceObject("demo", "default")
+	inst.SetGeneration(2)
+	metadata.SetInstanceFinalizer(inst)
+	inst.SetLabels(metadata.NewKROMetaLabeler().Labels())
+	inst.SetAnnotations(map[string]string{v1alpha1.InstanceReconcileAnnotation: v1alpha1.ReconcileSuspended})
+	require.NoError(t, unstructured.SetNestedMap(inst.Object, map[string]any{"healthy": false, "value": "v2"}, "spec"))
+	conditions := make([]any, 0, 3)
+	for _, condType := range []string{"AppReady", pendingType, "Paused"} {
+		status := "True"
+		if condType == "Paused" {
+			status = "False"
+		}
+		conditions = append(conditions, map[string]any{
+			"type": condType, "status": status, "reason": "AuthorVerdict", "message": "previous value",
+			"observedGeneration": int64(1), "lastTransitionTime": "2026-01-01T00:00:00Z",
+		})
+	}
+	require.NoError(t, unstructured.SetNestedMap(inst.Object, map[string]any{
+		"conditions": conditions, "state": string(v1alpha1.InstanceStateActive), "value": "v1",
+	}, "status"))
+	return inst
+}
+
+func TestReconcileSuspendedAuthorConditions(t *testing.T) {
+	// Authors can also use a built-in type name for a genuinely pending output.
+	for _, pendingType := range []string{"CmReady", ResourcesReady} {
+		t.Run(pendingType, func(t *testing.T) {
+			inst := newSuspendedAuthorInstance(t, pendingType)
+			raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+			controller, _ := newGraphEngineControllerUnderTest(t, raw, suspendedAuthorRGDSpec(pendingType),
+				revisions.RevisionStateActive, newTestRealCompiler(t), nil)
+			controller.reconcileConfig.HasAuthorConditions = true
+			controller.graphEngineExecutor = nil // Suspension must not enter the executor.
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "demo", Namespace: "default"}}
+
+			require.NoError(t, controller.Reconcile(context.Background(), req))
+			stored := getStoredParentObject(t, raw)
+			appReady := conditionByType(t, stored, "AppReady")
+			assert.Equal(t, metav1.ConditionFalse, appReady.Status, "must follow the current spec while suspended")
+			assert.Equal(t, int64(2), appReady.ObservedGeneration)
+			assert.NotEqual(t, conditionByType(t, inst, "AppReady").LastTransitionTime, appReady.LastTransitionTime)
+			paused := conditionByType(t, stored, "Paused")
+			assert.Equal(t, metav1.ConditionTrue, paused.Status)
+			assert.Equal(t, new("ReconciliationSuspended"), paused.Reason)
+			assert.Equal(t, int64(2), paused.ObservedGeneration)
+			assert.Equal(t, conditionByType(t, inst, pendingType), conditionByType(t, stored, pendingType),
+				"pending outputs retain their value, generation, and transition time")
+			assert.Len(t, conditionsFromInstance(stored), 3, "suspension must not add a built-in entry")
+			status := captureWireStatus(stored)
+			assert.Equal(t, string(v1alpha1.InstanceStateActive), status["state"])
+			assert.Equal(t, "v1", status["value"], "author status fields are carried forward")
+			assert.True(t, metadata.HasInstanceFinalizer(stored))
+			assert.Equal(t, 1, countStatusUpdates(raw.Actions()))
+			for _, action := range raw.Actions() {
+				assert.Equal(t, controllerTestParentGVR, action.GetResource(), "no managed-resource observation or writes")
+			}
+
+			raw.ClearActions()
+			require.NoError(t, controller.Reconcile(context.Background(), req))
+			assert.Equal(t, status, captureWireStatus(getStoredParentObject(t, raw)))
+			for _, action := range raw.Actions() {
+				assert.Equal(t, "get", action.GetVerb(), "an identical suspended status must not be written again")
+			}
+		})
+	}
+}
+
+func TestReconcileSuspendedRuntimeUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		state           revisions.RevisionState
+		olderActive     bool
+		missingSpec     bool
+		missingCompiler bool
+		compileError    bool
+	}{
+		{name: "missing revision"},
+		{name: "latest pending with an older active revision", state: revisions.RevisionStatePending, olderActive: true},
+		{name: "latest failed with an older active revision", state: revisions.RevisionStateFailed, olderActive: true},
+		{name: "missing spec", state: revisions.RevisionStateActive, missingSpec: true},
+		{name: "missing compiler", state: revisions.RevisionStateActive, missingCompiler: true},
+		{name: "compile failure", state: revisions.RevisionStateActive, compileError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := newSuspendedAuthorInstance(t, ResourcesReady)
+			previousStatus := captureWireStatus(inst)
+			raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+			spec := suspendedAuthorRGDSpec(ResourcesReady)
+			if tc.missingSpec {
+				spec = nil
+			}
+			comp := &testStubCompiler{err: errors.New("compiler unavailable")}
+			controller, _ := newGraphEngineControllerUnderTest(t, raw, spec, tc.state, comp, nil)
+			controller.reconcileConfig.HasAuthorConditions = true
+			controller.graphEngineExecutor = nil
+			if tc.missingCompiler {
+				controller.graphEngineCompiler = nil
+			}
+			if tc.olderActive {
+				registry := revisions.NewRegistry()
+				registry.Put(revisions.Entry{OwnerKey: "webapps", Revision: 1, State: revisions.RevisionStateActive, RGDSpec: spec})
+				registry.Put(revisions.Entry{OwnerKey: "webapps", Revision: 2, State: tc.state, RGDSpec: spec})
+				controller.graphResolver = registry.ResolverFor("webapps")
+			}
+
+			require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+			assert.Equal(t, previousStatus, captureWireStatus(getStoredParentObject(t, raw)),
+				"runtime fallback must preserve the entire author list, including authored built-in names")
+			wantCompiles := 0
+			if tc.compileError {
+				wantCompiles = 1
+			}
+			assert.Equal(t, wantCompiles, comp.calls, "only an Active latest-issued revision may be compiled")
+		})
+	}
+}
+
+func TestReconcileSuspendedDegradedAuthorConditions(t *testing.T) {
+	inst := newSuspendedAuthorInstance(t, "CmReady")
+	raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+	spec := testEmptyRGDSpec()
+	spec.Schema.Status = apimachineryruntime.RawExtension{Raw: []byte(`{"conditions":[
+		"${runtime.newCondition({type: 'AppReady', status: 'False'})}",
+		"${runtime.newCondition({type: 'Dup', status: 'True'})}",
+		"${runtime.newCondition({type: 'Dup', status: 'False'})}"
+	]}`)}
+	controller, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, newTestRealCompiler(t), nil)
+	controller.reconcileConfig.HasAuthorConditions = true
+	previous := inst.DeepCopy()
+
+	require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+	stored := getStoredParentObject(t, raw)
+	assert.Equal(t, string(v1alpha1.InstanceStateError), captureWireStatus(stored)["state"])
+	assert.Equal(t, "v1", captureWireStatus(stored)["value"])
+	assert.Len(t, conditionsFromInstance(stored), 3)
+	appReady := conditionByType(t, stored, "AppReady")
+	assert.Equal(t, metav1.ConditionFalse, appReady.Status, "valid output survives another expression's failure")
+	assert.Equal(t, int64(2), appReady.ObservedGeneration)
+	for _, condType := range []string{"CmReady", "Paused"} {
+		assert.Equal(t, conditionByType(t, previous, condType), conditionByType(t, stored, condType))
+	}
+}
+
+func TestReconcileSuspendedAuthorConditionsCostLimit(t *testing.T) {
+	inst := newSuspendedAuthorInstance(t, "CmReady")
+	raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+	spec := testRGDSpecWithAuthorConditions(`${runtime.newCondition({type: 'Expensive',
+		status: [1, 2, 3, 4, 5].map(x, x * x).exists(x, x > 10) ? 'True' : 'False'})}`)
+	controller, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, newTestRealCompiler(t), nil)
+	controller.reconcileConfig.HasAuthorConditions = true
+	controller.reconcileConfig.CELCostLimit = 1
+	previous := conditionsFromInstance(inst)
+
+	require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+	stored := getStoredParentObject(t, raw)
+	assert.Equal(t, string(v1alpha1.InstanceStateError), captureWireStatus(stored)["state"])
+	assert.Equal(t, previous, conditionsFromInstance(stored), "cost-limited projection retains the prior outputs")
+}
+
+func TestReconcileSuspendedEmptyAuthorProjection(t *testing.T) {
+	for _, fresh := range []bool{false, true} {
+		t.Run(map[bool]string{false: "prior author list", true: "no prior status"}[fresh], func(t *testing.T) {
+			inst := newSuspendedAuthorInstance(t, "CmReady")
+			if fresh {
+				delete(inst.Object, "status")
+			}
+			raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+			controller, _ := newGraphEngineControllerUnderTest(t, raw, testRGDSpecWithAuthorConditions("${[]}"),
+				revisions.RevisionStateActive, newTestRealCompiler(t), nil)
+			controller.reconcileConfig.HasAuthorConditions = true
+
+			require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+			status := captureWireStatus(getStoredParentObject(t, raw))
+			assert.Equal(t, []any{}, status["conditions"], "a complete empty projection replaces the old list")
+			assert.Equal(t, string(v1alpha1.InstanceStateActive), status["state"])
+		})
+	}
+}
+
+func TestReconcileSuspendedWithoutAuthorConditions(t *testing.T) {
+	inst := newSuspendedAuthorInstance(t, "CmReady")
+	raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+	controller, _ := newGraphEngineControllerUnderTest(t, raw, testEmptyRGDSpec(), revisions.RevisionStateActive, nil, nil)
+
+	require.NoError(t, controller.reconcileSuspended(context.Background(), inst))
+	stored := getStoredParentObject(t, raw)
+	assert.Len(t, conditionsFromInstance(stored), 4)
+	assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, InstanceManaged).Status)
+	assert.Equal(t, metav1.ConditionTrue, conditionByType(t, stored, GraphResolved).Status)
+	assert.Equal(t, metav1.ConditionFalse, conditionByType(t, stored, Ready).Status)
+	rr := conditionByType(t, stored, ResourcesReady)
+	assert.Equal(t, metav1.ConditionFalse, rr.Status)
+	assert.Equal(t, new("ReconciliationSuspended"), rr.Reason)
+	assert.Equal(t, int64(2), rr.ObservedGeneration)
+	assert.Equal(t, string(v1alpha1.InstanceStateActive), captureWireStatus(stored)["state"])
+}
