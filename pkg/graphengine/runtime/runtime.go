@@ -61,6 +61,9 @@ type Runtime struct {
 	// the overflow safeguard in cartesianProduct still active).
 	maxCollectionSize int
 
+	// maxCollectionDimensions caps the number of forEach axes per collection.
+	maxCollectionDimensions int
+
 	// nodeObjectOverrides replaces a literal Def node's compiled payload with
 	// a per-Runtime value at render time. This is what lets one compiled
 	// Program be shared across every instance of a revision: the `schema`
@@ -79,6 +82,16 @@ type Option func(*Runtime)
 // Use 0 to disable the cap entirely.
 func WithMaxCollectionSize(n int) Option {
 	return func(r *Runtime) { r.maxCollectionSize = n }
+}
+
+// WithMaxCollectionDimensions overrides the default cap on forEach axes per
+// collection. Nonpositive values leave the limit unchanged.
+func WithMaxCollectionDimensions(n int) Option {
+	return func(r *Runtime) {
+		if n > 0 {
+			r.maxCollectionDimensions = n
+		}
+	}
 }
 
 // WithNodeObjectOverride replaces the literal payload of the named Def node
@@ -128,11 +141,12 @@ func New(prog *compiler.Program, g *expv1alpha1.Graph, opts ...Option) *Runtime 
 	}
 
 	rt := &Runtime{
-		program:           prog,
-		graph:             g,
-		scope:             make(map[string]any, nodeCount),
-		byID:              make(map[string]*Node, nodeCount),
-		maxCollectionSize: DefaultMaxCollectionSize,
+		program:                 prog,
+		graph:                   g,
+		scope:                   make(map[string]any, nodeCount),
+		byID:                    make(map[string]*Node, nodeCount),
+		maxCollectionSize:       DefaultMaxCollectionSize,
+		maxCollectionDimensions: DefaultMaxCollectionDimensions,
 	}
 	for _, opt := range opts {
 		opt(rt)

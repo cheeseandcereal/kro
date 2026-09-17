@@ -156,7 +156,9 @@ func (c *Controller) reconcileViaGraphEngine(
 	}
 
 	// Build a per-reconcile Runtime.
-	var rtOpts []geruntime.Option
+	rtOpts := []geruntime.Option{
+		geruntime.WithMaxCollectionDimensions(c.reconcileConfig.MaxCollectionDimensionSize),
+	}
 	if c.reconcileConfig.MaxCollectionSize > 0 {
 		rtOpts = append(rtOpts, geruntime.WithMaxCollectionSize(c.reconcileConfig.MaxCollectionSize))
 	}

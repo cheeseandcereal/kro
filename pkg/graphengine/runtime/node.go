@@ -433,7 +433,7 @@ func (n *Node) expand() ([]map[string]any, error) {
 		}
 		dims = append(dims, evaluatedDimension{name: axis.Name, values: items})
 	}
-	rows, err := cartesianProduct(dims, n.rt.maxCollectionSize)
+	rows, err := cartesianProduct(dims, n.rt.maxCollectionSize, n.rt.maxCollectionDimensions)
 	if err != nil {
 		return nil, err
 	}

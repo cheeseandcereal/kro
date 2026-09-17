@@ -302,6 +302,9 @@ func (e *Environment) setupController() error {
 		MaxCollectionSize:          1000,
 		MaxCollectionDimensionSize: 10,
 	}
+	if limit := e.ControllerConfig.ReconcileConfig.MaxCollectionDimensionSize; limit > 0 {
+		rgdConfig.MaxCollectionDimensionSize = limit
+	}
 	maxGraphRevisions := e.ControllerConfig.MaxGraphRevisions
 	if maxGraphRevisions <= 0 {
 		maxGraphRevisions = 20
