@@ -167,6 +167,21 @@ func TestCompile(t *testing.T) {
 
 		// --- dependency / DAG ---
 		{
+			name: "graphengine resource reference",
+			graph: generator.NewGraph("g",
+				generator.WithTemplate("graphengine", configMap("ge-cm")),
+				generator.WithTemplate("dependent", map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "ge-cm-dep"},
+					"data":     map[string]any{"source": "${graphengine.metadata.name}"},
+				}),
+			),
+			after: func(t *testing.T, prog *Program, _ *expv1alpha1.Graph) {
+				assert.Equal(t, []string{"graphengine"}, prog.Nodes["dependent"].HardDepIDs())
+				assert.Equal(t, []string{"graphengine", "dependent"}, prog.TopologicalOrder)
+			},
+		},
+		{
 			name: "linear dependency chain",
 			graph: generator.NewGraph("g",
 				generator.WithDef("base", map[string]any{"name": "alpha"}),
@@ -281,6 +296,17 @@ func TestCompile(t *testing.T) {
 		},
 
 		// --- forEach ---
+		{
+			name: "graphengine iterator binding",
+			graph: generator.NewGraph("g",
+				generator.WithTemplate("copies", configMap("${'ge-cm-' + graphengine}"),
+					generator.ForEachDim("graphengine", "${['a', 'b']}")),
+			),
+			after: func(t *testing.T, prog *Program, _ *expv1alpha1.Graph) {
+				assert.True(t, prog.Nodes["copies"].IsCollection())
+				assert.Empty(t, prog.Nodes["copies"].HardDepIDs())
+			},
+		},
 		{
 			name: "forEach over typed source binds element type",
 			graph: generator.NewGraph("g",
