@@ -53,6 +53,7 @@ type fakeExecutor struct {
 	applyResult  executor.ApplyResult
 	deleteErr    error
 	deleteCalls  [][]expv1alpha1.ManagedResource // captures every Delete invocation in order
+	deleteOwners []types.UID
 	releaseErr   error
 	releaseCalls [][]executor.Contribution // captures every Release invocation in order
 }
@@ -60,8 +61,9 @@ type fakeExecutor struct {
 func (f *fakeExecutor) Apply(context.Context, *krotruntime.Runtime, watchrouter.Watcher) (executor.ApplyResult, error) {
 	return f.applyResult, f.applyErr
 }
-func (f *fakeExecutor) Delete(_ context.Context, resources []expv1alpha1.ManagedResource) error {
+func (f *fakeExecutor) Delete(_ context.Context, ownerUID types.UID, resources []expv1alpha1.ManagedResource) error {
 	f.deleteCalls = append(f.deleteCalls, resources)
+	f.deleteOwners = append(f.deleteOwners, ownerUID)
 	return f.deleteErr
 }
 func (f *fakeExecutor) Release(_ context.Context, contributions []executor.Contribution) error {
@@ -194,8 +196,9 @@ func TestReconcile(t *testing.T) {
 		wantGone   bool                              // expect a NotFound on refetch after reconcile
 		// wantRequeue, when > 0, asserts the reconcile returned no error
 		// and ctrl.Result.RequeueAfter equals this value.
-		wantRequeue time.Duration
-		after       func(t *testing.T, g *expv1alpha1.Graph)
+		wantRequeue     time.Duration
+		wantDeleteOwner types.UID
+		after           func(t *testing.T, g *expv1alpha1.Graph)
 	}{
 		{
 			name:    "not found is a no-op",
@@ -221,11 +224,14 @@ func TestReconcile(t *testing.T) {
 			},
 		},
 		{
-			name:     "deletion releases the finalizer",
-			initial:  graph("g", withFinalizer, withDeletionTimestamp),
-			compile:  &fakeCompiler{program: prog(1)},
-			wantGone: true,
-			wantCmp:  0,
+			name: "deletion releases the finalizer",
+			initial: graph("g", withFinalizer, withDeletionTimestamp, withManagedResource, func(g *expv1alpha1.Graph) {
+				g.UID = "deleting-graph-uid"
+			}),
+			compile:         &fakeCompiler{program: prog(1)},
+			wantGone:        true,
+			wantCmp:         0,
+			wantDeleteOwner: "deleting-graph-uid",
 		},
 		{
 			name:    "successful compile sets Accepted=True and Ready=True",
@@ -421,6 +427,9 @@ func TestReconcile(t *testing.T) {
 			}
 			if tc.wantCmp != 0 {
 				assert.Equal(t, tc.wantCmp, tc.compile.calls)
+			}
+			if tc.wantDeleteOwner != "" {
+				assert.Equal(t, []types.UID{tc.wantDeleteOwner}, exec.deleteOwners)
 			}
 			got := &expv1alpha1.Graph{}
 			getErr := cl.Get(context.Background(), req.NamespacedName, got)

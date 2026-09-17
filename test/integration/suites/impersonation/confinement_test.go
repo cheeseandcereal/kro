@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -51,13 +52,15 @@ import (
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/compiler"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/executor"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/registry"
+	"github.com/kubernetes-sigs/kro/pkg/metadata"
 )
 
 // TestGraphImpersonationConfinement proves an impersonated ServiceAccount whose
 // RBAC forbids a write cannot apply the Graph's resource. It stands up its OWN
 // envtest (RBAC-enforcing), grants a limited SA read-only access to ConfigMaps,
-// then submits a Graph (as that SA) that tries to CREATE a ConfigMap. The apply
-// must be refused and the ConfigMap must never appear.
+// then submits a Graph that tries to CREATE a ConfigMap and read an unreadable
+// Secret. Unverifiable intents must not wedge deletion, while a verified child's
+// DELETE Forbidden must retain the finalizer.
 func TestGraphImpersonationConfinement(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping envtest-backed confinement test in -short mode")
@@ -184,15 +187,17 @@ func TestGraphImpersonationConfinement(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "confined", Namespace: ns},
 		Spec: expv1alpha1.GraphSpec{
 			ServiceAccountName: saName,
-			Nodes: []expv1alpha1.Node{{
-				ID: "cm",
-				Template: rawExt(t, map[string]any{
-					"apiVersion": "v1",
-					"kind":       "ConfigMap",
-					"metadata":   map[string]any{"name": "forbidden-cm"},
-					"data":       map[string]any{"hello": "world"},
-				}),
-			}},
+			Nodes: []expv1alpha1.Node{
+				{ID: "cm", Template: rawExt(t, map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "forbidden-cm"},
+					"data":     map[string]any{"hello": "world"},
+				})},
+				{ID: "secret", Template: rawExt(t, map[string]any{
+					"apiVersion": "v1", "kind": "Secret",
+					"metadata": map[string]any{"name": "unreadable-secret"},
+				})},
+			},
 		},
 	}
 	if err := adminClient.Create(ctx, g); err != nil {
@@ -242,13 +247,86 @@ func TestGraphImpersonationConfinement(t *testing.T) {
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("unexpected error checking ConfigMap absence: %v", err)
 	}
+	require.True(t, apierrors.IsNotFound(adminClient.Get(ctx,
+		types.NamespacedName{Namespace: ns, Name: "unreadable-secret"}, &corev1.Secret{})))
+	require.NoError(t, adminClient.Get(ctx, key, g))
+	require.Len(t, g.Status.ManagedResources, 2)
+	for _, entry := range g.Status.ManagedResources {
+		require.Empty(t, entry.UID)
+	}
+	require.NoError(t, adminClient.Delete(ctx, g))
+	require.Eventually(t, func() bool {
+		return apierrors.IsNotFound(adminClient.Get(ctx, key, &expv1alpha1.Graph{}))
+	}, 15*time.Second, 100*time.Millisecond, "unreadable write-ahead intent must not block finalization")
 
 	mgrCancel()
 	select {
 	case <-errCh:
 	case <-time.After(10 * time.Second):
-		t.Log("manager did not stop within 10s")
+		t.Fatal("manager did not stop within 10s")
 	}
+
+	t.Run("verified DELETE Forbidden retains finalizer", func(t *testing.T) {
+		// Drive reconciliation explicitly after stopping the manager, so the
+		// stripped UID cannot be restored by a concurrent successful Apply.
+		role := &rbacv1.Role{}
+		require.NoError(t, adminClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "cm-reader"}, role))
+		role.Rules[0].Verbs = append(role.Rules[0].Verbs, "create", "patch", "update")
+		require.NoError(t, adminClient.Update(ctx, role))
+		manual := &ctrlgraph.Reconciler{
+			Client: adminClient, Compiler: cmp, Registry: registry.New(),
+			Executor: exec, Impersonation: impersonation, RequireImpersonation: true,
+		}
+		owned := &expv1alpha1.Graph{
+			ObjectMeta: metav1.ObjectMeta{Name: "owned-writeahead", Namespace: ns},
+			Spec: expv1alpha1.GraphSpec{ServiceAccountName: saName, Nodes: []expv1alpha1.Node{
+				{ID: "cm", Template: rawExt(t, map[string]any{
+					"apiVersion": "v1", "kind": "ConfigMap",
+					"metadata": map[string]any{"name": "owned-writeahead-cm"},
+					"data":     map[string]any{"value": "owned"},
+				})},
+			}},
+		}
+		create(t, ctx, adminClient, owned)
+		req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(owned)}
+		require.Eventually(t, func() bool {
+			_, err := manual.Reconcile(ctx, req)
+			return err == nil && adminClient.Get(ctx, req.NamespacedName, owned) == nil &&
+				len(owned.Status.ManagedResources) == 1 && owned.Status.ManagedResources[0].UID != ""
+		}, 30*time.Second, 100*time.Millisecond, "writer must apply a real owned child")
+		childKey := types.NamespacedName{Namespace: ns, Name: "owned-writeahead-cm"}
+		child := &corev1.ConfigMap{}
+		require.NoError(t, adminClient.Get(ctx, childKey, child))
+		require.NotEmpty(t, child.ManagedFields)
+		childUID := child.UID
+		owned.Status.ManagedResources[0].UID = ""
+		require.NoError(t, adminClient.Status().Update(ctx, owned))
+		require.NoError(t, adminClient.Delete(ctx, owned))
+
+		_, err := manual.Reconcile(ctx, req)
+		require.True(t, apierrors.IsForbidden(err), "verified child DELETE denial must propagate: %v", err)
+		require.NoError(t, adminClient.Get(ctx, req.NamespacedName, owned))
+		require.Contains(t, owned.Finalizers, metadata.GraphFinalizer)
+		require.Len(t, owned.Status.ManagedResources, 1)
+		require.Empty(t, owned.Status.ManagedResources[0].UID)
+		deleteFailed := false
+		for _, condition := range owned.Status.Conditions {
+			if condition.Type == ctrlgraph.ResourcesConverged && condition.Reason != nil {
+				deleteFailed = condition.Status == metav1.ConditionFalse && *condition.Reason == "DeleteFailed"
+			}
+		}
+		require.True(t, deleteFailed, "denied DELETE must report DeleteFailed")
+		require.NoError(t, adminClient.Get(ctx, childKey, child))
+		require.Equal(t, childUID, child.UID)
+
+		role.Rules[0].Verbs = append(role.Rules[0].Verbs, "delete")
+		require.NoError(t, adminClient.Update(ctx, role))
+		require.Eventually(t, func() bool {
+			_, err := manual.Reconcile(ctx, req)
+			return err == nil && apierrors.IsNotFound(adminClient.Get(ctx, req.NamespacedName, owned))
+		}, 15*time.Second, 100*time.Millisecond, "restoring DELETE permission must release the finalizer")
+		require.True(t, apierrors.IsNotFound(adminClient.Get(ctx, childKey, child)))
+	})
 }
 
 func ptr[T any](v T) *T { return &v }

@@ -193,13 +193,10 @@ type ManagedResource struct {
 	// as a delete precondition so we don't remove a resource that was
 	// deleted-and-recreated out of band between apply and prune.
 	//
-	// A UID-less entry is a not-yet-observed intent (e.g. a pre-apply
-	// write-ahead entry declared but not yet applied this cycle). Such an
-	// entry is intentionally SKIPPED on delete/prune: without a captured UID
-	// kro cannot prove the live object is the one it applied, and deleting by
-	// name alone could remove an object kro does not own. It is therefore
-	// effectively required for cleanup — an entry only becomes deletable once
-	// a successful apply has recorded its UID.
+	// A UID-less entry records pre-apply intent. Delete/prune may recover a
+	// live UID if the object carries this Graph's template manager and no
+	// peer template manager. Unmarked objects and NotFound, NoMatch, or
+	// Forbidden reads are skipped; other read failures remain errors.
 	//
 	// +kubebuilder:validation:Optional
 	UID string `json:"uid,omitempty"`
