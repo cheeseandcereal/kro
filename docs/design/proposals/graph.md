@@ -123,7 +123,7 @@ keyword. Evaluation order is derived from dependencies, not list position. The
 cannot evaluate until the Deployment has been applied and its observed state is available.
 
 `spec.serviceAccountName` (optional) selects which ServiceAccount in the Graph's own namespace kro
-impersonates when applying the Graph's resources; when unset, the namespace's `default`
+impersonates when applying the Graph's resources; when unset or explicitly `""`, the namespace's `default`
 ServiceAccount is impersonated. See [Security Posture](#security-posture) for the full model.
 
 ### Node Types

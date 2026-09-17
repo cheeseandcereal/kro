@@ -49,13 +49,13 @@ type GraphSpec struct {
 	// a Graph can never escalate beyond the RBAC granted to a ServiceAccount in
 	// its own namespace. When empty, kro impersonates the default ServiceAccount
 	// of the Graph's namespace, confining resource access to that namespace by
-	// default.
+	// default. An explicit empty string is equivalent to omitting this field.
 	//
 	// The kro controller ServiceAccount must be granted the "impersonate" verb
 	// on serviceaccounts for this to take effect.
 	//
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:Pattern=`^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +kubebuilder:validation:MaxLength=253
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 }
