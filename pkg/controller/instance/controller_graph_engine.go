@@ -176,6 +176,10 @@ func (c *Controller) reconcileViaGraphEngine(
 	// but the parent has no inventory tracking them.
 	supersetMeta, applier, preErr := c.preApplyApplySetInventory(ctx, log, inst, rt)
 	if preErr != nil {
+		mark.ResourcesNotReady("pre-apply inventory failed: %v", preErr)
+		if statusErr := c.persistGraphEngineStatus(ctx, inst, wireStatus, rt, rgd, true); statusErr != nil {
+			log.V(1).Info("graph-engine: failed to persist pre-apply inventory failure status", "error", statusErr)
+		}
 		return preErr
 	}
 
