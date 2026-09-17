@@ -23,6 +23,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	apimachineryruntime "k8s.io/apimachinery/pkg/runtime"
@@ -81,6 +82,143 @@ func TestReconcileInstanceLoad(t *testing.T) {
 			}
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestReconcile_MetadataFailureStatus(t *testing.T) {
+	for _, route := range []struct {
+		name       string
+		annotation string
+	}{
+		{name: "normal"},
+		{name: "suspended", annotation: v1alpha1.ReconcileSuspended},
+		{name: "legacy disabled", annotation: v1alpha1.ReconcileLegacyDisabled},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name             string
+				rejectMetadata   bool
+				rejectStatus     bool
+				authorConditions bool
+			}{
+				{name: "invalid inventory"},
+				{name: "metadata patch rejected", rejectMetadata: true},
+				{name: "status also rejected", rejectMetadata: true, rejectStatus: true},
+				{name: "author status preserved", rejectMetadata: true, authorConditions: true},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					inst := newInstanceObject("demo", "default")
+					inst.SetGeneration(7)
+					annotations := map[string]string{}
+					if route.annotation != "" {
+						annotations[v1alpha1.InstanceReconcileAnnotation] = route.annotation
+					}
+					if !tt.rejectMetadata {
+						// Tooling without an ApplySet ID must fail the finalizer guard.
+						annotations[applyset.ApplySetToolingAnnotation] = applyset.ToolingID()
+					}
+					inst.SetAnnotations(annotations)
+					if tt.rejectStatus || tt.authorConditions {
+						inst.Object["status"] = map[string]any{
+							"state":    string(v1alpha1.InstanceStateActive),
+							"endpoint": "https://example.test",
+						}
+					}
+					if tt.authorConditions {
+						require.NoError(t, unstructured.SetNestedSlice(inst.Object, []any{
+							map[string]any{
+								"type":               "AuthorHealthy",
+								"status":             "True",
+								"reason":             "Healthy",
+								"message":            "previous author verdict",
+								"observedGeneration": int64(6),
+								"lastTransitionTime": "2026-01-01T00:00:00Z",
+							},
+							map[string]any{
+								"type":               Ready,
+								"status":             "True",
+								"reason":             "AuthorReady",
+								"message":            "author uses a built-in type name",
+								"observedGeneration": int64(6),
+								"lastTransitionTime": "2026-01-01T00:00:00Z",
+							},
+						}, "status", "conditions"))
+					}
+					previousStatus := captureWireStatus(inst)
+					raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+					metadataErr := apierrors.NewForbidden(controllerTestParentGVR.GroupResource(), inst.GetName(), errors.New("metadata stamping denied"))
+					statusErr := errors.New("status update denied")
+					metadataPatches, statusUpdates := 0, 0
+					raw.PrependReactor("patch", "webapps", func(action k8stesting.Action) (bool, apimachineryruntime.Object, error) {
+						patch := action.(k8stesting.PatchActionImpl)
+						if patch.GetSubresource() == "" && patch.GetPatchType() == types.ApplyPatchType &&
+							patch.GetPatchOptions().FieldManager == FieldManagerForLabeler {
+							metadataPatches++
+							return true, nil, metadataErr
+						}
+						return false, nil, nil
+					})
+					raw.PrependReactor("update", "webapps", func(action k8stesting.Action) (bool, apimachineryruntime.Object, error) {
+						if action.GetSubresource() == "status" {
+							statusUpdates++
+							if tt.rejectStatus {
+								return true, nil, statusErr
+							}
+						}
+						return false, nil, nil
+					})
+					comp := &testStubCompiler{}
+					runtimeClient := newFakeRuntimeClient(t)
+					controller, _ := newGraphEngineControllerUnderTest(t, raw, testRGDSpecWithConfigMap("child", ""), revisions.RevisionStateActive, comp, runtimeClient)
+					controller.reconcileConfig.HasAuthorConditions = tt.authorConditions
+					if route.annotation != "" {
+						// Suspension must reach the stamp guard without entering the engine.
+						controller.graphEngineCompiler = nil
+					}
+
+					err := controller.Reconcile(context.Background(), ctrl.Request{
+						NamespacedName: types.NamespacedName{Name: inst.GetName(), Namespace: inst.GetNamespace()},
+					})
+					if tt.rejectMetadata {
+						require.ErrorIs(t, err, metadataErr)
+						assert.EqualError(t, err, "graph-engine: failed stamping instance metadata: "+metadataErr.Error())
+						assert.Equal(t, 1, metadataPatches)
+					} else {
+						require.ErrorContains(t, err, "cannot install finalizer with invalid applyset inventory")
+						assert.Contains(t, err.Error(), applyset.ApplySetParentIDLabel)
+						assert.Zero(t, metadataPatches)
+					}
+					assert.NotErrorIs(t, err, statusErr)
+					assert.Equal(t, 1, statusUpdates, "must attempt to persist the metadata failure even when status is rejected")
+					assert.Zero(t, comp.calls, "metadata failure must stop before runtime construction")
+					assert.True(t, apierrors.IsNotFound(runtimeClient.Get(context.Background(),
+						types.NamespacedName{Name: "child", Namespace: "default"}, newConfigMapObject("child", "default"))))
+
+					stored := getStoredParentObject(t, raw)
+					assert.False(t, metadata.HasInstanceFinalizer(stored))
+					status := captureWireStatus(stored)
+					if tt.rejectStatus {
+						assert.Equal(t, previousStatus, status, "rejected status must not change the stored object")
+						return
+					}
+					assert.Equal(t, string(v1alpha1.InstanceStateError), status["state"])
+					if tt.authorConditions {
+						previousStatus["state"] = string(v1alpha1.InstanceStateError)
+						assert.Equal(t, previousStatus, status, "only state may change on the author-owned status surface")
+						return
+					}
+					managed := conditionByType(t, stored, InstanceManaged)
+					assert.Equal(t, metav1.ConditionFalse, managed.Status)
+					assert.Equal(t, new("ManagementFailed"), managed.Reason)
+					assert.Equal(t, inst.GetGeneration(), managed.ObservedGeneration)
+					require.NotNil(t, managed.Message)
+					assert.Contains(t, *managed.Message, err.Error())
+					ready := conditionByType(t, stored, Ready)
+					assert.Equal(t, metav1.ConditionFalse, ready.Status)
+					assert.Equal(t, inst.GetGeneration(), ready.ObservedGeneration)
+				})
+			}
 		})
 	}
 }
