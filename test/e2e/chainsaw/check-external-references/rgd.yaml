@@ -8,6 +8,12 @@ spec:
     kind: ExternalReferenceTest
     spec:
       name: string | default=foobar
+      tag: string | default=v1
+    status:
+      tag: ${schema.spec.tag}
+      extInfo:
+        source: ${input.metadata.name}
+        value: ${input.data.ECHO_VALUE}
   resources:
     - id: input
       externalRef:

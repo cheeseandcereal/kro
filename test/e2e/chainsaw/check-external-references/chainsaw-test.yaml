@@ -4,7 +4,7 @@ metadata:
   name: check-external-references
 spec:
   description: | 
-    Tests if a ResourceGraphDefinition creates an Instance CRD
+    Tests external reference availability and progressive instance status updates
   steps:
   - name: setup
     try:
@@ -58,6 +58,83 @@ spec:
     - assert:
         file: owned.yaml
       description: Verify Owned Resource based on External Reference is created
+    catch:
+    - description: kro controller pod logs collector
+      podLogs:
+        selector: app.kubernetes.io/instance=kro
+        namespace: kro-system
+
+  - name: remove-external-ref
+    try:
+    - command:
+        entrypoint: kubectl
+        args:
+        - patch
+        - crd
+        - externalreferencetests.kro.run
+        - --type=json
+        - -p
+        - >-
+          [{"op":"add","path":"/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/extInfo/minProperties","value":1}]
+      description: Exercise a status schema that rejects an empty extInfo object
+    - delete:
+        file: configmap.yaml
+      description: Delete the external ConfigMap after its status has been published
+    - assert:
+        file: instance-assert-in-progress.yaml
+      description: Verify external-derived status disappears while the instance waits
+    catch:
+    - description: kro controller pod logs collector
+      podLogs:
+        selector: app.kubernetes.io/instance=kro
+        namespace: kro-system
+
+  - name: update-instance-while-pending
+    try:
+    - apply:
+        resource:
+          apiVersion: kro.run/v1alpha1
+          kind: ExternalReferenceTest
+          metadata:
+            name: test-external-reference
+          spec:
+            tag: v2
+    - assert:
+        resource:
+          apiVersion: kro.run/v1alpha1
+          kind: ExternalReferenceTest
+          metadata:
+            name: test-external-reference
+          status:
+            state: IN_PROGRESS
+            tag: v2
+            (contains(keys(@), 'extInfo')): false
+      description: Verify resolvable status still updates while the reference is missing
+    catch:
+    - description: kro controller pod logs collector
+      podLogs:
+        selector: app.kubernetes.io/instance=kro
+        namespace: kro-system
+
+  - name: restore-external-ref
+    try:
+    - apply:
+        file: configmap.yaml
+    - assert:
+        resource:
+          apiVersion: kro.run/v1alpha1
+          kind: ExternalReferenceTest
+          metadata:
+            name: test-external-reference
+          status:
+            state: ACTIVE
+            tag: v2
+            extInfo:
+              source: check-external-references
+              value: "Hello, World!"
+            (conditions[?type == 'Ready']):
+            - status: 'True'
+      description: Verify complete status is restored when the reference returns
     catch:
     - description: kro controller pod logs collector
       podLogs:
