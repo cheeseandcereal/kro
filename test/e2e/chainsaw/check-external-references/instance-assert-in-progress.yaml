@@ -12,3 +12,5 @@ spec:
   name: foobar
 status:
   state: IN_PROGRESS
+  tag: v1
+  (contains(keys(@), 'extInfo')): false

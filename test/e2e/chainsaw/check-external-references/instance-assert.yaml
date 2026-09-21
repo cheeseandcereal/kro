@@ -16,3 +16,7 @@ status:
   (conditions[?type == 'Ready']):
     - status: 'True'
   state: ACTIVE
+  tag: v1
+  extInfo:
+    source: check-external-references
+    value: "Hello, World!"
