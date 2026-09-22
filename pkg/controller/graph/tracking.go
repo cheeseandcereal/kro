@@ -267,8 +267,8 @@ func intendedContributions(rt *krotruntime.Runtime) []executor.Contribution {
 	return out
 }
 
-// projectContributions walks one runtime frame, appending patch-node
-// contributions (deduped via seen) to out and recursing into subgraph frames.
+// projectContributions walks one runtime frame, appending a contribution per
+// patch target (deduped via seen) to out and recursing into subgraph frames.
 // prefix is the frame's qualified node-ID prefix ("" at root); graphUID is
 // threaded so the FieldManager derivation matches the executor at every depth.
 func projectContributions(
@@ -299,38 +299,40 @@ func projectContributions(
 			continue
 		}
 		desired, err := n.Resolve()
-		if err != nil || len(desired) != 1 {
+		if err != nil {
 			continue
 		}
-		obj := desired[0]
-		gvk := obj.GroupVersionKind()
-		if gvk.Kind == "" || obj.GetName() == "" {
-			continue
+		fieldManager := executor.PatchFieldManager(graphUID, prefix+n.ID())
+		for _, obj := range desired {
+			gvk := obj.GroupVersionKind()
+			if gvk.Kind == "" || obj.GetName() == "" {
+				continue
+			}
+			ns := obj.GetNamespace()
+			if ns == "" && n.Namespaced() {
+				ns = rt.Graph().GetNamespace()
+			}
+			// Same dynamic-GVK-no-namespace ambiguity as intendedManagedResources:
+			// the scope isn't known until apply resolves it from the RESTMapper, so a
+			// ns="" entry would never correlate. Skip it.
+			if ns == "" && n.DynamicGVK() {
+				continue
+			}
+			c := executor.Contribution{
+				APIVersion:   gvk.GroupVersion().String(),
+				Kind:         gvk.Kind,
+				Namespace:    ns,
+				Name:         obj.GetName(),
+				Subresource:  n.Subresource(),
+				FieldManager: fieldManager,
+			}
+			k := contribKeyOf(c)
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			*out = append(*out, c)
 		}
-		ns := obj.GetNamespace()
-		if ns == "" && n.Namespaced() {
-			ns = rt.Graph().GetNamespace()
-		}
-		// Same dynamic-GVK-no-namespace ambiguity as intendedManagedResources:
-		// the scope isn't known until apply resolves it from the RESTMapper, so a
-		// ns="" entry would never correlate. Skip it.
-		if ns == "" && n.DynamicGVK() {
-			continue
-		}
-		c := executor.Contribution{
-			APIVersion:   gvk.GroupVersion().String(),
-			Kind:         gvk.Kind,
-			Namespace:    ns,
-			Name:         obj.GetName(),
-			Subresource:  n.Subresource(),
-			FieldManager: executor.PatchFieldManager(graphUID, prefix+n.ID()),
-		}
-		k := contribKeyOf(c)
-		if _, dup := seen[k]; dup {
-			continue
-		}
-		seen[k] = struct{}{}
-		*out = append(*out, c)
 	}
 }
 
