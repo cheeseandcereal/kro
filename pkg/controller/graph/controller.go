@@ -376,12 +376,12 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 		marker.ResourcesApplyFailed(applyErr.Error())
 	}
 
-	// Record the identity that applied under, but ONLY when the apply reached
-	// the cluster (clean or soft not-ready) — never on a hard failure, which
-	// must preserve the last-good identity so teardown can still see resources a
-	// prior identity applied. Empty when impersonation is inactive (the base
-	// controller identity), in which case teardown falls back to the spec.
-	reachedCluster := applyErr == nil || errors.Is(applyErr, executor.ErrNotReady)
+	// Record the current identity on clean/soft apply. A hard partial result
+	// may fill a missing identity, but must preserve any previously recorded one
+	// so a later spec change does not strand the tracked resources on teardown.
+	hardErr := applyErr != nil && !errors.Is(applyErr, executor.ErrNotReady)
+	reachedCluster := !hardErr ||
+		(g.Status.AppliedServiceAccount == "" && len(result.Applied)+len(result.Contributions) > 0)
 	if reachedCluster {
 		if user := r.appliedIdentity(g); user != "" {
 			g.Status.AppliedServiceAccount = user
@@ -403,7 +403,6 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	// pruning was gated on a fully clean apply, so a single never-ready node
 	// vetoed pruning of every unrelated retired node (this is the Graph-path twin
 	// of the instance ownedUnresolved/pruneGate narrowing).
-	hardErr := applyErr != nil && !errors.Is(applyErr, executor.ErrNotReady)
 	// The full pre-apply superset (previous + applied + intent), reused wherever
 	// the inventory must not shrink below what the write-ahead already advertised.
 	superset := func() []expv1alpha1.ManagedResource {
