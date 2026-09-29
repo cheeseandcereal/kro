@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -36,6 +37,7 @@ import (
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/kubernetes-sigs/kro/api/v1alpha1"
+	"github.com/kubernetes-sigs/kro/pkg/controller/instance/applyset"
 	"github.com/kubernetes-sigs/kro/pkg/features"
 	"github.com/kubernetes-sigs/kro/pkg/graph/revisions"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/compiler"
@@ -163,6 +165,68 @@ func TestReconcile_IncludeWhenAfterInventoryProjection(t *testing.T) {
 				})
 			}
 			assert.Equal(t, 1, c.programCache.Len(), "both instances share the revision's compiled program")
+		})
+	}
+}
+
+func TestCandidateMetadata_ConfiguredDimensions(t *testing.T) {
+	for _, duplicate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duplicate=%t", duplicate), func(t *testing.T) {
+			inst := newInstanceObject("demo", "default")
+			inst.SetGeneration(2)
+			inst.Object["spec"] = map[string]any{"targetNamespace": "target", "values": []any{"x"}}
+			rgdSpec := testRGDSpecWithConfigMap("shared-cm", "")
+			rgdSpec.Schema.Spec.Raw = []byte(`{"targetNamespace":"string","values":"[]string"}`)
+			collection := rgdSpec.Resources[0]
+			nameTemplate := "shared-cm"
+			childName := "shared-cm" + strings.Repeat("-x", 11)
+			for i := range 11 {
+				nameTemplate += fmt.Sprintf("-${axis%d}", i)
+				collection.ForEach = append(collection.ForEach, v1alpha1.ForEachDimension{
+					fmt.Sprintf("axis%d", i): "${schema.spec.values}",
+				})
+			}
+			collection.Template.Raw = []byte(fmt.Sprintf(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":%q,"namespace":"${schema.spec.targetNamespace}"}}`, nameTemplate))
+			namespace := "distinct"
+			if duplicate {
+				namespace = "target"
+			}
+			rgdSpec.Resources = append(rgdSpec.Resources, &v1alpha1.Resource{
+				ID: "scalar",
+				Template: apimachineryruntime.RawExtension{Raw: []byte(fmt.Sprintf(
+					`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":%q,"namespace":%q}}`, childName, namespace))},
+			})
+			raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+			cl := newFakeRuntimeClient(t)
+			comp := newTestRealCompiler(t)
+			c, _ := newGraphEngineControllerUnderTest(t, raw, rgdSpec, revisions.RevisionStateActive, comp, cl)
+			c.reconcileConfig.MaxCollectionDimensionSize = 11
+			rgd := &v1alpha1.ResourceGraphDefinition{ObjectMeta: metav1.ObjectMeta{Name: "dimensions"}, Spec: *rgdSpec}
+			rt, _, err := rgdadapter.BuildRuntimeForInstanceCached(rgd, inst, comp, registry.New(), geruntime.WithMaxCollectionDimensions(11))
+			require.NoError(t, err)
+			before := maps.Clone(rt.Scope())
+			meta, candidates := c.candidateMetadata(rt, inst)
+			assert.Equal(t, sets.New("target", namespace), meta.AdditionalNamespaces)
+			require.Len(t, candidates, 2, "the eleven-axis collection must not silently use static fallback")
+			assert.True(t, maps.Equal(before, rt.Scope()))
+			assert.Nil(t, rt.Node(rgdadapter.SchemaNodeID).Observed())
+			if duplicate {
+				// A nil executor makes bypassing preflight fail even if executor-time
+				// duplicate detection would eventually reject the same identity.
+				c.graphEngineExecutor = nil
+				err = c.reconcileViaGraphEngine(t.Context(), inst, &fakeInstanceWatcher{})
+				require.ErrorIs(t, err, applyset.ErrDuplicateResource)
+				stored := getStoredParentObject(t, raw)
+				assert.Equal(t, metav1.ConditionFalse, conditionByType(t, stored, ResourcesReady).Status)
+				assert.Equal(t, "ERROR", stored.Object["status"].(map[string]any)["state"])
+			} else {
+				require.NoError(t, c.reconcileViaGraphEngine(t.Context(), inst, &fakeInstanceWatcher{}))
+				for _, ns := range []string{"target", "distinct"} {
+					cm := newConfigMapObject(childName, ns)
+					require.NoError(t, cl.Get(t.Context(), types.NamespacedName{Namespace: ns, Name: childName}, cm))
+				}
+				assert.Equal(t, metav1.ConditionTrue, conditionByType(t, getStoredParentObject(t, raw), ResourcesReady).Status)
+			}
 		})
 	}
 }

@@ -156,7 +156,9 @@ func (c *Controller) reconcileViaGraphEngine(
 	}
 
 	// Build a per-reconcile Runtime.
-	var rtOpts []geruntime.Option
+	rtOpts := []geruntime.Option{
+		geruntime.WithMaxCollectionDimensions(c.reconcileConfig.MaxCollectionDimensionSize),
+	}
 	if c.reconcileConfig.MaxCollectionSize > 0 {
 		rtOpts = append(rtOpts, geruntime.WithMaxCollectionSize(c.reconcileConfig.MaxCollectionSize))
 	}
@@ -651,6 +653,7 @@ func newProjectionRuntime(rt *geruntime.Runtime) *geruntime.Runtime {
 	opts := []geruntime.Option{
 		geruntime.WithSeedScope(rt.Scope()),
 		geruntime.WithMaxCollectionSize(rt.MaxCollectionSize()),
+		geruntime.WithMaxCollectionDimensions(rt.MaxCollectionDimensions()),
 	}
 	if schemaNode := rt.Node(rgdadapter.SchemaNodeID); schemaNode != nil {
 		// Cached Programs have an empty schema payload; preserve its effective value.

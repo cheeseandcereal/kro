@@ -194,11 +194,12 @@ func (r *ResourceGraphDefinitionReconciler) setupMicroController(
 	instCtrl := instancectrl.NewController(
 		instanceLogger,
 		instancectrl.ReconcileConfig{
-			DefaultRequeueDuration: r.cfg.InstanceRequeueInterval,
-			HasAuthorConditions:    len(processedRGD.Instance.Conditions) > 0,
-			MaxCollectionSize:      r.cfg.RGDConfig.MaxCollectionSize,
-			ApplyConcurrency:       r.cfg.ApplyConcurrency,
-			CELCostLimit:           r.cfg.CELCostLimit,
+			DefaultRequeueDuration:     r.cfg.InstanceRequeueInterval,
+			HasAuthorConditions:        len(processedRGD.Instance.Conditions) > 0,
+			MaxCollectionSize:          r.cfg.RGDConfig.MaxCollectionSize,
+			MaxCollectionDimensionSize: r.cfg.RGDConfig.MaxCollectionDimensionSize,
+			ApplyConcurrency:           r.cfg.ApplyConcurrency,
+			CELCostLimit:               r.cfg.CELCostLimit,
 		},
 		gvr,
 		r.revisionsRegistry.ResolverFor(rgd.Name),
