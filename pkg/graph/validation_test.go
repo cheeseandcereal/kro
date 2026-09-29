@@ -107,7 +107,7 @@ func TestIsKROReservedWord(t *testing.T) {
 	}{
 		{"resourcegraphdefinition", true},
 		{"instance", true},
-		{"graphengine", true},
+		{"graphengine", false},
 		{"each", true}, // Reserved for per-item readiness in collections
 		{"notReserved", false},
 		{"RESOURCEGRAPHDEFINITION", false}, // Case-sensitive check
