@@ -16,17 +16,22 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/compiler"
@@ -595,4 +600,108 @@ func TestReconcile_ErrorPathKeepsIntentSuperset(t *testing.T) {
 		"intent superset must survive a soft-error cycle in persisted status")
 	assert.Equal(t, "Widget", got.Status.ManagedResources[0].Kind)
 	assert.Equal(t, "w", got.Status.ManagedResources[0].Name)
+}
+
+func TestReconcile_ContributionPersistFailureFlipsConverged(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name             string
+		previouslyReady  bool
+		rejectConditions bool
+	}{
+		{name: "first reconcile"},
+		{name: "previously ready", previouslyReady: true},
+		{name: "conditions write also fails", previouslyReady: true, rejectConditions: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			g := graph("g", withFinalizer)
+			g.UID = "graph-uid"
+			key := client.ObjectKeyFromObject(g)
+			contributions := []executor.Contribution{
+				{APIVersion: "v1", Kind: "ConfigMap", Namespace: g.Namespace, Name: "old-target", FieldManager: executor.PatchFieldManager(g.UID, "old")},
+				{APIVersion: "v1", Kind: "ConfigMap", Namespace: g.Namespace, Name: "new-target", FieldManager: executor.PatchFieldManager(g.UID, "p")},
+			}
+			if tc.previouslyReady {
+				g.Status.Contributions = toAPIContributions(contributions[:1])
+				marker := NewConditionsMarkerFor(g)
+				marker.GraphCompiled(1)
+				marker.ResourcesConverged()
+				g.Generation++
+			}
+			exec := &applyObservingExecutor{
+				fakeExecutor: fakeExecutor{applyResult: executor.ApplyResult{Contributions: contributions}},
+				key:          key,
+			}
+			persistErr := errors.New("etcdserver: request is too large")
+			statusErr := errors.New("conditions write unavailable")
+			ledgerWrites, conditionWrites := 0, 0
+			scheme := runtime.NewScheme()
+			require.NoError(t, expv1alpha1.AddToScheme(scheme))
+			cl := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(g).WithObjects(g).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: func(ctx context.Context, c client.Client, subresource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+						require.Equal(t, "status", subresource)
+						data, err := patch.Data(obj)
+						require.NoError(t, err)
+						var body struct {
+							Status map[string]json.RawMessage `json:"status"`
+						}
+						require.NoError(t, json.Unmarshal(data, &body))
+						if _, changesLedger := body.Status["contributions"]; changesLedger {
+							require.True(t, exec.observed, "the refused ledger write must follow Apply")
+							ledgerWrites++
+							return persistErr
+						}
+						if _, changesConditions := body.Status["conditions"]; changesConditions {
+							conditionWrites++
+							if tc.rejectConditions {
+								return statusErr
+							}
+						}
+						return c.SubResource(subresource).Patch(ctx, obj, patch, opts...)
+					},
+				}).Build()
+			exec.cl = cl
+			// No pre-resolvable intent: isolate a contribution discovered during apply.
+			r := &Reconciler{Client: cl, Compiler: &fakeCompiler{program: emptyNodeProgram("p")}, Registry: registry.New(), Executor: exec}
+			before := &expv1alpha1.Graph{}
+			require.NoError(t, cl.Get(ctx, key, before))
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			require.ErrorIs(t, err, persistErr)
+			assert.Equal(t, ctrl.Result{}, res, "persistence failures retain error-based retry")
+			assert.Equal(t, 1, ledgerWrites)
+			assert.Equal(t, 1, conditionWrites)
+			assert.Empty(t, exec.releaseCalls)
+
+			got := &expv1alpha1.Graph{}
+			require.NoError(t, cl.Get(ctx, key, got))
+			assert.Equal(t, before.Status.Contributions, got.Status.Contributions, "retain the last durable ledger")
+			if tc.rejectConditions {
+				assert.ErrorIs(t, err, statusErr, "return both persistence and terminal status failures")
+				assert.Equal(t, before.Status.Conditions, got.Status.Conditions)
+				return
+			}
+			assert.EqualError(t, err, persistErr.Error())
+			accepted := findCondition(got.Status.Conditions, GraphAccepted)
+			require.NotNil(t, accepted)
+			assert.Equal(t, metav1.ConditionTrue, accepted.Status)
+			require.NotNil(t, accepted.Reason)
+			assert.Equal(t, "Compiled", *accepted.Reason)
+			assert.Equal(t, g.Generation, accepted.ObservedGeneration)
+			for _, conditionType := range []string{ResourcesConverged, Ready} {
+				condition := findCondition(got.Status.Conditions, conditionType)
+				require.NotNil(t, condition)
+				assert.Equal(t, metav1.ConditionFalse, condition.Status, conditionType)
+				require.NotNil(t, condition.Reason)
+				assert.Equal(t, "StatusWriteFailed", *condition.Reason, conditionType)
+				require.NotNil(t, condition.Message)
+				assert.Equal(t, "persist contributions: "+persistErr.Error(), *condition.Message, conditionType)
+				assert.Equal(t, g.Generation, condition.ObservedGeneration, conditionType)
+			}
+		})
+	}
 }
