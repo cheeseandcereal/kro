@@ -1044,6 +1044,183 @@ func TestReconcileViaGraphEngine_SoftErrors(t *testing.T) {
 // 11. reconcileViaGraphEngine: Hard Apply Errors & Inventory Errors
 // -----------------------------------------------------------------------------
 
+func TestReconcileViaGraphEngine_PreApplyInventoryFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		corruptInventory bool
+		rejectStatus     bool
+		authorConditions bool
+	}{
+		{name: "union failure", corruptInventory: true},
+		{name: "inventory write failure"},
+		{name: "inventory and status write failures", rejectStatus: true},
+		{name: "author conditions", authorConditions: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			inst := newInstanceObject("demo", "default")
+			inst.SetGeneration(1)
+			inst.Object["spec"] = map[string]any{"value": "v1", "healthy": true}
+			inst.Object["status"] = map[string]any{"lastAppliedValue": "v1"}
+			spec := testRGDSpecWithConfigMap("app-config", "")
+			spec.Schema.Spec = apimachineryruntime.RawExtension{Raw: []byte(`{"value":"string","healthy":"boolean"}`)}
+			spec.Resources[0].Template.Raw = []byte(`{
+				"apiVersion":"v1","kind":"ConfigMap",
+				"metadata":{"name":"app-config","namespace":"default"},
+				"data":{"value":"${schema.spec.value}"}
+			}`)
+			if tc.authorConditions {
+				spec.Schema.Status = apimachineryruntime.RawExtension{Raw: []byte(`{"conditions":[
+					"${runtime.newCondition({type: 'AppReady', status: schema.spec.healthy ? 'True' : 'False', reason: 'DesiredHealth'})}",
+					"${runtime.newCondition({type: 'CmReady', status: cm.data.value == 'v1' ? 'True' : 'False', reason: 'ObservedValue'})}",
+					"${runtime.newCondition({type: 'InventoryReady', status: runtime.condition(schema, 'ResourcesReady').status, reason: runtime.condition(schema, 'ResourcesReady').reason, message: runtime.condition(schema, 'ResourcesReady').message})}"
+				]}`)}
+			}
+			raw := newControllerTestDynamicClient(t, inst.DeepCopy())
+			runtimeClient := newFakeRuntimeClient(t)
+			c, _ := newGraphEngineControllerUnderTest(t, raw, spec, revisions.RevisionStateActive, newTestRealCompiler(t), runtimeClient)
+			c.reconcileConfig.HasAuthorConditions = tc.authorConditions
+
+			// Establish healthy, stored generation-1 conditions and an applied child.
+			require.NoError(t, c.reconcileViaGraphEngine(ctx, inst, &fakeInstanceWatcher{}))
+			previous := getStoredParentObject(t, raw)
+			previousStatus := captureWireStatus(previous)
+			require.Equal(t, string(v1alpha1.InstanceStateActive), previousStatus["state"])
+			for _, cond := range conditionsFromInstance(previous) {
+				require.Equal(t, metav1.ConditionTrue, cond.Status, string(cond.Type))
+				require.Equal(t, int64(1), cond.ObservedGeneration, string(cond.Type))
+			}
+			require.NoError(t, applyset.ValidateParentInventory(previous))
+			child := newConfigMapObject("app-config", "default")
+			require.NoError(t, runtimeClient.Get(ctx, client.ObjectKeyFromObject(child), child))
+			require.Equal(t, map[string]any{"value": "v1"}, child.Object["data"])
+
+			// Change the desired child value and inventory together, as one stored update.
+			inst = previous.DeepCopy()
+			inst.SetGeneration(2)
+			inst.Object["spec"] = map[string]any{"value": "v2", "healthy": false}
+			annotations := inst.GetAnnotations()
+			if tc.corruptInventory {
+				annotations[applyset.ApplySetGKsAnnotation] = "invalid.group.with.bad.chars!/Kind"
+			} else {
+				// Missing the optional hash forces a real inventory backfill SSA;
+				// otherwise inventoryUpToDate would skip the injected rejection.
+				delete(annotations, applyset.ApplySetInventoryHashAnnotation)
+			}
+			inst.SetAnnotations(annotations)
+			if !tc.corruptInventory {
+				require.NoError(t, applyset.ValidateParentInventory(inst))
+			}
+			require.NoError(t, raw.Tracker().Update(controllerTestParentGVR, inst.DeepCopy(), inst.GetNamespace()))
+			raw.ClearActions()
+
+			inventoryErr := errors.New("inventory write rejected")
+			statusErr := errors.New("status write rejected")
+			inventoryPatches, statusPatches := 0, 0
+			raw.PrependReactor("patch", "webapps", func(action k8stesting.Action) (bool, apimachineryruntime.Object, error) {
+				patch := action.(k8stesting.PatchActionImpl)
+				if action.GetSubresource() == "status" {
+					statusPatches++
+					assert.Equal(t, types.ApplyPatchType, patch.GetPatchType())
+					assert.Equal(t, instanceStatusFieldManager, patch.GetPatchOptions().FieldManager)
+					payload := &unstructured.Unstructured{}
+					require.NoError(t, payload.UnmarshalJSON(patch.GetPatch()))
+					status, found, err := unstructured.NestedMap(payload.Object, "status")
+					require.NoError(t, err)
+					require.True(t, found)
+					assert.Len(t, status, 2, "only conditions and state belong in this status write")
+					assert.Contains(t, status, "conditions")
+					assert.Contains(t, status, "state")
+					if tc.rejectStatus {
+						return true, nil, statusErr
+					}
+					return false, nil, nil
+				}
+				if action.GetSubresource() == "" && patch.GetPatchOptions().FieldManager == applyset.FieldManager+"-parent" {
+					inventoryPatches++
+					assert.Zero(t, statusPatches, "inventory must fail before the status write")
+					assert.Equal(t, types.ApplyPatchType, patch.GetPatchType())
+					payload := &unstructured.Unstructured{}
+					require.NoError(t, payload.UnmarshalJSON(patch.GetPatch()))
+					assert.Equal(t, previous.GetAnnotations(), payload.GetAnnotations(), "the rejected write must backfill the inventory hash")
+					return true, nil, inventoryErr
+				}
+				return false, nil, nil
+			})
+
+			// Any attempt to apply or release through the executor must fail this test.
+			c.graphEngineExecutor = nil
+			watcher := &fakeInstanceWatcher{}
+			err := c.reconcileViaGraphEngine(ctx, getStoredParentObject(t, raw), watcher)
+			require.Error(t, err)
+			var after *requeue.RequeueNeededAfter
+			require.ErrorAs(t, err, &after)
+			assert.Equal(t, c.reconcileConfig.DefaultRequeueDuration, after.Duration())
+			assert.NotErrorIs(t, err, statusErr)
+			if tc.corruptInventory {
+				assert.ErrorContains(t, err, "pre-apply applyset union failed")
+				assert.ErrorContains(t, err, applyset.ApplySetGKsAnnotation)
+				assert.Zero(t, inventoryPatches)
+			} else {
+				require.Equal(t, 1, inventoryPatches, "the intended inventory rejection must be exercised")
+				assert.ErrorIs(t, err, inventoryErr)
+				assert.ErrorContains(t, err, "patch pre-apply superset inventory")
+			}
+			assert.Equal(t, 1, statusPatches, "inventory failure must attempt status persistence")
+			assert.Empty(t, watcher.watchedRequests)
+			for _, action := range raw.Actions() {
+				assert.Equal(t, controllerTestParentGVR, action.GetResource(), "pre-apply failure must not reach child pruning")
+			}
+			storedChild := newConfigMapObject("app-config", "default")
+			require.NoError(t, runtimeClient.Get(ctx, client.ObjectKeyFromObject(child), storedChild))
+			assert.Equal(t, child.Object, storedChild.Object)
+
+			// Read storage, not the instance mutated by the marker/status writer.
+			stored := getStoredParentObject(t, raw)
+			storedStatus := captureWireStatus(stored)
+			assert.Equal(t, "v1", storedStatus["lastAppliedValue"])
+			t.Logf("inventory patches=%d, status patches=%d, stored generation=%d, state=%v", inventoryPatches, statusPatches, stored.GetGeneration(), storedStatus["state"])
+			for _, cond := range conditionsFromInstance(stored) {
+				t.Logf("stored %s=%s observedGeneration=%d", cond.Type, cond.Status, cond.ObservedGeneration)
+			}
+			if tc.rejectStatus {
+				assert.Equal(t, previousStatus, storedStatus, "rejected status must not change storage")
+				return
+			}
+			assert.Equal(t, string(v1alpha1.InstanceStateError), storedStatus["state"])
+			if tc.authorConditions {
+				assert.Len(t, conditionsFromInstance(stored), 3, "only author conditions should be stored")
+				appReady := conditionByType(t, stored, "AppReady")
+				assert.Equal(t, metav1.ConditionFalse, appReady.Status)
+				assert.Equal(t, stored.GetGeneration(), appReady.ObservedGeneration)
+				assert.Equal(t, conditionByType(t, previous, "CmReady"), conditionByType(t, stored, "CmReady"), "unobserved child data stays pending")
+				inventoryReady := conditionByType(t, stored, "InventoryReady")
+				assert.Equal(t, metav1.ConditionFalse, inventoryReady.Status)
+				assert.Equal(t, stored.GetGeneration(), inventoryReady.ObservedGeneration)
+				require.NotNil(t, inventoryReady.Reason)
+				assert.Equal(t, "NotReady", *inventoryReady.Reason)
+				require.NotNil(t, inventoryReady.Message)
+				assert.Contains(t, *inventoryReady.Message, err.Error())
+			} else {
+				for _, typ := range []string{ResourcesReady, Ready} {
+					cond := conditionByType(t, stored, typ)
+					assert.Equal(t, metav1.ConditionFalse, cond.Status, typ)
+					assert.Equal(t, stored.GetGeneration(), cond.ObservedGeneration, typ)
+					require.NotNil(t, cond.Reason)
+					assert.Equal(t, "NotReady", *cond.Reason, typ)
+					require.NotNil(t, cond.Message)
+					assert.Contains(t, *cond.Message, err.Error(), typ)
+				}
+				for _, typ := range []string{InstanceManaged, GraphResolved} {
+					cond := conditionByType(t, stored, typ)
+					assert.Equal(t, metav1.ConditionTrue, cond.Status, typ)
+					assert.Equal(t, stored.GetGeneration(), cond.ObservedGeneration, typ)
+				}
+			}
+		})
+	}
+}
+
 func TestReconcileViaGraphEngine_HardErrorsAndInventory(t *testing.T) {
 	comp := newTestRealCompiler(t)
 
