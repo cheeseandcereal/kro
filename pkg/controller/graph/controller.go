@@ -248,7 +248,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, logger logr.Logger, re
 	}
 
 	if len(g.Status.ManagedResources) > 0 {
-		if err := ex.Delete(ctx, g.Status.ManagedResources); err != nil {
+		if err := ex.Delete(ctx, g.GetUID(), g.Status.ManagedResources); err != nil {
 			return teardownFailed(err, "executor delete", "failed to persist teardown delete-failure condition")
 		}
 	}
@@ -411,7 +411,7 @@ func (r *Reconciler) reconcileGraph(ctx context.Context, g *expv1alpha1.Graph) e
 	}
 	if !hardErr {
 		if len(pruneCandidates) > 0 {
-			if err := ex.Delete(ctx, pruneCandidates); err != nil {
+			if err := ex.Delete(ctx, g.GetUID(), pruneCandidates); err != nil {
 				// A retired resource could not be deleted (e.g. the impersonated
 				// SA lacks delete RBAC). The Graph has NOT converged; surface it
 				// and keep the union so teardown still sees the un-deleted entry.
