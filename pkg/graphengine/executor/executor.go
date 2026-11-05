@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	expv1alpha1 "github.com/kubernetes-sigs/kro/api/v1alpha1"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/runtime"
 	"github.com/kubernetes-sigs/kro/pkg/graphengine/watchrouter"
@@ -157,8 +159,11 @@ type Interface interface {
 	// — they are recorded and returned wrapped as ErrNotReady, while
 	// the walk continues so every reachable node still declares its
 	// watch and contributes its identities to Applied. Hard errors
-	// (apply 5xx, type errors, unsupported kinds) abort immediately;
-	// Applied carries whatever was tracked up to the abort point.
+	// (apply 5xx, type errors, unsupported kinds) do not abort the walk
+	// either: the failing node is recorded (and never marked ready, so
+	// its dependents stay gated), independent nodes still run, and the
+	// hard errors are joined and returned after the walk, dominating any
+	// soft signal. Applied carries everything that reached the cluster.
 	//
 	// The Watcher is the per-Graph handle obtained from the dynamic
 	// controller; pass watchrouter.NoopWatcher{} when drift
@@ -170,12 +175,18 @@ type Interface interface {
 	// entry so we never remove an impostor that replaced our resource
 	// out of band. NotFound is tolerated. Safe to call repeatedly.
 	//
+	// UID-free entries require a nonempty ownerUID and a readable object with
+	// this Graph's template manager and no peer template manager. Deletion uses
+	// both UID and resourceVersion from that snapshot; conflicts remain errors.
+	// NotFound or NoMatch GETs skip the entry; other GET errors, including Forbidden,
+	// propagate. DELETE NotFound is success; DELETE Forbidden and NoMatch are errors.
+	//
 	// Unlike Apply, Delete does not consult the runtime — it operates
 	// purely from the persisted tracking record. This means a Graph
 	// whose spec was edited (template renamed, forEach shrunk, node
 	// removed) can still be deleted cleanly: the record knows what was
 	// applied, regardless of what the current spec would re-derive.
-	Delete(ctx context.Context, resources []expv1alpha1.ManagedResource) error
+	Delete(ctx context.Context, ownerUID types.UID, resources []expv1alpha1.ManagedResource) error
 
 	// Release relinquishes the fields each Contribution's field manager
 	// owns on its target by server-side applying an object that carries
